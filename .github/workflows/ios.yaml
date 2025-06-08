@@ -44,6 +44,6 @@ jobs:
       - name: Upload
         uses: actions/upload-artifact@v4
         with:
-          name: NarSil.ipa
-          path:  build/NarSil.ipa
+          name: Angband.ipa
+          path:  build/Angband.ipa
           retention-days: 7
