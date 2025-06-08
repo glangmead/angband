@@ -1,0 +1,49 @@
+name: iOS
+
+on:
+  push:
+    branches: [ sdl2-term-touch-keyboard ]
+  pull_request:
+
+jobs:
+  build:
+    name: iOS
+    runs-on: macos-13
+    steps:
+      - name: Clone Project
+        uses: actions/checkout@v4
+
+      - name: Configure
+        run: |
+          cmake \
+            -B build \
+            -G Xcode \
+            -D CMAKE_TOOLCHAIN_FILE=src/cmake/toolchain/ios.toolchain.cmake \
+            -D ENABLE_BITCODE=0 \
+            -D PLATFORM=OS64 \
+            -D CMAKE_SYSTEM_NAME=iOS \
+            -D CMAKE_BUILD_TYPE=RelWithDebInfo \
+            -D CMAKE_XCODE_ATTRIBUTE_CODE_SIGN_IDENTITY='' \
+            -D SUPPORT_SDL2_FRONTEND=ON \
+            -D CMAKE_POLICY_VERSION_MINIMUM=3.5 \
+            # EOL
+
+      - name: Build
+        run: |
+          cmake \
+            --build build \
+            --config RelWithDebInfo \
+            -j $(sysctl -n hw.physicalcpu) \
+            # EOL
+
+      - name: Pack
+        run: |
+          cd build
+          cpack -G ZIP -C RelWithDebInfo
+
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: NarSil.ipa
+          path:  build/NarSil.ipa
+          retention-days: 7

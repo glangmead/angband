@@ -56,6 +56,7 @@
  */
 #ifdef USE_SDL2
 #include "SDL_main.h"
+#include "SDL_filesystem.h"
 #endif
 
 /**
@@ -138,10 +139,20 @@ static void init_stuff(void)
 	char libpath[512];
 	char datapath[512];
 
+#ifdef __APPLE__
+	my_strcpy(configpath, getenv("HOME"), sizeof(configpath));
+	my_strcpy(datapath, getenv("HOME"), sizeof(datapath));
+	my_strcat(datapath, "/Documents", sizeof(datapath));
+	my_strcat(configpath, "/Documents", sizeof(configpath));
+	my_strcpy(libpath, SDL_GetBasePath(), sizeof(libpath));
+	my_strcat(libpath, "/lib", sizeof(libpath));
+#else
+
 	/* Use the angband_path, or a default */
 	my_strcpy(configpath, DEFAULT_CONFIG_PATH, sizeof(configpath));
 	my_strcpy(libpath, DEFAULT_LIB_PATH, sizeof(libpath));
 	my_strcpy(datapath, DEFAULT_DATA_PATH, sizeof(datapath));
+#endif // __APPLE__
 
 	/* Make sure they're terminated */
 	configpath[511] = '\0';
@@ -319,6 +330,9 @@ int main(int argc, char *argv[])
 {
 	int i;
 	bool new_game = false, select_game = false;
+#ifdef __APPLE__
+	select_game = true;
+#endif
 	bool done = false;
 
 	const char *mstr = NULL;
@@ -480,7 +494,7 @@ int main(int argc, char *argv[])
 	if (mstr)
 		ANGBAND_SYS = mstr;
 #if !defined(WINDOWS) && !defined(DJGPP)
-	if (setlocale(LC_CTYPE, "")) {
+	if (setlocale(LC_CTYPE, "UTF-8")) {
 		/* Require UTF-8 */
 		if (!streq(nl_langinfo(CODESET), "UTF-8"))
 			quit("Angband requires UTF-8 support");

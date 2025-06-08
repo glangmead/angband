@@ -1,0 +1,45 @@
+# These are customized defaults for the interface options.
+# All lines begin with "option:" followed by the internal option name.
+# After the name is a colon followed by yes or no for the option's state.
+# Move with hjkl etc. (^ for underlying keys)
+option:hjkl_movement:yes
+# Use sound
+option:use_sound:no
+# Dismiss '-more-', 'y/n' prompts with any key
+option:quick_messages:yes
+# Use a keyset more closely based on Angband
+option:angband_keyset:no
+# Stop singing when you use the rest command
+option:stop_singing_on_rest:yes
+# Forgo bonus attacks on non-alert enemies
+option:forgo_attacking_unwary:yes
+# Audible beep (on errors/warnings)
+option:beep:no
+# Highlight the player with the cursor
+option:highlight_player:no
+# Highlight the target with the cursor
+option:highlight_target:yes
+# Highlight sleeping and unwary creatures
+option:highlight_unwary:yes
+# Show walls as solid blocks
+option:solid_walls:yes
+# Show walls with shaded background
+option:hybrid_walls:no
+# Color: Shimmer multi-colored things
+option:animate_flicker:no
+# Center map continuously
+option:center_player:no
+# Avoid centering while running
+option:run_avoid_center:no
+# Automatically clear '-more-' prompts
+option:auto_more:no
+# Allow mouse clicks to move the player
+option:mouse_movement:yes
+# Display a mark when something gets hit
+option:display_hits:yes
+# Always pickup items
+option:pickup_always:no
+# Always pickup items matching inventory
+option:pickup_inven:no
+# Show flavors in object descriptions
+option:show_flavors:no

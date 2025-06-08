@@ -2111,6 +2111,23 @@ static void update_player_compact_subwindow(game_event_type type,
 }
 
 
+static void update_touch_keyboard_subwindow(game_event_type type, game_event_data *data, void* user)
+{
+	term *old = Term;
+	term *inv_term = user;
+
+	/* Activate */
+	Term_activate(inv_term);
+
+	/* Display touch keyboard */
+	display_touch_keyboard(type, data, user);
+
+	Term_fresh();
+
+	/* Restore */
+	Term_activate(old);
+}
+
 static void flush_subwindow(game_event_type type, game_event_data *data,
 							void *user)
 {
@@ -2153,11 +2170,12 @@ const char *window_flag_desc[32] =
 #ifdef ALLOW_BORG
 	"Display borg messages",
 	"Display borg status",
+	"Display touch keyboard",
 #else
+	"Display touch keyboard",
 	NULL,
 	NULL,
 #endif
-	NULL,
 	NULL,
 	NULL,
 	NULL,
@@ -2250,6 +2268,12 @@ static void subwindow_flag_changed(int win_idx, uint32_t flag, bool new_state)
 						   update_topbar_subwindow,
 						   angband_term[win_idx]);
 
+			break;
+		}
+
+		case PW_TOUCH_KEYBOARD:
+		{
+			register_or_deregister(EVENT_INITSTATUS, update_touch_keyboard_subwindow, angband_term[win_idx]);
 			break;
 		}
 

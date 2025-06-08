@@ -1,0 +1,22 @@
+#=#=#=#=#=#=#=#=#=#=#=#=#=#=#=#=#=#=#=# begin Dump window settings
+# *Warning!*  The lines below are an automatic dump.
+# Don't edit them; changes will be deleted and replaced automatically.
+
+# Options
+
+# Window 'Term-1', Flag 'Display touch keyboard'
+window:1:14:1
+
+# Window 'Term-2', Flag 'Display monster list'
+window:2:10:1
+
+# Window 'Term-3', Flag 'Display item list'
+window:3:12:1
+
+# Window 'Term-4', Flag 'Display monster recall'
+window:4:8:1
+
+
+# *Warning!*  The lines above are an automatic dump.
+# Don't edit them; changes will be deleted and replaced automatically.
+#=#=#=#=#=#=#=#=#=#=#=#=#=#=#=#=#=#=#=# end Dump window settings
