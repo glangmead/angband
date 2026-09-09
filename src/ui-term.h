@@ -162,7 +162,6 @@ struct term
 	void *data;
 
 	bool user_flag;
-	bool send_char_clicked_as_keystroke;
 
 	bool data_flag;
 
@@ -320,7 +319,6 @@ extern int col_map[SIDEBAR_MAX];
 #define PW_STATUS           0x00000800L /* Display status */
 #define PW_ITEMLIST         0x00001000L /* Display item list */
 #define PW_PLAYER_3         0x00002000L /* Display player (topbar) */
-#define PW_TOUCH_KEYBOARD   0x00004000L /* Display touch keyboard */
 #ifdef ALLOW_BORG
  /* xxx */
 #define PW_BORG_1           0x00008000L /* Display borg messages */

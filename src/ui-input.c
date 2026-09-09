@@ -635,45 +635,6 @@ void message_flush(game_event_type unused, game_event_data *data, void *user)
 	}
 }
 
-void display_touch_keyboard(game_event_type unused, game_event_data *data, void *user) {
-	char keyboard_text[80];
-	wchar_t w_keyboard_text[80];
-	char path[512];
-	int term_width, term_height;
-	Term_get_size(&term_width, &term_height);
-	char *filename_vert =  "keyboard_vert.txt";
-	char *filename_horiz = "keyboard_horiz.txt";
-	char *filename = filename_horiz;
-	if (term_height * 2 > term_width) {
-		filename = filename_vert;
-	}
-	path_build(path, sizeof(path), ANGBAND_DIR_USER, filename);
-	ang_file *key_file = file_open(path, MODE_READ, FTYPE_TEXT);
-	if (!key_file) {
-		path_build(path, sizeof(path), ANGBAND_DIR_HELP, filename);
-		key_file = file_open(path, MODE_READ, FTYPE_TEXT);
-	}
-	if (!key_file)
-		return; // TODO: need to report errors
-
-	int term_line = 0;
-	int wstrlen = 0;
-	/* Clip to the term: Term_queue_chars() does not check its bounds */
-	while (term_line < term_height
-			&& file_getl(key_file, keyboard_text, sizeof(keyboard_text))) {
-		strunescape(keyboard_text);
-		wstrlen = text_mbstowcs(w_keyboard_text, keyboard_text, strlen(keyboard_text));
-		if (wstrlen > term_width) {
-			wstrlen = term_width;
-		}
-		if (wstrlen > 0) {
-			Term_queue_chars(0, term_line, wstrlen, COLOUR_L_WHITE, w_keyboard_text);
-		}
-		term_line++;
-	}
-	file_close(key_file);
-}
-
 /**
  * Clear the bottom part of the screen
  */

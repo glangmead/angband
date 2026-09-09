@@ -586,7 +586,6 @@ struct my_app {
 
 /* Forward declarations */
 
-static void send_sdl_keylike_event(struct sdlpui_window *window, wchar_t commandish_char);
 static void init_globals(struct my_app *a);
 static void free_globals(struct my_app *a);
 static bool read_config_file(struct my_app *a);
@@ -4165,7 +4164,6 @@ static bool handle_mousebutton(struct my_app *a,
 	term *old;
 	bool touched;
 
-	struct sdlpui_window *window = get_window_by_id(a, mouse->windowID);
 	if (!a->w_mouse) {
 		return false;
 	}
@@ -4307,13 +4305,6 @@ static bool handle_mousebutton(struct my_app *a,
 	old = Term;
 	Term_activate(subwindow->term);
 	Term_mousepress(col, row, button);
-	if (Term->send_char_clicked_as_keystroke)
-	{
-		int theint;
-		wchar_t thechar;
-		Term_what(col, row, &theint, &thechar);
-		send_sdl_keylike_event(window, thechar);
-	}
 	Term_activate(old);
 
 	return true;
@@ -4899,8 +4890,8 @@ static void refresh_angband_terms(struct my_app *a)
 	/*
 	 * A term the frontend resized keeps its old contents until the core
 	 * draws it again.  The redraw flags below cover the map and the usual
-	 * subwindows once a level exists; EVENT_REFRESH lets the others (the
-	 * touch keyboard term) notice at any time after the game's init.
+	 * subwindows once a level exists; EVENT_REFRESH freshens the main term
+	 * at any time after the game's init, before a level exists.
 	 */
 	if (player) {
 		event_signal(EVENT_REFRESH);
@@ -6196,35 +6187,6 @@ static void push_term_keypress(keycode_t code, uint8_t mods)
 	ev.type = SDL_USEREVENT;
 	ev.user.timestamp = SDL_GetTicks();
 	SDL_PushEvent(&ev);
-}
-
-/*
- * Send what a key of the touch keyboard term shows: the glyphs for the
- * special keys become key presses, anything else is typed as text (a
- * keyboard sends space as text, which is why it is not a key press here).
- */
-static void send_sdl_keylike_event(struct sdlpui_window *window, wchar_t commandish_char)
-{
-	SDL_Keycode kc = SDLK_UNKNOWN;
-
-	switch (commandish_char) {
-		case L'↑': kc = SDLK_UP; break;
-		case L'←': kc = SDLK_LEFT; break;
-		case L'↓': kc = SDLK_DOWN; break;
-		case L'→': kc = SDLK_RIGHT; break;
-		case L'⌫': kc = SDLK_BACKSPACE; break;
-		case L'⎋': kc = SDLK_ESCAPE; break;
-		case L'↵': kc = SDLK_RETURN; break;
-		case L'⇥': kc = SDLK_TAB; break;
-		case L'␣': commandish_char = L' '; break;
-	}
-	if (kc != SDLK_UNKNOWN) {
-		push_key_event(window, kc, 0);
-	} else {
-		char text[2] = { (char) commandish_char, '\0' };
-
-		push_text_event(window, text);
-	}
 }
 
 /*
@@ -9549,7 +9511,6 @@ static void load_term(struct subwindow *subwindow)
 	term *old = Term;
 	Term_activate(subwindow->term);
 	Term_redraw();
-	Term->send_char_clicked_as_keystroke = true;
 	Term_activate(old);
 
 	subwindow->linked = true;

@@ -47,6 +47,10 @@ characters that acts as a keyboard.
   `lib/ios/window.prf`. Clicks on that term become synthetic SDL events in
   `send_sdl_keylike_event` (`src/main-sdl2.c:5861`). That function is reused
   by the panel.
+  2026-09-09: removed, in the step 2d follow-up below. The panel does not
+  in fact use `send_sdl_keylike_event`; it pushes events itself, so that
+  function went too, along with `send_char_clicked_as_keystroke` on
+  `struct term`, which existed only to feed it.
 - Font: JuliaMono, which already has glyphs for Esc, Backspace, Space, Return,
   Tab and arrows.
 
@@ -600,6 +604,12 @@ performance on the iPad "great"); you chose candidate 2 for the strip
 layout. Nothing from 2d is committed yet. The session ended with a
 list of to-dos and questions under step 2d ("Next session") and two
 TBD discussion items in section 8. Committed 2026-09-09.
+2026-09-09, later: the three code boxes of that list are done --
+candidate 2 is the shipped default, the rose is 156 points with a 9
+point outline, and the touch keyboard hack is gone from Angband. Both
+orientations were exercised on the simulator and a saved game plays in
+portrait. What is left before step 3 is yours: the blank-term question
+and the device test.
 
 ### Step 0. Prerequisites
 
@@ -1162,16 +1172,19 @@ Next session (from the 2026-09-09 evening hand-off; in order):
       event-loop and texture fixes, the rose, the wide key stack, term
       1 as messages, this file), then the items below as their own
       commits. 2026-09-09: committed.
-- [ ] code: `lib/ios/sdl2init.txt` takes candidate 2's regions
+- [x] code: `lib/ios/sdl2init.txt` takes candidate 2's regions
       (`sdl2init.strip2.txt`) and `subwindow-font:1:30`; the candidate
-      files and `sdl2init.portraitA/B.txt` can then go.
-- [ ] code: rose 30 percent bigger in both directions (156 points,
+      files and `sdl2init.portraitA/B.txt` can then go. 2026-09-09: done;
+      the four candidate files are deleted and the region comment
+      rewritten to describe the layout rather than the comparison.
+- [x] code: rose 30 percent bigger in both directions (156 points,
       `PANEL_ROSE_SIZE_POINTS`) and the outline 10 percent thinner (9
       points, `PANEL_ROSE_LINE_POINTS`). Check the strip still holds
       it (candidate 2's strip is 262 points in portrait, 244 in
       landscape; the rose is centred, so it fits, with 40 points to
-      spare in landscape).
-- [ ] code: remove the touch keyboard hack now rather than in step 6:
+      spare in landscape). 2026-09-09: done; on the simulator the rose
+      clears the strip in both orientations, as the arithmetic said.
+- [x] code: remove the touch keyboard hack now rather than in step 6:
       `PW_TOUCH_KEYBOARD` in `src/ui-term.h`,
       `update_touch_keyboard_subwindow` in `src/ui-display.c`,
       `display_touch_keyboard` in `src/ui-input.c`, the defaults in
@@ -1180,6 +1193,19 @@ Next session (from the 2026-09-09 evening hand-off; in order):
       the window-flags menu, which you saw and which is not a thing.
       `send_sdl_keylike_event` in `main-sdl2.c` goes with it if nothing
       else uses it. Move the step 6 box here.
+      2026-09-09: done, all of it. Nothing else used
+      `send_sdl_keylike_event`, so it went, and with it
+      `send_char_clicked_as_keystroke` on `struct term` and the two
+      lines that set and read it (`load_term` set it on every subwindow
+      term, so before this a tap on any term typed the glyph under the
+      finger; taps now only reach the core as mouse presses, which is
+      why a tap on the map no longer dismisses the splash screen -- use
+      the panel). `ui-init.c`'s window-flag defaults go back to
+      upstream's, term 1 included, which is what `lib/ios/window.prf`
+      already asks for. `handle_mousebutton`'s `window` local became
+      unused and went. Checked on the simulator: builds clean, a saved
+      game loads and plays in portrait, and Term-1's Purpose submenu
+      now ends at "Display borg status" with "Display messages" ticked.
 - [ ] you decide: a blank term. Angband's window flags are a bitmask
       and a term with no flag set draws nothing, so "empty" already
       exists as "every flag off" in the window-flags menu; a named
@@ -1288,8 +1314,11 @@ Next session (from the 2026-09-09 evening hand-off; in order):
 - [ ] you test (simulator, then device): the system keyboard never
       appears, including at the character name prompt; a hardware keyboard
       still types.
-- [ ] code: remove the `PW_TOUCH_KEYBOARD` hack (files in section 2.1) in
+- [x] code: remove the `PW_TOUCH_KEYBOARD` hack (files in section 2.1) in
       Angband and NarSil; term 1 becomes messages; region files updated.
+      2026-09-09: moved up to the step 2d follow-up and done there for
+      Angband. NarSil and FAangband still carry the hack; they get it
+      with the step 3 port.
 - [ ] code: NarSil `Info.plist` orientations.
 - [ ] code: the Menu-open-at-launch bug, if still open.
 - [ ] you test (device): both orientations, a session from launch to the
