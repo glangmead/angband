@@ -1241,10 +1241,11 @@ Next session (from the 2026-09-09 evening hand-off; in order):
       the shipped default, no keyboard term anywhere. 2026-09-09:
       passed on the look ("I like how things look on my device"); the
       menu crashes found in the same session are the box above.
-- [ ] you test (device): the menu fix -- open a Term-N submenu and tap
+- [x] you test (device): the menu fix -- open a Term-N submenu and tap
       away, and turn a term's last purpose off, without a crash.
-- [ ] commit; then step 4 here, or the core hooks in
-      `CORE_HOOKS_PLAN.md`. Neither waits on the other.
+      2026-09-09: passed on the iPad. Step 2 is done.
+- [x] commit; then step 4 here, or the core hooks in
+      `CORE_HOOKS_PLAN.md`. Neither waits on the other. 2026-09-09.
 
 ### Step 3. Core hooks
 
@@ -1313,6 +1314,23 @@ theirs. Nothing in those steps waits on it; see section 4.6.
       should do anything yet. 2026-09-09: deferred by you in favour of
       movable pieces (section 8), which would make the position a drag
       rather than a decision.
+      2026-09-09, after the device test: the size and position are
+      settled (156 points, dragged where you want it), but the drawn
+      shape was wrong against Brogue and is now redone. What changed:
+      the diagonals are mirrored, so their sharp apex points outward at
+      the corner and the round lobe faces the centre, which is what
+      Brogue does and what the old code had backwards; they moved out
+      to sit in the corner cells; the outline halved to 4.5 points; and
+      the petal is built from true tangents to its lobe, so the sides
+      meet the arc smoothly instead of kinking, with a 7 degree bow for
+      Brogue's slight curve. The hit test is no longer angular: the
+      rose's square is divided in three each way and the nine cells are
+      the eight directions around the stay, so there are no dead zones
+      between petals and the drawn shape is a hint rather than the
+      target. Still unlike Brogue, if you want it: their cardinal
+      apexes run right into the centre square, ours stop short of it
+      (`PANEL_ROSE_CARD_APEX`, 0.30 of the radius; about 0.19 would
+      touch).
 - [x] you test (device): walk, run, alter, stay; sliding; that a finger
       resting on the rose does not fire twice. 2026-09-09: passed on the
       iPad; it behaves as on the simulator.

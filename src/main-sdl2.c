@@ -6239,27 +6239,35 @@ static void push_term_keypress(keycode_t code, uint8_t mods)
 /* the rose's default diameter, in points */
 #define PANEL_ROSE_SIZE_POINTS 156
 /* the petals' outline thickness, in points */
-#define PANEL_ROSE_LINE_POINTS 9
+#define PANEL_ROSE_LINE_POINTS 4.5f
 /*
- * Rose geometry, as fractions of its radius and half-angles in degrees.
- * A petal is a cone from an apex near the centre to a semicircular cap:
- * the cap's centre and radius are given per kind, and the tip is their
- * sum.  The hit test uses angular windows and reaches instead.
+ * Rose geometry, as fractions of the radius, measured along the petal's
+ * bearing from the rose's centre.  A petal is a teardrop: a sharp apex,
+ * two sides running as tangents to a circular lobe, and the lobe's major
+ * arc.  Because the sides are true tangents the joins are smooth, which
+ * is most of what makes the shape read as Brogue's.
+ *
+ * The cardinals point their apex at the centre and their lobe outward.
+ * The diagonals are mirrored -- apex outward, towards the corner of the
+ * square, lobe inward -- and sit far enough out that each falls in the
+ * corner cell of the rose's three-by-three division (see rose_hit).
  */
-#define PANEL_ROSE_DIAG_REACH 0.7f
-#define PANEL_ROSE_APEX 0.30f
-#define PANEL_ROSE_CARD_CAP 0.74f
+#define PANEL_ROSE_CARD_APEX 0.30f
+#define PANEL_ROSE_CARD_LOBE 0.74f
 #define PANEL_ROSE_CARD_RADIUS 0.26f
-#define PANEL_ROSE_DIAG_CAP 0.54f
-#define PANEL_ROSE_DIAG_RADIUS 0.16f
+#define PANEL_ROSE_DIAG_APEX 1.20f
+#define PANEL_ROSE_DIAG_LOBE 0.72f
+#define PANEL_ROSE_DIAG_RADIUS 0.20f
+/* how far a side bows outward from the straight tangent, in degrees */
+#define PANEL_ROSE_BOW_DEG 7.0f
 #define PANEL_ROSE_CENTER_SIDE 0.36f
-#define PANEL_ROSE_CENTER_HIT 0.3f
-#define PANEL_ROSE_CARDINAL_HALF 27.0f
-#define PANEL_ROSE_DIAGONAL_HALF 18.0f
 #define PANEL_ROSE_PETALS 8
 #define PANEL_ROSE_CENTER 8
-#define PANEL_ROSE_ARC_POINTS 9
-#define PANEL_ROSE_POINTS (1 + PANEL_ROSE_ARC_POINTS)
+/* interior points per bowed side, and points along the lobe's arc */
+#define PANEL_ROSE_SIDE_POINTS 10
+#define PANEL_ROSE_ARC_POINTS 15
+#define PANEL_ROSE_POINTS \
+	(1 + 2 * PANEL_ROSE_SIDE_POINTS + PANEL_ROSE_ARC_POINTS)
 /* the key stack's wide form: the chrome beside the tabs and grid */
 #define PANEL_WIDE_COLS (PANEL_CHROME_COLS + PANEL_GRID_COLS)
 #define PANEL_WIDE_ROWS (1 + PANEL_GRID_ROWS)
@@ -6951,76 +6959,177 @@ static int rose_digit(int petal)
 
 /*
  * What lies at (x, y), relative to the control: a petal, the centre, or
- * -1.  Cardinal petals own 54 degrees out to the full radius; diagonal
- * ones own 36 degrees out to PANEL_ROSE_DIAG_REACH of it.
+ * -1 when the point is outside the rose's square.
+ *
+ * The square is divided in three each way and the nine cells are the
+ * eight directions around the stay in the middle, as on a keypad.  The
+ * petals are drawn inside their cells but do not define them: a tap
+ * between two petals still walks, which is what a thumb wants.  The
+ * drawn shape is a hint, not the target.
  */
 static int rose_hit(const struct panel_rose *pr, int x, int y)
 {
-	float dx = (float)(x - pr->cx);
-	float dy = (float)(y - pr->cy);
-	float dist = sqrtf(dx * dx + dy * dy);
-	float bearing, off;
-	int petal;
+	/* cell (row, col) to petal, row 0 at the top; 8 is the centre */
+	static const int cells[3][3] = {
+		{ 7, 0, 1 },
+		{ 6, 8, 2 },
+		{ 5, 4, 3 }
+	};
+	float fx, fy;
+	int col, row;
 
 	if (pr->radius <= 0) {
 		return -1;
 	}
-	if (dist <= PANEL_ROSE_CENTER_HIT * pr->radius) {
-		return PANEL_ROSE_CENTER;
-	}
-	if (dist > pr->radius) {
+	fx = (float)(x - pr->cx) / pr->radius;
+	fy = (float)(y - pr->cy) / pr->radius;
+	if (fx < -1.0f || fx > 1.0f || fy < -1.0f || fy > 1.0f) {
 		return -1;
 	}
-	/* clockwise from north, in degrees */
-	bearing = atan2f(dx, -dy) * 180.0f / (float) M_PI;
-	if (bearing < 0.0f) {
-		bearing += 360.0f;
-	}
-	petal = (int)((bearing + 22.5f) / 45.0f) % PANEL_ROSE_PETALS;
-	off = fabsf(bearing - 45.0f * petal);
-	if (off > 180.0f) {
-		off = 360.0f - off;
-	}
-	if (petal % 2 == 0) {
-		return (off <= PANEL_ROSE_CARDINAL_HALF) ? petal : -1;
-	}
-	return (off <= PANEL_ROSE_DIAGONAL_HALF
-		&& dist <= PANEL_ROSE_DIAG_REACH * pr->radius) ? petal : -1;
+	col = (fx < -1.0f / 3.0f) ? 0 : ((fx > 1.0f / 3.0f) ? 2 : 1);
+	row = (fy < -1.0f / 3.0f) ? 0 : ((fy > 1.0f / 3.0f) ? 2 : 1);
+	return cells[row][col];
 }
 
 /*
- * The outline of a petal as a closed polygon: the apex, then the
- * semicircular cap from one side of the cone round the tip to the other.
+ * One side of a petal, as a cubic Bezier from the apex to a tangent
+ * point on the lobe.  The control point at the lobe end sits on the
+ * tangent line, so the side meets the arc smoothly; the one at the apex
+ * is swung out by PANEL_ROSE_BOW_DEG, which bows the side outward
+ * without rounding the apex.  Writes the interior points only, in order
+ * from the apex, so the caller owns both ends.
+ */
+static void rose_petal_side(SDL_FPoint apex, SDL_FPoint tan_pt,
+		float outx, float outy, SDL_FPoint *pts)
+{
+	float dx = tan_pt.x - apex.x, dy = tan_pt.y - apex.y;
+	float len = sqrtf(dx * dx + dy * dy);
+	float bow = tanf(PANEL_ROSE_BOW_DEG * (float) M_PI / 180.0f);
+	float bx, by, bl;
+	SDL_FPoint p1, p2;
+	int i;
+
+	if (len < 1e-6f) {
+		for (i = 0; i < PANEL_ROSE_SIDE_POINTS; i++) {
+			pts[i] = apex;
+		}
+		return;
+	}
+	dx /= len;
+	dy /= len;
+	/* the apex tangent, swung towards the petal's outer side */
+	bx = dx + bow * outx;
+	by = dy + bow * outy;
+	bl = sqrtf(bx * bx + by * by);
+	bx /= bl;
+	by /= bl;
+	p1.x = apex.x + 0.45f * len * bx;
+	p1.y = apex.y + 0.45f * len * by;
+	p2.x = tan_pt.x - 0.30f * len * dx;
+	p2.y = tan_pt.y - 0.30f * len * dy;
+	for (i = 0; i < PANEL_ROSE_SIDE_POINTS; i++) {
+		float t = (float)(i + 1) / (PANEL_ROSE_SIDE_POINTS + 1);
+		float m = 1.0f - t;
+		float w0 = m * m * m, w1 = 3.0f * m * m * t;
+		float w2 = 3.0f * m * t * t, w3 = t * t * t;
+
+		pts[i].x = w0 * apex.x + w1 * p1.x + w2 * p2.x + w3 * tan_pt.x;
+		pts[i].y = w0 * apex.y + w1 * p1.y + w2 * p2.y + w3 * tan_pt.y;
+	}
+}
+
+/*
+ * The outline of a petal as a closed polygon: the apex, one side out to
+ * the lobe, the lobe's major arc, and the other side back.  The sides
+ * are tangents to the lobe, found from the apex's distance to the lobe's
+ * centre, so there is no kink where they meet the arc.  A cardinal's
+ * lobe lies outside its apex and a diagonal's inside it; the sign s
+ * carries that difference and the rest of the arithmetic is shared.
  * (ox, oy) is the control's origin in the target's coordinates.
+ *
+ * With inset greater than zero this returns the outline inset by that
+ * much, for the inner edge of a stroke: a narrower lobe and an apex
+ * moved along the axis to where the inset sides now meet.  Offsetting
+ * the sampled polygon instead would fold it at the apex, where the
+ * points are closer together than the stroke is thick.
  */
 static int rose_petal_points(const struct panel_rose *pr, int petal,
-		float ox, float oy, SDL_FPoint *pts)
+		float ox, float oy, float inset, SDL_FPoint *pts)
 {
 	float bearing = 45.0f * petal * (float) M_PI / 180.0f;
 	/* along the petal, outward, and across it */
 	float ux = sinf(bearing), uy = -cosf(bearing);
 	float vx = cosf(bearing), vy = sinf(bearing);
 	bool cardinal = (petal % 2 == 0);
-	float apex = PANEL_ROSE_APEX * pr->radius;
-	float cap = (cardinal ? PANEL_ROSE_CARD_CAP : PANEL_ROSE_DIAG_CAP)
+	float apex_d = (cardinal ? PANEL_ROSE_CARD_APEX : PANEL_ROSE_DIAG_APEX)
+		* pr->radius;
+	float lobe_d = (cardinal ? PANEL_ROSE_CARD_LOBE : PANEL_ROSE_DIAG_LOBE)
 		* pr->radius;
 	float rho = (cardinal ? PANEL_ROSE_CARD_RADIUS : PANEL_ROSE_DIAG_RADIUS)
 		* pr->radius;
 	float cx = ox + pr->cx, cy = oy + pr->cy;
+	/* s points from the apex towards the lobe's centre */
+	float s = (lobe_d > apex_d) ? 1.0f : -1.0f;
+	float d = fabsf(lobe_d - apex_d);
+	/* the lobe's frame: towards the apex, and across */
+	float wx = -s * ux, wy = -s * uy;
+	SDL_FPoint apex, lx, tan_a, tan_b;
+	float phi;
 	int n = 0, k;
 
-	pts[n].x = cx + apex * ux;
-	pts[n].y = cy + apex * uy;
-	n++;
-	for (k = 0; k < PANEL_ROSE_ARC_POINTS; k++) {
-		float a = (90.0f - 180.0f * k / (PANEL_ROSE_ARC_POINTS - 1))
-			* (float) M_PI / 180.0f;
-		float along = cap + rho * cosf(a), across = rho * sinf(a);
+	if (inset > 0.0f) {
+		/*
+		 * The sides are tangents, so insetting them by this much
+		 * moves their meeting point inset * d / rho along the axis.
+		 */
+		float room = 0.45f * d;
 
-		pts[n].x = cx + along * ux + across * vx;
-		pts[n].y = cy + along * uy + across * vy;
+		if (inset > 0.6f * rho) {
+			inset = 0.6f * rho;
+		}
+		apex_d += s * MIN(inset * d / rho, room);
+		rho -= inset;
+		d = fabsf(lobe_d - apex_d);
+	}
+	apex.x = cx + apex_d * ux;
+	apex.y = cy + apex_d * uy;
+	lx.x = cx + lobe_d * ux;
+	lx.y = cy + lobe_d * uy;
+	if (d <= rho * 1.02f) {
+		/* Degenerate: the apex is inside the lobe.  Draw the lobe. */
+		d = rho * 1.02f;
+	}
+	phi = acosf(rho / d);
+	/*
+	 * Angles run from the direction of the apex, positive towards +v.
+	 * The tangent points are at +phi and -phi; the outline follows the
+	 * major arc between them, through the far side of the lobe.
+	 */
+	tan_a.x = lx.x + rho * (cosf(phi) * wx + sinf(phi) * vx);
+	tan_a.y = lx.y + rho * (cosf(phi) * wy + sinf(phi) * vy);
+	tan_b.x = lx.x + rho * (cosf(phi) * wx - sinf(phi) * vx);
+	tan_b.y = lx.y + rho * (cosf(phi) * wy - sinf(phi) * vy);
+
+	pts[n++] = apex;
+	rose_petal_side(apex, tan_a, vx, vy, pts + n);
+	n += PANEL_ROSE_SIDE_POINTS;
+	for (k = 0; k < PANEL_ROSE_ARC_POINTS; k++) {
+		float psi = phi + (2.0f * (float) M_PI - 2.0f * phi)
+			* k / (PANEL_ROSE_ARC_POINTS - 1);
+
+		pts[n].x = lx.x + rho * (cosf(psi) * wx + sinf(psi) * vx);
+		pts[n].y = lx.y + rho * (cosf(psi) * wy + sinf(psi) * vy);
 		n++;
 	}
+	/* The far side, from the lobe back to the apex. */
+	rose_petal_side(apex, tan_b, -vx, -vy, pts + n);
+	for (k = 0; k < PANEL_ROSE_SIDE_POINTS / 2; k++) {
+		SDL_FPoint tmp = pts[n + k];
+
+		pts[n + k] = pts[n + PANEL_ROSE_SIDE_POINTS - 1 - k];
+		pts[n + PANEL_ROSE_SIDE_POINTS - 1 - k] = tmp;
+	}
+	n += PANEL_ROSE_SIDE_POINTS;
 	return n;
 }
 
@@ -7052,57 +7161,6 @@ static void rose_fill_polygon(SDL_Renderer *r, const SDL_FPoint *pts, int n,
 		indices[3 * i + 2] = ((i + 1) % n) + 1;
 	}
 	SDL_RenderGeometry(r, NULL, verts, n + 1, indices, 3 * n);
-}
-
-/*
- * Offset a closed polygon inward by t, for the inner edge of a thick
- * outline: each vertex moves along the bisector of its edges' inward
- * normals, far enough that both edges move by t.
- */
-static void rose_inset_polygon(const SDL_FPoint *pts, int n, float t,
-		SDL_FPoint *out)
-{
-	float area = 0.0f, sign;
-	int i;
-
-	for (i = 0; i < n; i++) {
-		const SDL_FPoint *a = &pts[i], *b = &pts[(i + 1) % n];
-
-		area += a->x * b->y - b->x * a->y;
-	}
-	/* The interior lies to the left of each edge of a positive-area polygon. */
-	sign = (area > 0.0f) ? 1.0f : -1.0f;
-	for (i = 0; i < n; i++) {
-		const SDL_FPoint *p = &pts[(i + n - 1) % n], *c = &pts[i],
-			*q = &pts[(i + 1) % n];
-		float d0x = c->x - p->x, d0y = c->y - p->y;
-		float d1x = q->x - c->x, d1y = q->y - c->y;
-		float l0 = sqrtf(d0x * d0x + d0y * d0y);
-		float l1 = sqrtf(d1x * d1x + d1y * d1y);
-		float n0x, n0y, n1x, n1y, mx, my, ml, cosang;
-
-		if (l0 < 1e-6f || l1 < 1e-6f) {
-			out[i] = *c;
-			continue;
-		}
-		n0x = -sign * d0y / l0;
-		n0y = sign * d0x / l0;
-		n1x = -sign * d1y / l1;
-		n1y = sign * d1x / l1;
-		mx = n0x + n1x;
-		my = n0y + n1y;
-		ml = sqrtf(mx * mx + my * my);
-		if (ml < 1e-6f) {
-			out[i] = *c;
-			continue;
-		}
-		mx /= ml;
-		my /= ml;
-		/* cos of half the turn; the miter is capped at four times t */
-		cosang = MAX(mx * n0x + my * n0y, 0.25f);
-		out[i].x = c->x + mx * t / cosang;
-		out[i].y = c->y + my * t / cosang;
-	}
 }
 
 /* Fill the ring between a polygon and its inset as a strip of triangles. */
@@ -7253,11 +7311,12 @@ static void render_panel_rose(struct sdlpui_control *c,
 	SDL_GetRenderDrawBlendMode(r, &old_mode);
 	SDL_SetRenderDrawBlendMode(r, SDL_BLENDMODE_BLEND);
 	for (petal = 0; petal < PANEL_ROSE_PETALS; petal++) {
-		n = rose_petal_points(pr, petal, ox, oy, pts);
+		n = rose_petal_points(pr, petal, ox, oy, 0.0f, pts);
 		if (pr->armed && pr->active == petal) {
 			rose_fill_polygon(r, pts, n, solid);
 		} else {
-			rose_inset_polygon(pts, n, thickness, inner);
+			(void) rose_petal_points(pr, petal, ox, oy, thickness,
+				inner);
 			rose_fill_ring(r, pts, inner, n, outline);
 		}
 	}
