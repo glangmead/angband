@@ -222,8 +222,9 @@ them.
 - Bug observed, not fixed: the status bar's Menu dropdown is open when the
   app comes up, on every launch, in both Angband and NarSil. A tap anywhere
   closes it. Probably a spurious mouse-down at the origin during SDL's iOS
-  startup. Look at it in step 2a when mouse routing gets attention. Not yet
-  checked on a device.
+  startup. Confirmed on the iPad too (Angband, landscape, first launch), so
+  it is real. Find and fix it in step 2a, where mouse routing gets
+  attention anyway.
 - iPadOS 26 orientation behaviour, seen on the simulator: an app that
   restricts itself to landscape is not rotated. With landscape-only
   `Info.plist` orientations (NarSil today) the landscape canvas is drawn
@@ -233,7 +234,14 @@ them.
   environment variable) the app opens as a floating, resizable window. So
   the app must accept every orientation and lay out for whatever size it is
   given, which is what regions do. Treat the window size as arbitrary, not
-  as one of two device sizes.
+  as one of two device sizes. On hardware (iPad Pro 11-inch M4, 2026-09-08)
+  Angband, which now allows portrait, does rotate and receives a resize
+  event. What it then draws is wrong for two reasons that step 1 fixes: the
+  renderer's logical size is set once in `start_window` and never
+  refreshed, so the old 2420 by 1668 logical space is scaled into a 1668 by
+  1150 band in the middle of the portrait screen; and inside that space the
+  absolute rects are only clamped. Screenshot:
+  `~/Downloads/andband_rotated.png`.
 - GitHub issues are disabled on `glangmead/angband`. Work is tracked in this
   file.
 - Step 0 is committed on `sdl2-touch-panel` in this repository and in
@@ -467,10 +475,19 @@ Port the angbandroid patch, renamed so nothing says Android:
 Decided in step 0: no macOS SDL2 build. The panel is developed on the iPad
 simulator, where touches arrive as mouse events exactly as on the device.
 
-- Device: iPad Pro 11-inch (M5), iOS 26.5, udid
+- Simulator: iPad Pro 11-inch (M5), iOS 26.5, udid
   `1EF4F5CD-E295-4DB7-9427-00B9B0A3913C`; a 13-inch M5 on the same runtime
   exists for the second size. Screen is 1668 by 2420 pixels, 834 by 1210
   points, scale 2.
+- Hardware: "Greg's iPad", an iPad Pro 11-inch (M4) with the same screen,
+  listed by `xcrun devicectl list devices` when paired. Install path:
+  `bash ./gregcmake2.sh`, then `cd build && cpack -G ZIP -C RelWithDebInfo`,
+  then drag `build/Angband.ipa` onto Sideloadly. The GitHub workflow builds
+  the same `.ipa` as an artifact. After an Xcode update, delete
+  `build/CMakeCache.txt` and `build/CMakeFiles` first, because the toolchain
+  caches the SDK path; keep `build/_deps`, which the simulator builds reuse.
+  For a clean-install test, delete the app or remove `sdl2init.txt` from its
+  Documents folder in Files, or the layout comes from that file.
 - `./gregsim.sh` in each repository configures (first run), builds, installs
   and launches; `./gregsim.sh shot out.png` screenshots. It reads the app
   name from `CMakeLists.txt` and reuses the SDL sources already fetched into
@@ -507,8 +524,8 @@ Tick boxes in place. When something surprising happens, add a dated line
 under the step rather than editing history. Each step still ends in a state
 that runs on the simulator. Step numbers match the rest of this file.
 
-**Status 2026-09-08:** step 0 done and committed in Angband and NarSil, except
-the optional device test; step 1 not started.
+**Status 2026-09-08:** step 0 complete, including the device test; step 1
+not started.
 
 ### Step 0. Prerequisites
 
@@ -532,10 +549,16 @@ the optional device test; step 1 not started.
 - [x] code: point `.github/workflows/ios.yaml` at `sdl2-touch-panel` (it
       still triggers on `sdl2-term-touch-keyboard`), or add the branch.
       Added in Angband and NarSil; FAangband when it gets the branch.
-- [ ] you test (device; optional now, required before step 6): install the
+- [x] you test (device; optional now, required before step 6): install the
       fixed Angband build on the iPad; confirm the tuned layout appears on
       a clean install; note whether the Menu dropdown is open at launch on
-      hardware.
+      hardware. Done on the iPad Pro 11-inch (M4): landscape layout correct
+      (`~/Downloads/angband_landscape.png`); NarSil plays a turn by touch
+      and its toolkit Menu works; the Menu dropdown is open at first launch
+      on hardware as well.
+      Rotating to portrait redrew the terms in the wrong places
+      (`~/Downloads/andband_rotated.png`, filename sic); see section 2.6 and
+      the logical-size item in step 1.
 
 ### Step 1. Regions
 
@@ -552,6 +575,11 @@ the optional device test; step 1 not started.
       While there, fix the `|` that should be `&` on the HiDPI check in
       `handle_last_resize_event`. Done when a portrait launch shows a
       portrait layout.
+- [ ] code: on resize, refresh `SDL_RenderSetLogicalSize` to the new
+      renderer output size (or drop the logical size and use the output
+      size directly) before re-laying out. Today it is set once in
+      `start_window`; the rotated-device screenshot in section 2.6 shows the
+      consequence. Done when a rotation on the device fills the screen.
 - [ ] code: map font fit: new `subwindow-font-max` and `subwindow-font-min`
       keys; try sizes downward with `reload_font` until cols >= 80 and rows
       >= 24. Done when the portrait map is 80 by 24 at the largest size that
@@ -594,8 +622,8 @@ the optional device test; step 1 not started.
       arrows move the character.
 - [ ] you test (device): tap targets. Are 44 points times `ui_scale` big
       enough for you? Does anything need to move away from the screen edge?
-- [ ] code: fix the Menu-open-at-launch bug (section 2.6) if it turns out
-      to live in mouse routing; otherwise record where it does live.
+- [ ] code: find and fix the Menu-open-at-launch bug (section 2.6). It
+      reproduces on the simulator and on the device, in both variants.
 - [ ] commit.
 
 2b. Tabs and modifiers.
@@ -738,8 +766,8 @@ the optional device test; step 1 not started.
 - iOS: system keyboard never appears; hardware keyboard still works through
   SDL; rotation re-lays out without a restart.
 - Step 0: NarSil with the unified frontend plays a turn on the simulator
-  (done 2026-09-08) and on the iPad (pending) before any panel commit
-  reaches it.
+  and on the iPad (both done 2026-09-08) before any panel commit reaches
+  it.
 
 ## 7. Porting notes for the other two variants
 
