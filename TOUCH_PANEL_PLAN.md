@@ -564,9 +564,9 @@ under the step rather than editing history. Each step still ends in a state
 that runs on the simulator. Step numbers match the rest of this file.
 
 **Status 2026-09-09:** step 0 complete. Step 1 done, tested on the
-simulator and the iPad, and committed in this repository; the portrait
-split decision is deferred until the panel exists. Next: the step 1
-cherry-picks to NarSil and FAangband, then step 2.
+simulator and the iPad, committed in this repository and cherry-picked to
+NarSil and FAangband; the portrait split decision is deferred until the
+panel exists. Next: step 2a.
 
 ### Step 0. Prerequisites
 
@@ -589,7 +589,8 @@ cherry-picks to NarSil and FAangband, then step 2.
 - [x] commit (NarSil): the unification as one commit.
 - [x] code: point `.github/workflows/ios.yaml` at `sdl2-touch-panel` (it
       still triggers on `sdl2-term-touch-keyboard`), or add the branch.
-      Added in Angband and NarSil; FAangband when it gets the branch.
+      Added in Angband and NarSil; FAangband when it gets the branch
+      (done 2026-09-09 with the step 1 port).
 - [x] you test (device; optional now, required before step 6): install the
       fixed Angband build on the iPad; confirm the tuned layout appears on
       a clean install; note whether the Menu dropdown is open at launch on
@@ -738,10 +739,40 @@ cherry-picks to NarSil and FAangband, then step 2.
       that a hardware keyboard still works after a rotation. Passed
       2026-09-09, including the keyboard redraw fix.
 - [x] commit (angband). 2026-09-09.
-- [ ] code: cherry-pick to `../NarSil_fork` and `../FAangband_fork`; NarSil
+- [x] code: cherry-pick to `../NarSil_fork` and `../FAangband_fork`; NarSil
       `sdl2init.txt` gets its own region file with the 54 px status bar.
-- [ ] you test: NarSil on the simulator in both orientations.
-- [ ] commit (NarSil, FAangband).
+      2026-09-09: done. NarSil's `main-sdl2.c` was byte-identical to the
+      pre-step-1 file, so the frontend hunks applied; `ui-display.c` and
+      `ui-input.c` were merged by hand (one conflict, the event
+      registrations). NarSil's region file keeps its old absolute rects
+      (54 px bar) as fallbacks under the same region lines; with the
+      unified frontend its status bar is 42 px like Angband's, and the
+      regions are per-mille of the area below it either way. FAangband
+      had no `sdl2-touch-panel` branch: created from
+      `sdl2-term-touch-keyboard`; the cherry-pick had one whitespace
+      conflict in `main-sdl2.c`; `gregsim.sh` arrived with it; the
+      workflow trigger and the portrait `Info.plist` change (both step 0
+      items in Angband) were added as separate commits. FAangband's
+      uncommitted `src/ui-init.c` edit (default window flags for terms 5
+      and 6) was left in its working tree, not committed. Both forks
+      build for the simulator. The plan file stays in this repository
+      only. NarSil's first simulator link failed once with no diagnostic
+      and succeeded on a rerun of the same build.
+- [x] you test: NarSil on the simulator in both orientations.
+      2026-09-09: NarSil's `Info.plist` was still landscape-only, so the
+      first portrait launch drew the landscape layout (82 by 24 at 36
+      point, correct for 2420 by 1668) letterboxed in the portrait
+      screen; with portrait allowed (the same plist change as Angband's,
+      committed), a portrait launch gives 82 by 30 at 34 point, the same
+      numbers as Angband. The Mac was locked, so no scripted rotation;
+      the Size button plus a swipe resized the map without a crash. A
+      real rotation of NarSil is still untested. Note: CMake bakes
+      `Info.plist` into the Xcode project at configure time, so a plist
+      edit needs `cmake build-sim` (a reconfigure) before the bundle
+      picks it up; `cmake --build` alone reused the old one.
+- [x] commit (NarSil, FAangband). 2026-09-09: NarSil `004f9d85b` (step
+      1) and `e193f1ddc` (plist); FAangband `d4d957da5` (step 1),
+      `6c2bcfb62` (plist), `e6be97d15` (CI trigger).
 
 ### Step 2. Panel scaffold
 
