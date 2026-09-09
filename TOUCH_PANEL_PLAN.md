@@ -224,7 +224,8 @@ them.
   closes it. Probably a spurious mouse-down at the origin during SDL's iOS
   startup. Confirmed on the iPad too (Angband, landscape, first launch), so
   it is real. Find and fix it in step 2a, where mouse routing gets
-  attention anyway.
+  attention anyway. 2026-09-09: fixed in step 2a (a spurious mouse
+  motion to the origin, not a mouse-down; see the step 2a notes).
 - iPadOS 26 orientation behaviour, seen on the simulator: an app that
   restricts itself to landscape is not rotated. With landscape-only
   `Info.plist` orientations (NarSil today) the landscape canvas is drawn
@@ -547,6 +548,21 @@ simulator, where touches arrive as mouse events exactly as on the device.
     catches ("Exiting on signal 11"), no report is written; attach
     `lldb -p <pid> --batch -o "process continue" -o "bt 30"` before
     reproducing to get a backtrace.
+  - Learned during step 2a (2026-09-09):
+    - A few `SDL_Log` lines in `get_event`, printing each event's type,
+      coordinates and device for the first minute, show exactly what the
+      simulator delivers; that is how the Menu bug was found. A touch
+      arrives as a motion, a button down and a button up, all with
+      `which` set to the touch id (4294967295).
+    - Once, before the panel existed, a tap on the map with the Menu
+      dropdown open was followed by an `SDL_TEXTINPUT` of a single
+      space. Not seen since. If it recurs, suspect SDL's hidden text
+      field on iOS; the step 6 screen keyboard hint is the place to look.
+    - CMake bakes `os/ios/Info.plist` into the Xcode project at
+      configure time; after editing it run `cmake build-sim` before
+      `cmake --build`, or the bundle keeps the old plist.
+    - The Mac stayed locked all session, so every check used `idb`
+      taps and the console; no scripted rotation was possible.
 
 ## 5. Implementation steps
 
@@ -566,7 +582,8 @@ that runs on the simulator. Step numbers match the rest of this file.
 **Status 2026-09-09:** step 0 complete. Step 1 done, tested on the
 simulator and the iPad, committed in this repository and cherry-picked to
 NarSil and FAangband; the portrait split decision is deferred until the
-panel exists. Next: step 2a.
+panel exists. Step 2a code done, tested on the simulator and committed
+here; its device test (tap targets) is open. Next: step 2b.
 
 ### Step 0. Prerequisites
 
@@ -778,22 +795,71 @@ panel exists. Next: step 2a.
 
 2a. Chrome keys.
 
-- [ ] code: `panel` config line (`panel:on` or `off`) and the panel region
+- [x] code: `panel` config line (`panel:on` or `off`) and the panel region
       reserved: `get_subwindow_by_xy` ignores it; a pinned, borderless
       `sdlpui` dialog is created over it with `panel-alpha`. Done when a
       translucent rectangle sits where the panel goes and taps on it do not
-      reach the term underneath.
-- [ ] code: `panel_key` control type registered with
+      reach the term underneath. 2026-09-09: done. `panel:on|off` and
+      `panel-alpha:<0-255>` bind to window 0 like the region lines and
+      are written back after them; defaults on and 160. The panel is a
+      dialog of a new type (`PANEL_CODE`), created in `start_window` once
+      the panel rect is resolved and moved, created or removed by
+      `relayout_panel` from `resolve_layout`. Like the toolkit's own
+      dialogs it has no texture and draws straight to the window;
+      `render_all` draws it after the terms, because that pass draws
+      dialogs before them (the status bar never overlapped a term, so
+      that never showed). While any dialog has focus the window is redrawn
+      through the menu-active path and `term_xtra_fresh` skips redraws,
+      so the panel yields mouse and key focus at every release and holds
+      none between taps. Touch has no hover, so `handle_mousebutton` now
+      gives the dialog under a press focus first, through the code the
+      motion path uses (`give_dialog_focus_at`); SDL also drops a motion
+      that does not change the position, so two taps on the same spot
+      produce one motion. `get_subwindow_by_xy` returns NULL inside the
+      panel. In `lib/ios/sdl2init.txt` the panel sits over the keyboard
+      term, which shows through at alpha 160 but takes no taps; until
+      step 2b the game is played with the eight chrome keys, a hardware
+      keyboard or `idb` keys.
+- [x] code: `panel_key` control type registered with
       `sdlpui_register_code`: label, action, pressed state, face font.
       Chrome keys Escape, Enter, Backspace, Space and the four arrows, sent
       through `send_sdl_keylike_event` extended with modifiers. Done when,
       on the simulator via `idb`, Escape closes the command menu and the
-      arrows move the character.
+      arrows move the character. 2026-09-09: done. A key sends a keycode
+      with modifiers (`push_key_event`) or text (`push_text_event`);
+      `send_sdl_keylike_event` now goes through the same two. It fires on
+      the press, not the release, so a held key can repeat in step 2c,
+      and shows a pressed state; faces use the dialog font for now. Space
+      is sent as text, as a keyboard does: `keyboard_event_to_angband_key`
+      has no case for `SDLK_SPACE`, so the keyboard term's ␣ key had
+      never worked; fixed there the same way. Chrome grid: four columns
+      at the panel's top left, keys 44 points high and up to 88 wide.
+      Verified on the simulator with `idb` taps: eight Enters take a new
+      character from the splash screen to the town, three right arrows
+      move it to a wall, Enter opens the command menu and Esc closes it,
+      and a tap on the panel background over the keyboard term's `C`
+      does not open the character sheet. Key centres in portrait, in
+      points, for `idb ui tap`: Esc 46,855; ↑ 134,855; Enter 222,855;
+      ⌫ 310,855; ← 46,903; ↓ 134,903; → 222,903; Space 310,903.
+      Screenshots: `~/Downloads/step2a_panel_launch.png` (portrait
+      launch, Menu closed, panel over the keyboard term) and
+      `step2a_panel_town_menu.png` (in town with the command menu open).
 - [ ] you test (device): tap targets. Are 44 points times `ui_scale` big
       enough for you? Does anything need to move away from the screen edge?
-- [ ] code: find and fix the Menu-open-at-launch bug (section 2.6). It
+- [x] code: find and fix the Menu-open-at-launch bug (section 2.6). It
       reproduces on the simulator and on the device, in both variants.
-- [ ] commit.
+      2026-09-09: found with a temporary event trace in `get_event`:
+      right after the window's mouse-enter event SDL delivers a mouse
+      motion to (0,0) from device 0, not the touch id. It comes from
+      `SDL_uikitview.m`'s `pointerInteraction:regionForRequest:` (SDL
+      2.33), which reports the request's location as a motion when the
+      pointer region is set up; the toolkit's submenu buttons open on
+      gaining mouse focus, so the Menu opened. Fix in
+      `handle_mousemotion`: a motion to exactly (0,0) with no button
+      held is ignored. Verified closed at launch on the simulator; the
+      device gets the same code. The fix reaches NarSil and FAangband
+      with the next cherry-pick (step 8).
+- [x] commit. 2026-09-09.
 
 2b. Tabs and modifiers.
 
@@ -979,4 +1045,4 @@ panel exists. Next: step 2a.
   This repository would stay canonical.
 - Rebasing `../NarSil_fork` `main` onto upstream, 124 commits behind as of
   2026-09-08. Nothing there touches `main-sdl2.c`.
-- The Menu dropdown open at launch (section 2.6).
+- The Menu dropdown open at launch (section 2.6): fixed in step 2a.

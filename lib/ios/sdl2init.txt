@@ -34,6 +34,11 @@ region:sub3:portrait:500:520:500:160
 region:sub1:portrait:0:680:1000:320
 region:panel:portrait:0:680:1000:320
 
+# The touch panel is drawn over its region; panel:off hides it. panel-alpha
+# is the opacity of its background, 0 to 255.
+panel:on
+panel-alpha:160
+
 # The map font is chosen between font-min and font-max: the largest size at
 # which 80 by 24 fits the map region. The other terms keep their font size.
 # Terms are drawn in file order, so the map (term 0) comes last.

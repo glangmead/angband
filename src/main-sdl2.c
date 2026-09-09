@@ -82,6 +82,8 @@
 /* for "Alpha" button; in percents */
 #define DEFAULT_ALPHA_STEP 10
 #define DEFAULT_ALPHA_LOWEST 0
+/* opacity of the touch panel's background when the config has no panel-alpha */
+#define DEFAULT_PANEL_ALPHA 160
 
 #define DEFAULT_WALLPAPER "att-128.png"
 #define DEFAULT_WALLPAPER_DIR \
@@ -271,6 +273,13 @@ struct window_config {
 
 	struct layout_region regions[MAX_REGIONS];
 	int num_regions;
+
+	/*
+	 * The touch panel is drawn over the "panel" region when enabled;
+	 * panel_alpha is the opacity of its background, 0 to 255.
+	 */
+	bool panel_enabled;
+	int panel_alpha;
 };
 
 /* struct subwindow is representation of angband's term */
@@ -425,6 +434,8 @@ struct sdlpui_window {
 	struct sdlpui_dialog *shorte;
 	/* The SDL details dialog; NULL if not currently displayed */
 	struct sdlpui_dialog *detaild;
+	/* The touch panel; NULL if there is none (see load_panel()) */
+	struct sdlpui_dialog *panel;
 
 	int pixelformat;
 
@@ -553,6 +564,13 @@ static const struct layout_region *find_region(
 static void region_to_rect(const struct sdlpui_window *window,
 		const struct layout_region *r, SDL_Rect *rect);
 static void resolve_panel_rect(struct sdlpui_window *window);
+static void load_panel(struct sdlpui_window *window);
+static void relayout_panel(struct sdlpui_window *window);
+static void push_key_event(struct sdlpui_window *window, SDL_Keycode sym,
+		Uint16 mod);
+static void push_text_event(struct sdlpui_window *window, const char *utf8);
+static bool give_dialog_focus_at(struct my_app *a,
+		const SDL_MouseMotionEvent *mouse);
 static void ensure_minimum_rect(const struct subwindow *subwindow,
 		SDL_Rect *rect);
 static void resize_subwindow(struct subwindow *subwindow);
@@ -607,6 +625,9 @@ static void recreate_textures(struct my_app *a, bool all);
 const char help_sdl2[] = "SDL2 frontend, subopts -v";
 static struct my_app g_app;
 static Uint32 SHORTCUT_EDITOR_CODE;
+/* type codes for the touch panel dialog and its key controls */
+static Uint32 PANEL_CODE;
+static Uint32 PANEL_KEY_CODE;
 
 /*
  * Provide the hooks needed by primitive UI toolkit for SDL2.
@@ -935,6 +956,9 @@ static void render_all(struct sdlpui_window *window)
 	render_background(window);
 
 	for (d = window->d_tail; d; d = d->prev) {
+		if (d == window->panel) {
+			continue;
+		}
 		if (d->texture) {
 			SDL_RenderCopy(window->renderer, d->texture, NULL,
 				&d->rect);
@@ -951,6 +975,11 @@ static void render_all(struct sdlpui_window *window)
 					subwindow->texture,
 					NULL, &subwindow->full_rect);
 		}
+	}
+
+	/* The touch panel overlaps the terms in its region; draw it over them. */
+	if (window->panel && window->panel->ftb->render) {
+		(*window->panel->ftb->render)(window->panel, window);
 	}
 }
 
@@ -3862,61 +3891,14 @@ static void do_moving(struct sdlpui_window *window, int x, int y)
 	move_state->originy = y;
 }
 
-static bool handle_mousemotion(struct my_app *a,
+/*
+ * Give the dialog or menu under the pointer, if any, mouse and key focus
+ * and let it handle the motion.  Return true if a dialog handled the event.
+ */
+static bool give_dialog_focus_at(struct my_app *a,
 		const SDL_MouseMotionEvent *mouse)
 {
 	struct sdlpui_dialog *d;
-	SDL_Event pendm[4];
-
-	if (!a->w_mouse) {
-		return false;
-	}
-
-	/*
-	 * If more than one consecutive motion event is queued, only process
-	 * the last one.
-	 */
-	while (1) {
-		int npend = SDL_PeepEvents(pendm,
-			(int)(sizeof(pendm) / sizeof(pendm[0])),
-			SDL_GETEVENT, SDL_MOUSEMOTION, SDL_MOUSEMOTION);
-
-		if (npend <= 0) {
-			if (npend < 0) {
-				SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
-					"SDL_PeepEvents() for pending motion "
-					"events failed: %s", SDL_GetError());
-			}
-			break;
-		}
-		SDL_assert(npend <= (int)(sizeof(pendm) / sizeof(pendm[0]))
-			&& pendm[npend - 1].type == SDL_MOUSEMOTION);
-		mouse = &pendm[npend - 1].motion;
-	}
-
-	if (a->w_mouse->move_state.moving) {
-		do_moving(a->w_mouse, mouse->x, mouse->y);
-		return true;
-	}
-	if (a->w_mouse->size_state.sizing) {
-		do_sizing(a->w_mouse, mouse->x, mouse->y);
-		return true;
-	}
-	/* Have a menu or dialog handle the event if appropriate. */
-	if (a->w_mouse->d_mouse
-			&& a->w_mouse->d_mouse->ftb->handle_mousemove
-			&& (*a->w_mouse->d_mouse->ftb->handle_mousemove)(
-				a->w_mouse->d_mouse, a->w_mouse, mouse)) {
-		return true;
-	}
-
-	/*
-	 * Ignore motion events while a mouse button is pressed (at
-	 * least up to the point that the mouse leaves the window).
-	 */
-	if (mouse->state != 0) {
-		return true;
-	}
 
 	/*
 	 * Has the motion entered any of the active dialogs/menus?
@@ -3983,6 +3965,75 @@ static bool handle_mousemotion(struct my_app *a,
 	return false;
 }
 
+static bool handle_mousemotion(struct my_app *a,
+		const SDL_MouseMotionEvent *mouse)
+{
+	SDL_Event pendm[4];
+
+	if (!a->w_mouse) {
+		return false;
+	}
+
+	/*
+	 * If more than one consecutive motion event is queued, only process
+	 * the last one.
+	 */
+	while (1) {
+		int npend = SDL_PeepEvents(pendm,
+			(int)(sizeof(pendm) / sizeof(pendm[0])),
+			SDL_GETEVENT, SDL_MOUSEMOTION, SDL_MOUSEMOTION);
+
+		if (npend <= 0) {
+			if (npend < 0) {
+				SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
+					"SDL_PeepEvents() for pending motion "
+					"events failed: %s", SDL_GetError());
+			}
+			break;
+		}
+		SDL_assert(npend <= (int)(sizeof(pendm) / sizeof(pendm[0]))
+			&& pendm[npend - 1].type == SDL_MOUSEMOTION);
+		mouse = &pendm[npend - 1].motion;
+	}
+
+	/*
+	 * SDL's UIKit backend reports a pointer at the window's origin when
+	 * the view is set up, before any pointer has moved.  That landed on
+	 * the status bar's Menu button, which opens on hover, so the menu was
+	 * open at every launch.  A pointer resting on that one pixel has no
+	 * use, so ignore it.
+	 */
+	if (mouse->x == 0 && mouse->y == 0 && mouse->state == 0) {
+		return false;
+	}
+
+	if (a->w_mouse->move_state.moving) {
+		do_moving(a->w_mouse, mouse->x, mouse->y);
+		return true;
+	}
+	if (a->w_mouse->size_state.sizing) {
+		do_sizing(a->w_mouse, mouse->x, mouse->y);
+		return true;
+	}
+	/* Have a menu or dialog handle the event if appropriate. */
+	if (a->w_mouse->d_mouse
+			&& a->w_mouse->d_mouse->ftb->handle_mousemove
+			&& (*a->w_mouse->d_mouse->ftb->handle_mousemove)(
+				a->w_mouse->d_mouse, a->w_mouse, mouse)) {
+		return true;
+	}
+
+	/*
+	 * Ignore motion events while a mouse button is pressed (at
+	 * least up to the point that the mouse leaves the window).
+	 */
+	if (mouse->state != 0) {
+		return true;
+	}
+
+	return give_dialog_focus_at(a, mouse);
+}
+
 /* x and y are relative to window */
 static bool get_colrow_from_xy(const struct subwindow *subwindow,
 		int x, int y, int *col, int *row)
@@ -4045,6 +4096,28 @@ static bool handle_mousebutton(struct my_app *a,
 			}
 		}
 		return true;
+	}
+
+	/*
+	 * Touch input has no hover, so a press can arrive without the motion
+	 * that would have given the dialog under it focus (SDL also drops a
+	 * motion that does not change the position).  Give focus now, as if
+	 * the pointer had just moved there.
+	 */
+	if (mouse->state == SDL_PRESSED && (!a->w_mouse->d_mouse
+			|| !sdlpui_is_in_dialog(a->w_mouse->d_mouse,
+			mouse->x, mouse->y))) {
+		SDL_MouseMotionEvent motion;
+
+		memset(&motion, 0, sizeof(motion));
+		motion.type = SDL_MOUSEMOTION;
+		motion.timestamp = mouse->timestamp;
+		motion.windowID = mouse->windowID;
+		motion.which = mouse->which;
+		motion.state = 0;
+		motion.x = mouse->x;
+		motion.y = mouse->y;
+		(void) give_dialog_focus_at(a, &motion);
 	}
 
 	/* Have a menu or dialog handle the event if appropriate. */
@@ -5915,6 +5988,11 @@ static struct subwindow *get_subwindow_by_index(
 static struct subwindow *get_subwindow_by_xy(
 		const struct sdlpui_window *window, int x, int y)
 {
+	/* The touch panel owns its area, whatever term lies under it. */
+	if (window->panel && is_point_in_rect(x, y, &window->panel->rect)) {
+		return NULL;
+	}
+
 	/* checking subwindows in z order */
 	for (size_t i = N_ELEMENTS(window->subwindows); i > 0; i--) {
 		struct subwindow *subwindow = window->subwindows[i - 1];
@@ -5929,69 +6007,654 @@ static struct subwindow *get_subwindow_by_xy(
 	return NULL;
 }
 
+/* Queue a key press as if it came from a keyboard. */
+static void push_key_event(struct sdlpui_window *window, SDL_Keycode sym,
+		Uint16 mod)
+{
+	SDL_Event ev;
+
+	memset(&ev, 0, sizeof(ev));
+	ev.type = SDL_KEYDOWN;
+	ev.key.timestamp = SDL_GetTicks();
+	ev.key.windowID = window->id;
+	ev.key.state = SDL_PRESSED;
+	ev.key.repeat = 0;
+	ev.key.keysym.scancode = SDL_GetScancodeFromKey(sym);
+	ev.key.keysym.sym = sym;
+	ev.key.keysym.mod = mod;
+	SDL_PushEvent(&ev);
+}
+
+/* Queue text as if it had been typed. */
+static void push_text_event(struct sdlpui_window *window, const char *utf8)
+{
+	SDL_Event ev;
+
+	memset(&ev, 0, sizeof(ev));
+	ev.type = SDL_TEXTINPUT;
+	ev.text.timestamp = SDL_GetTicks();
+	ev.text.windowID = window->id;
+	(void) my_strcpy(ev.text.text, utf8, sizeof(ev.text.text));
+	SDL_PushEvent(&ev);
+}
+
+/*
+ * Send what a key of the touch keyboard term shows: the glyphs for the
+ * special keys become key presses, anything else is typed as text (a
+ * keyboard sends space as text, which is why it is not a key press here).
+ */
 static void send_sdl_keylike_event(struct sdlpui_window *window, wchar_t commandish_char)
 {
-	// Synthesize a text-input event and push it into SDL's event queue
-	SDL_Event syntheticEvent;
-	// ␛ ↑ ← ↓ →
-	if (commandish_char == L'⎋' ||
-		commandish_char == L'⌫' ||
-		commandish_char == L'␣' ||
-		commandish_char == L'↵' ||
-		commandish_char == L'⇥' ||
-		commandish_char == L'↑' ||
-		commandish_char == L'←' ||
-		commandish_char == L'↓' ||
-		commandish_char == L'→') {
-		SDL_KeyboardEvent ke;
-		SDL_Keycode kc;
-		if (commandish_char == L'↑') {
-			kc = SDLK_UP;
-		} else if (commandish_char == L'←') {
-			kc = SDLK_LEFT;
-		} else if (commandish_char == L'↓') {
-			kc = SDLK_DOWN;
-		} else if (commandish_char == L'→') {
-			kc = SDLK_RIGHT;
-		} else if (commandish_char == L'⌫') {
-			kc = SDLK_BACKSPACE;
-		} else if (commandish_char == L'␣') {
-			kc = SDLK_SPACE;
-		} else if (commandish_char == L'⎋') {
-			kc = SDLK_ESCAPE;
-		} else if (commandish_char == L'↵') {
-			kc = SDLK_RETURN;
-		} else if (commandish_char == L'⇥') {
-			kc = SDLK_TAB;
-		}
-		SDL_Keysym keysym;
-		keysym.mod = 0;
-		keysym.sym = kc;
-		SDL_Scancode scancode;
-		keysym.scancode = SDL_SCANCODE_UNKNOWN;
-		keysym.unused = 0;
-		ke.keysym = keysym;
-		ke.type = SDL_KEYDOWN;
-		ke.timestamp = SDL_GetTicks();
-		ke.windowID = window->id;
-		ke.repeat = 0;
-		ke.state = SDL_PRESSED;
-		ke.padding2 = 0;
-		ke.padding3 = 0;
-		syntheticEvent.type = SDL_KEYDOWN;
-		syntheticEvent.key = ke;
-		} else {
-			SDL_TextInputEvent te;
-			te.type = SDL_TEXTINPUT;
-			te.timestamp = SDL_GetTicks();
-			te.windowID = window->id;
-			te.text[0] = commandish_char;
-			te.text[1] = '\0';
-			syntheticEvent.type = SDL_TEXTINPUT;
-			syntheticEvent.text = te;
-		}
+	SDL_Keycode kc = SDLK_UNKNOWN;
 
-	SDL_PushEvent(&syntheticEvent);
+	switch (commandish_char) {
+		case L'↑': kc = SDLK_UP; break;
+		case L'←': kc = SDLK_LEFT; break;
+		case L'↓': kc = SDLK_DOWN; break;
+		case L'→': kc = SDLK_RIGHT; break;
+		case L'⌫': kc = SDLK_BACKSPACE; break;
+		case L'⎋': kc = SDLK_ESCAPE; break;
+		case L'↵': kc = SDLK_RETURN; break;
+		case L'⇥': kc = SDLK_TAB; break;
+		case L'␣': commandish_char = L' '; break;
+	}
+	if (kc != SDLK_UNKNOWN) {
+		push_key_event(window, kc, 0);
+	} else {
+		char text[2] = { (char) commandish_char, '\0' };
+
+		push_text_event(window, text);
+	}
+}
+
+/*
+ * Touch panel (TOUCH_PANEL_PLAN.md, step 2): a pinned, borderless dialog
+ * over the "panel" region holding panel_key controls.  A key sends what a
+ * keyboard would, a keycode with modifiers or text, when it is pressed.
+ * Between taps the panel holds no focus, so the game owns the redraws.
+ */
+#define PANEL_MAX_KEYS 16
+/* minimum touch target, in points; scaled by the window's ui_scale */
+#define PANEL_MIN_TOUCH_POINTS 44
+/* space between keys, in points */
+#define PANEL_GAP_POINTS 4
+/* keys per row of the chrome grid */
+#define PANEL_CHROME_COLS 4
+
+struct panel_key {
+	char *caption;
+	/* relative to the control's rect */
+	SDL_Rect caption_rect;
+	/* what a press sends: sym with mod, or text if sym is SDLK_UNKNOWN */
+	SDL_Keycode sym;
+	Uint16 mod;
+	char text[8];
+	/* re-fires while held (step 2c) */
+	bool repeat;
+	bool armed;
+	bool has_mouse;
+	bool disabled;
+};
+
+struct panel_data {
+	struct sdlpui_control keys[PANEL_MAX_KEYS];
+	int nkeys;
+};
+
+static void fire_panel_key(struct sdlpui_control *c, struct sdlpui_window *w)
+{
+	struct panel_key *pk;
+
+	SDL_assert(c->type_code == PANEL_KEY_CODE && c->priv);
+	pk = c->priv;
+	if (pk->disabled) {
+		return;
+	}
+	if (pk->sym != SDLK_UNKNOWN) {
+		push_key_event(w, pk->sym, pk->mod);
+	} else if (pk->text[0]) {
+		push_text_event(w, pk->text);
+	}
+}
+
+static bool handle_panel_key_mouseclick(struct sdlpui_control *c,
+		struct sdlpui_dialog *d, struct sdlpui_window *w,
+		const SDL_MouseButtonEvent *e)
+{
+	if (e->button == SDL_BUTTON_LEFT) {
+		if (e->state == SDL_PRESSED) {
+			/* Fire on the press so a held key can repeat later. */
+			(*c->ftb->arm)(c, d, w, SDLPUI_ACTION_HINT_MOUSE);
+			fire_panel_key(c, w);
+		} else {
+			(*c->ftb->disarm)(c, d, w, SDLPUI_ACTION_HINT_MOUSE);
+		}
+	}
+	/* Swallow the event, even if nothing was done. */
+	return true;
+}
+
+static void place_panel_key_caption(struct sdlpui_control *c,
+		struct sdlpui_window *w)
+{
+	struct panel_key *pk = c->priv;
+	int tw = 0, th = 0;
+
+	if (pk->caption && pk->caption[0]) {
+		sdlpui_get_utf8_metrics(sdlpui_get_ttf(w), pk->caption,
+			&tw, &th);
+	}
+	if (tw > c->rect.w) {
+		tw = c->rect.w;
+	}
+	if (th > c->rect.h) {
+		th = c->rect.h;
+	}
+	pk->caption_rect.x = (c->rect.w - tw) / 2;
+	pk->caption_rect.y = (c->rect.h - th) / 2;
+	pk->caption_rect.w = tw;
+	pk->caption_rect.h = th;
+}
+
+static void change_panel_key_caption(struct sdlpui_control *c,
+		struct sdlpui_dialog *d, struct sdlpui_window *w,
+		const char *new_caption)
+{
+	struct panel_key *pk;
+
+	SDL_assert(c->type_code == PANEL_KEY_CODE && c->priv);
+	pk = c->priv;
+	string_free(pk->caption);
+	pk->caption = string_make(new_caption);
+	place_panel_key_caption(c, w);
+	d->dirty = true;
+	sdlpui_signal_redraw(w);
+}
+
+static void render_panel_key(struct sdlpui_control *c,
+		struct sdlpui_dialog *d, struct sdlpui_window *w,
+		SDL_Renderer *r)
+{
+	const SDL_Color *fg = sdlpui_get_color(w, SDLPUI_COLOR_DIALOG_FG);
+	const SDL_Color *bg, *border;
+	struct panel_key *pk;
+	SDL_Rect dst_r;
+
+	SDL_assert(c->type_code == PANEL_KEY_CODE && c->priv);
+	pk = c->priv;
+	bg = &w->app->colors[pk->armed ? COLOUR_SLATE : COLOUR_L_DARK];
+	border = &w->app->colors[(pk->armed || pk->has_mouse) ?
+		COLOUR_WHITE : COLOUR_SLATE];
+
+	dst_r = c->rect;
+	if (!d->texture) {
+		/* Drawing directly to the window; use its coordinates. */
+		dst_r.x += d->rect.x;
+		dst_r.y += d->rect.y;
+	}
+	SDL_SetRenderDrawColor(r, bg->r, bg->g, bg->b, bg->a);
+	SDL_RenderFillRect(r, &dst_r);
+	SDL_SetRenderDrawColor(r, border->r, border->g, border->b, border->a);
+	SDL_RenderDrawRect(r, &dst_r);
+
+	if (pk->caption_rect.w > 0 && pk->caption_rect.h > 0) {
+		SDL_Rect cap_r = pk->caption_rect;
+
+		cap_r.x += dst_r.x;
+		cap_r.y += dst_r.y;
+		sdlpui_render_utf8_line(r, sdlpui_get_ttf(w), fg, &cap_r,
+			pk->caption);
+	}
+
+	if (pk->disabled) {
+		sdlpui_stipple_rect(r, sdlpui_get_stipple(w), &dst_r);
+	}
+}
+
+static void respond_default_panel_key(struct sdlpui_control *c,
+		struct sdlpui_dialog *d, struct sdlpui_window *w,
+		enum sdlpui_action_hint hint)
+{
+	fire_panel_key(c, w);
+}
+
+static void gain_mouse_panel_key(struct sdlpui_control *c,
+		struct sdlpui_dialog *d, struct sdlpui_window *w, int comp_ind)
+{
+	struct panel_key *pk;
+
+	SDL_assert(c->type_code == PANEL_KEY_CODE && c->priv);
+	pk = c->priv;
+	if (!pk->has_mouse) {
+		pk->has_mouse = true;
+		d->dirty = true;
+		sdlpui_signal_redraw(w);
+	}
+}
+
+static void lose_mouse_panel_key(struct sdlpui_control *c,
+		struct sdlpui_dialog *d, struct sdlpui_window *w,
+		struct sdlpui_control *new_c, struct sdlpui_dialog *new_d)
+{
+	struct panel_key *pk;
+
+	SDL_assert(c->type_code == PANEL_KEY_CODE && c->priv);
+	pk = c->priv;
+	if (pk->has_mouse) {
+		pk->has_mouse = false;
+		d->dirty = true;
+		sdlpui_signal_redraw(w);
+	}
+}
+
+static void arm_panel_key(struct sdlpui_control *c, struct sdlpui_dialog *d,
+		struct sdlpui_window *w, enum sdlpui_action_hint hint)
+{
+	struct panel_key *pk;
+
+	SDL_assert(c->type_code == PANEL_KEY_CODE && c->priv);
+	pk = c->priv;
+	if (!pk->armed) {
+		pk->armed = true;
+		d->dirty = true;
+		sdlpui_signal_redraw(w);
+	}
+}
+
+static void disarm_panel_key(struct sdlpui_control *c,
+		struct sdlpui_dialog *d, struct sdlpui_window *w,
+		enum sdlpui_action_hint hint)
+{
+	struct panel_key *pk;
+
+	SDL_assert(c->type_code == PANEL_KEY_CODE && c->priv);
+	pk = c->priv;
+	if (pk->armed) {
+		pk->armed = false;
+		d->dirty = true;
+		sdlpui_signal_redraw(w);
+	}
+}
+
+static int get_panel_key_interactable_component(struct sdlpui_control *c,
+		bool first)
+{
+	struct panel_key *pk;
+
+	SDL_assert(c->type_code == PANEL_KEY_CODE && c->priv);
+	pk = c->priv;
+	return (pk->disabled) ? 0 : 1;
+}
+
+static void resize_panel_key(struct sdlpui_control *c,
+		struct sdlpui_dialog *d, struct sdlpui_window *w, int width,
+		int height)
+{
+	SDL_assert(c->type_code == PANEL_KEY_CODE && c->priv);
+	c->rect.w = width;
+	c->rect.h = height;
+	place_panel_key_caption(c, w);
+}
+
+static void query_panel_key_natural_size(struct sdlpui_control *c,
+		struct sdlpui_dialog *d, struct sdlpui_window *w, int *width,
+		int *height)
+{
+	struct panel_key *pk;
+	int tw = 0, th = 0;
+	int min_touch = (int)(PANEL_MIN_TOUCH_POINTS * w->ui_scale + 0.5f);
+
+	SDL_assert(c->type_code == PANEL_KEY_CODE && c->priv);
+	pk = c->priv;
+	if (pk->caption && pk->caption[0]) {
+		sdlpui_get_utf8_metrics(sdlpui_get_ttf(w), pk->caption,
+			&tw, &th);
+	}
+	*width = MAX(tw + 2 * SDLPUI_DEFAULT_CTRL_BORDER, min_touch);
+	*height = MAX(th + 2 * SDLPUI_DEFAULT_CTRL_BORDER, min_touch);
+}
+
+static bool is_panel_key_disabled(const struct sdlpui_control *c)
+{
+	const struct panel_key *pk;
+
+	SDL_assert(c->type_code == PANEL_KEY_CODE && c->priv);
+	pk = c->priv;
+	return pk->disabled;
+}
+
+static bool set_panel_key_disabled(struct sdlpui_control *c,
+		struct sdlpui_dialog *d, struct sdlpui_window *w, bool disabled)
+{
+	struct panel_key *pk;
+	bool old;
+
+	SDL_assert(c->type_code == PANEL_KEY_CODE && c->priv);
+	pk = c->priv;
+	old = pk->disabled;
+	if (old != disabled) {
+		pk->disabled = disabled;
+		d->dirty = true;
+		sdlpui_signal_redraw(w);
+	}
+	return old;
+}
+
+static void cleanup_panel_key(struct sdlpui_control *c)
+{
+	struct panel_key *pk;
+
+	SDL_assert(c->type_code == PANEL_KEY_CODE && c->priv);
+	pk = c->priv;
+	string_free(pk->caption);
+	SDL_free(pk);
+	c->priv = NULL;
+}
+
+/*
+ * Initialize c as a panel key.  sym and mod are sent as a key press; if
+ * sym is SDLK_UNKNOWN, text is sent as typed text instead.
+ */
+static void create_panel_key(struct sdlpui_control *c, const char *caption,
+		SDL_Keycode sym, Uint16 mod, const char *text, bool repeat)
+{
+	static const struct sdlpui_control_funcs panel_key_funcs = {
+		.handle_mouseclick = handle_panel_key_mouseclick,
+		.handle_mousemove = sdlpui_control_handle_mousemove,
+		.change_caption = change_panel_key_caption,
+		.render = render_panel_key,
+		.respond_default = respond_default_panel_key,
+		.gain_mouse = gain_mouse_panel_key,
+		.lose_mouse = lose_mouse_panel_key,
+		.arm = arm_panel_key,
+		.disarm = disarm_panel_key,
+		.get_interactable_component =
+			get_panel_key_interactable_component,
+		.resize = resize_panel_key,
+		.query_natural_size = query_panel_key_natural_size,
+		.is_disabled = is_panel_key_disabled,
+		.set_disabled = set_panel_key_disabled,
+		.cleanup = cleanup_panel_key
+	};
+	struct panel_key *pk = SDL_calloc(1, sizeof(*pk));
+
+	pk->caption = string_make(caption ? caption : "");
+	pk->sym = sym;
+	pk->mod = mod;
+	if (text) {
+		(void) my_strcpy(pk->text, text, sizeof(pk->text));
+	}
+	pk->repeat = repeat;
+
+	c->ftb = &panel_key_funcs;
+	c->priv = pk;
+	c->type_code = PANEL_KEY_CODE;
+	c->rect.x = 0;
+	c->rect.y = 0;
+	c->rect.w = 0;
+	c->rect.h = 0;
+}
+
+static struct sdlpui_control *find_panel_control_containing(
+		struct sdlpui_dialog *d, struct sdlpui_window *w, Sint32 x,
+		Sint32 y, int *comp_ind)
+{
+	struct panel_data *pd;
+	int i;
+
+	SDL_assert(d->type_code == PANEL_CODE && d->priv);
+	pd = d->priv;
+	*comp_ind = 0;
+	for (i = 0; i < pd->nkeys; i++) {
+		struct sdlpui_control *c = &pd->keys[i];
+
+		if (c->ftb->get_interactable_component
+				&& (*c->ftb->get_interactable_component)(c, true)
+				&& sdlpui_is_in_control(c, d, x, y)) {
+			return c;
+		}
+	}
+	return NULL;
+}
+
+/*
+ * Drop the panel's hover state and its mouse and key focus.  While a
+ * dialog has focus the window is redrawn as if a menu were open, so the
+ * panel gives focus back after every tap.
+ */
+static void panel_yield_focus(struct sdlpui_dialog *d, struct sdlpui_window *w)
+{
+	sdlpui_dialog_handle_window_loses_mouse(d, w);
+}
+
+static bool handle_panel_mouseclick(struct sdlpui_dialog *d,
+		struct sdlpui_window *w, const SDL_MouseButtonEvent *e)
+{
+	if (e->state == SDL_PRESSED) {
+		int comp_ind;
+		struct sdlpui_control *c = find_panel_control_containing(d, w,
+			e->x, e->y, &comp_ind);
+
+		if (c != d->c_mouse) {
+			if (d->c_mouse && d->c_mouse->ftb->lose_mouse) {
+				(*d->c_mouse->ftb->lose_mouse)(d->c_mouse, d,
+					w, c, d);
+			}
+			if (c && c->ftb->gain_mouse) {
+				(*c->ftb->gain_mouse)(c, d, w, comp_ind);
+			}
+			d->c_mouse = c;
+		}
+		if (c && c->ftb->handle_mouseclick) {
+			(*c->ftb->handle_mouseclick)(c, d, w, e);
+		}
+		return true;
+	}
+
+	/* The release goes to the key that was pressed, then focus is dropped. */
+	if (d->c_mouse && d->c_mouse->ftb->handle_mouseclick) {
+		(*d->c_mouse->ftb->handle_mouseclick)(d->c_mouse, d, w, e);
+	}
+	panel_yield_focus(d, w);
+	return true;
+}
+
+static bool handle_panel_mousemove(struct sdlpui_dialog *d,
+		struct sdlpui_window *w, const SDL_MouseMotionEvent *e)
+{
+	if (!sdlpui_is_in_dialog(d, e->x, e->y)) {
+		/* A pointer (not a finger) left the panel. */
+		if (e->state == 0) {
+			panel_yield_focus(d, w);
+		}
+		return false;
+	}
+	return sdlpui_dialog_handle_mousemove(d, w, e);
+}
+
+static void render_panel(struct sdlpui_dialog *d, struct sdlpui_window *w)
+{
+	SDL_Renderer *r = sdlpui_get_renderer(w);
+	const SDL_Color *bg = &w->app->colors[COLOUR_L_DARK];
+	int alpha = (w->config) ? w->config->panel_alpha : DEFAULT_PANEL_ALPHA;
+	SDL_BlendMode old_mode;
+	struct panel_data *pd;
+	int i;
+
+	SDL_assert(d->type_code == PANEL_CODE && d->priv);
+	pd = d->priv;
+
+	/* Straight to the window; the panel has no texture. */
+	SDL_SetRenderTarget(r, d->texture);
+	SDL_GetRenderDrawBlendMode(r, &old_mode);
+	SDL_SetRenderDrawBlendMode(r, SDL_BLENDMODE_BLEND);
+	SDL_SetRenderDrawColor(r, bg->r, bg->g, bg->b, (Uint8) alpha);
+	SDL_RenderFillRect(r, &d->rect);
+	SDL_SetRenderDrawBlendMode(r, old_mode);
+	for (i = 0; i < pd->nkeys; i++) {
+		if (pd->keys[i].ftb->render) {
+			(*pd->keys[i].ftb->render)(&pd->keys[i], d, w, r);
+		}
+	}
+	d->dirty = false;
+}
+
+/*
+ * Lay the chrome keys out as a grid at the panel's top left corner.  Keys
+ * are at least the minimum touch target and, in a wide band, no more than
+ * twice it.
+ */
+static void layout_panel_keys(struct sdlpui_dialog *d, struct sdlpui_window *w)
+{
+	struct panel_data *pd = d->priv;
+	int min_touch = (int)(PANEL_MIN_TOUCH_POINTS * w->ui_scale + 0.5f);
+	int gap = (int)(PANEL_GAP_POINTS * w->ui_scale + 0.5f);
+	int cell_w = (d->rect.w - gap) / PANEL_CHROME_COLS;
+	int cell_h = min_touch + gap;
+	int i;
+
+	if (cell_w > 2 * min_touch) {
+		cell_w = 2 * min_touch;
+	}
+	for (i = 0; i < pd->nkeys; i++) {
+		struct sdlpui_control *c = &pd->keys[i];
+
+		c->rect.x = gap + (i % PANEL_CHROME_COLS) * cell_w;
+		c->rect.y = gap + (i / PANEL_CHROME_COLS) * cell_h;
+		(*c->ftb->resize)(c, d, w, cell_w - gap, cell_h - gap);
+	}
+}
+
+static void resize_panel(struct sdlpui_dialog *d, struct sdlpui_window *w,
+		int width, int height)
+{
+	SDL_assert(d->type_code == PANEL_CODE && d->priv);
+	d->rect.w = width;
+	d->rect.h = height;
+	layout_panel_keys(d, w);
+	d->dirty = true;
+}
+
+static void query_panel_natural_size(struct sdlpui_dialog *d,
+		struct sdlpui_window *w, int *width, int *height)
+{
+	*width = w->panel_rect.w;
+	*height = w->panel_rect.h;
+}
+
+static void cleanup_panel(struct sdlpui_dialog *d)
+{
+	struct panel_data *pd;
+	int i;
+
+	SDL_assert(d->type_code == PANEL_CODE && d->priv);
+	pd = d->priv;
+	for (i = 0; i < pd->nkeys; i++) {
+		if (pd->keys[i].ftb->cleanup) {
+			(*pd->keys[i].ftb->cleanup)(&pd->keys[i]);
+		}
+	}
+	SDL_free(pd);
+	d->priv = NULL;
+}
+
+static void hide_panel(struct sdlpui_dialog *d, struct sdlpui_window *w,
+		bool up)
+{
+	if (!up && w->panel == d) {
+		w->panel = NULL;
+	}
+}
+
+/*
+ * Create the touch panel over the window's panel rect, if the window has
+ * one and the panel is enabled.  Step 2a: the chrome keys only.
+ */
+static void load_panel(struct sdlpui_window *window)
+{
+	static const struct sdlpui_dialog_funcs panel_funcs = {
+		.handle_mouseclick = handle_panel_mouseclick,
+		.handle_mousemove = handle_panel_mousemove,
+		.handle_loses_mouse = sdlpui_dialog_handle_loses_mouse,
+		.handle_loses_key = sdlpui_dialog_handle_loses_key,
+		.handle_window_loses_mouse =
+			sdlpui_dialog_handle_window_loses_mouse,
+		.handle_window_loses_key =
+			sdlpui_dialog_handle_window_loses_key,
+		.render = render_panel,
+		.find_control_containing = find_panel_control_containing,
+		.resize = resize_panel,
+		.query_natural_size = query_panel_natural_size,
+		.cleanup = cleanup_panel
+	};
+	struct sdlpui_dialog *d;
+	struct panel_data *pd;
+	int n = 0;
+
+	if (window->panel || window->index != MAIN_WINDOW
+			|| !window->has_panel || !window->config
+			|| !window->config->panel_enabled) {
+		return;
+	}
+
+	d = SDL_calloc(1, sizeof(*d));
+	pd = SDL_calloc(1, sizeof(*pd));
+	create_panel_key(&pd->keys[n++], "Esc", SDLK_ESCAPE, 0, NULL, false);
+	create_panel_key(&pd->keys[n++], "↑", SDLK_UP, 0, NULL, true);
+	create_panel_key(&pd->keys[n++], "Enter", SDLK_RETURN, 0, NULL, false);
+	create_panel_key(&pd->keys[n++], "⌫", SDLK_BACKSPACE, 0, NULL, true);
+	create_panel_key(&pd->keys[n++], "←", SDLK_LEFT, 0, NULL, true);
+	create_panel_key(&pd->keys[n++], "↓", SDLK_DOWN, 0, NULL, true);
+	create_panel_key(&pd->keys[n++], "→", SDLK_RIGHT, 0, NULL, true);
+	create_panel_key(&pd->keys[n++], "Space", SDLK_UNKNOWN, 0, " ", false);
+	pd->nkeys = n;
+
+	d->ftb = &panel_funcs;
+	d->pop_callback = hide_panel;
+	d->recreate_textures_callback = NULL;
+	d->next = NULL;
+	d->prev = NULL;
+	d->texture = NULL;
+	d->c_mouse = NULL;
+	d->c_key = NULL;
+	d->priv = pd;
+	d->type_code = PANEL_CODE;
+	d->tag = 0;
+	/* Never removed when another dialog pops down. */
+	d->pinned = true;
+	d->dirty = true;
+	d->rect = window->panel_rect;
+	layout_panel_keys(d, window);
+
+	window->panel = d;
+	sdlpui_popup_dialog(d, window, false);
+	SDL_Log("window %u: panel at %d,%d %dx%d, %d keys", window->index,
+		d->rect.x, d->rect.y, d->rect.w, d->rect.h, pd->nkeys);
+}
+
+/*
+ * After a layout: move the panel to the new panel rect, remove it if there
+ * is none for this orientation, or create it if there is one now.
+ */
+static void relayout_panel(struct sdlpui_window *window)
+{
+	if (!window->panel) {
+		load_panel(window);
+		return;
+	}
+	if (window->has_panel && window->config
+			&& window->config->panel_enabled) {
+		window->panel->rect.x = window->panel_rect.x;
+		window->panel->rect.y = window->panel_rect.y;
+		(*window->panel->ftb->resize)(window->panel, window,
+			window->panel_rect.w, window->panel_rect.h);
+		SDL_Log("window %u: panel moved to %d,%d %dx%d", window->index,
+			window->panel->rect.x, window->panel->rect.y,
+			window->panel->rect.w, window->panel->rect.h);
+	} else {
+		/* hide_panel() clears window->panel */
+		sdlpui_popdown_dialog(window->panel, window, false);
+	}
 }
 
 static void handle_button_open_subwindow(struct sdlpui_control *ctrl,
@@ -6321,6 +6984,7 @@ static void resolve_layout(struct sdlpui_window *window)
 		(window->inner_rect.w > window->inner_rect.h) ?
 		"landscape" : "portrait");
 	resolve_panel_rect(window);
+	relayout_panel(window);
 	for (size_t i = 0; i < N_ELEMENTS(window->subwindows); i++) {
 		struct subwindow *subwindow = window->subwindows[i];
 		const struct layout_region *r;
@@ -6577,6 +7241,7 @@ static void start_window(struct sdlpui_window *window)
 
 	load_window(window);
 	resolve_panel_rect(window);
+	load_panel(window);
 
 	for (size_t i = 0; i < N_ELEMENTS(window->subwindows); i++) {
 		if (window->subwindows[i] != NULL) {
@@ -6595,6 +7260,8 @@ static void wipe_window_aux_config(struct sdlpui_window *window)
 {
 	window->config = mem_zalloc(sizeof(*window->config));
 	assert(window->config != NULL);
+	window->config->panel_enabled = true;
+	window->config->panel_alpha = DEFAULT_PANEL_ALPHA;
 
 	const struct sdlpui_window *main_window =
 		get_window_direct(window->app, MAIN_WINDOW);
@@ -6815,6 +7482,13 @@ static void dump_window(const struct sdlpui_window *window, ang_file *config)
 				r->x, r->y, r->w, r->h);
 		}
 		file_put(config, "\n");
+	}
+
+	if (window->config && window->index == MAIN_WINDOW) {
+		file_putf(config, "panel:%s\n",
+			window->config->panel_enabled ? "on" : "off");
+		file_putf(config, "panel-alpha:%d\n\n",
+			window->config->panel_alpha);
 	}
 
 	for (size_t i = 0; i < N_ELEMENTS(window->subwindows); i++) {
@@ -7349,6 +8023,7 @@ static void free_window(struct sdlpui_window *window)
 	window->infod = NULL;
 	window->shorte = NULL;
 	window->detaild = NULL;
+	window->panel = NULL;
 
 	for (size_t i = 0; i < N_ELEMENTS(window->subwindows); i++) {
 		struct subwindow *subwindow = window->subwindows[i];
@@ -7552,6 +8227,8 @@ static void init_systems(void)
 		quit("sdlpui_init() failed");
 	}
 	SHORTCUT_EDITOR_CODE = sdlpui_register_code("ANGBAND_SHORTCUT_EDITOR");
+	PANEL_CODE = sdlpui_register_code("ANGBAND_TOUCH_PANEL");
+	PANEL_KEY_CODE = sdlpui_register_code("ANGBAND_TOUCH_PANEL_KEY");
 	SDL_assert(SHORTCUT_EDITOR_CODE);
 
 	/* On (some?) Macs the touchpad sends both mouse events and touch events;
@@ -7933,6 +8610,8 @@ static enum parser_error config_window_display(struct parser *parser)
 	window->config = mem_zalloc(sizeof(*window->config));
 
 	window->config->window_flags = SDL_WINDOW_RESIZABLE;
+	window->config->panel_enabled = true;
+	window->config->panel_alpha = DEFAULT_PANEL_ALPHA;
 
 	return PARSE_ERROR_NONE;
 }
@@ -8443,6 +9122,44 @@ static enum parser_error config_region(struct parser *parser)
 	return PARSE_ERROR_NONE;
 }
 
+static enum parser_error config_panel(struct parser *parser)
+{
+	struct my_app *a = parser_priv(parser);
+	struct sdlpui_window *window = &a->windows[MAIN_WINDOW];
+	const char *state = parser_getsym(parser, "state");
+
+	/* The panel belongs to the main window, which must come first. */
+	if (!window->inited || !window->config) {
+		return PARSE_ERROR_MISSING_RECORD_HEADER;
+	}
+	if (streq(state, "on") || streq(state, "true")) {
+		window->config->panel_enabled = true;
+	} else if (streq(state, "off") || streq(state, "false")) {
+		window->config->panel_enabled = false;
+	} else {
+		return PARSE_ERROR_INVALID_VALUE;
+	}
+
+	return PARSE_ERROR_NONE;
+}
+
+static enum parser_error config_panel_alpha(struct parser *parser)
+{
+	struct my_app *a = parser_priv(parser);
+	struct sdlpui_window *window = &a->windows[MAIN_WINDOW];
+	int alpha = parser_getint(parser, "alpha");
+
+	if (!window->inited || !window->config) {
+		return PARSE_ERROR_MISSING_RECORD_HEADER;
+	}
+	if (alpha < 0 || alpha > DEFAULT_ALPHA_FULL) {
+		return PARSE_ERROR_OUT_OF_BOUNDS;
+	}
+	window->config->panel_alpha = alpha;
+
+	return PARSE_ERROR_NONE;
+}
+
 static enum parser_error config_menu_shortcut(struct parser *parser)
 {
 	struct my_app *a = parser_priv(parser);
@@ -8525,6 +9242,8 @@ static struct parser *init_parse_config(struct my_app *a)
 
 	parser_reg(parser, "region sym name sym orient int x int y int w int h",
 			config_region);
+	parser_reg(parser, "panel sym state", config_panel);
+	parser_reg(parser, "panel-alpha int alpha", config_panel_alpha);
 
 	parser_reg(parser, "menu-shortcut uint index str keypress",
 			config_menu_shortcut);
