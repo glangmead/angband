@@ -1270,9 +1270,23 @@ theirs. Nothing in those steps waits on it; see section 4.6.
       `Hidden`, which section 4.3 excluded but its own example needs
       (`Stand still`, `Alter a grid`); only the debug groups are skipped.
       The panel now opens on Act rather than Keys.
-- [ ] code: command references resolved at press time against `cmds_all`
+- [x] code: command references resolved at press time against `cmds_all`
       for the active keyset (Angband `key[2]`; NarSil `key[4]` with its
-      index).
+      index). 2026-09-09: done for Angband. A slot keeps the
+      `struct cmd_info *` it matched and reads `key[mode]` when it is
+      pressed, `mode` from `OPT(player, rogue_like_commands)` as
+      `textui_process_key` does, falling back to `key[0]` because
+      `cmd_init()` only fills the roguelike column later. The key goes
+      through `push_term_keypress`, so the player's own keymaps still
+      apply to it. Literal text of more than one character needed the
+      `feed_keymap` of section 4.7: it is now in `ui-input.c`, but
+      returning the first keypress rather than returning void, because
+      `inkey_ex` reads `inkey_next` only on entry and the front end is
+      already inside it -- the caller delivers the first key and the rest
+      follow through `inkey_next`, which is what angbandroid's caller
+      open-codes. Verified on the simulator: `[Rest for a while]` raised
+      the rest prompt, and `"za."` gave "no rods to zap", "no wands to
+      aim" and then the run prompt, in that order.
 - [ ] code: seeder from `cmds_all` with the section 4.4 group-to-tab rules,
       the face table, commented overflow rows, and a menu item to
       regenerate.

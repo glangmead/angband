@@ -44,6 +44,7 @@
 #include "ui-output.h"
 #include "game-world.h"
 #include "ui-input.h"
+#include "ui-keymap.h"
 #include "ui-prefs.h"
 #include "grafmode.h"
 #include "ui-game.h"
@@ -6544,7 +6545,25 @@ static void fire_panel_key(struct sdlpui_control *c, struct sdlpui_dialog *d,
 	}
 
 	panel_active_mods(ps, &shift, &ctrl);
-	if (pk->sym != SDLK_UNKNOWN) {
+	if (pk->cmd) {
+		/*
+		 * A slot names a command, not a key.  Its key is looked up
+		 * here, at the press, for the keyset in force now, so that
+		 * turning the roguelike option on or off never means editing
+		 * or re-seeding panel.txt.
+		 */
+		int mode = (player && OPT(player, rogue_like_commands)) ?
+			KEYMAP_MODE_ROGUE : KEYMAP_MODE_ORIG;
+		keycode_t key = pk->cmd->key[mode];
+
+		/* Before cmd_init() the roguelike keys are still unfilled. */
+		if (!key) {
+			key = pk->cmd->key[0];
+		}
+		if (key) {
+			push_term_keypress(key, 0);
+		}
+	} else if (pk->sym != SDLK_UNKNOWN) {
 		Uint16 mod = pk->mod;
 
 		if (shift) {
@@ -6568,6 +6587,13 @@ static void fire_panel_key(struct sdlpui_control *c, struct sdlpui_dialog *d,
 			'\0' };
 
 		push_text_event(w, text);
+	} else if (pk->text[0] && pk->text[1]) {
+		/*
+		 * More than one character goes as a keymap's action does,
+		 * which is what makes a slot like "za." behave the way the
+		 * same keymap in a pref file would.
+		 */
+		push_term_keypress(feed_keymap(pk->text), 0);
 	} else if (pk->text[0]) {
 		push_text_event(w, pk->text);
 	}

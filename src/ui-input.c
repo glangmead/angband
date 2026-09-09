@@ -1783,6 +1783,43 @@ static int textui_get_count(void)
  */
 static struct keypress request_command_buffer[256];
 
+/**
+ * Install a string as the action of the current keymap, as if a keymap
+ * had matched, and return the first keypress of it.
+ *
+ * This is how a front end sends more than one keypress at a time: the SDL2
+ * touch panel's literal text slots use it.  Going through a keymap keeps
+ * the more-prompt handling ('(' and ')') and the "already inside a keymap"
+ * behaviour that pushing the keys one at a time would lose.
+ *
+ * Only the keypresses after the first are left for inkey_next, because
+ * inkey_ex() reads inkey_next when it is entered and a front end calling
+ * this is already inside it; the caller must deliver the returned keypress
+ * itself, with Term_keypress().  Returns 0 for an empty string.
+ */
+keycode_t feed_keymap(const char *buf)
+{
+	size_t n = 0;
+
+	inkey_next = NULL;
+
+	while (buf[n] && n < N_ELEMENTS(request_command_buffer) - 1) {
+		request_command_buffer[n].type = EVT_KBRD;
+		request_command_buffer[n].code = buf[n];
+		request_command_buffer[n].mods = 0;
+		n++;
+	}
+	request_command_buffer[n].type = EVT_NONE;
+	request_command_buffer[n].code = 0;
+	request_command_buffer[n].mods = 0;
+
+	if (n > 1) {
+		inkey_next = request_command_buffer + 1;
+	}
+
+	return (n > 0) ? request_command_buffer[0].code : 0;
+}
+
 
 /**
  * Request a command from the user.
