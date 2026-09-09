@@ -608,8 +608,10 @@ TBD discussion items in section 8. Committed 2026-09-09.
 candidate 2 is the shipped default, the rose is 156 points with a 9
 point outline, and the touch keyboard hack is gone from Angband. Both
 orientations were exercised on the simulator and a saved game plays in
-portrait. What is left before step 3 is yours: the blank-term question
-and the device test.
+portrait. You then tested on the device: the look is right, blanking a
+term by turning every purpose off is the behaviour you want, and the
+menus were crashy. That crash is fixed (toolkit bug, see the step 2d
+box). What is left before step 3 is your re-test on the device.
 
 ### Step 0. Prerequisites
 
@@ -1206,13 +1208,37 @@ Next session (from the 2026-09-09 evening hand-off; in order):
       unused and went. Checked on the simulator: builds clean, a saved
       game loads and plays in portrait, and Term-1's Purpose submenu
       now ends at "Display borg status" with "Display messages" ticked.
-- [ ] you decide: a blank term. Angband's window flags are a bitmask
+- [x] you decide: a blank term. Angband's window flags are a bitmask
       and a term with no flag set draws nothing, so "empty" already
       exists as "every flag off" in the window-flags menu; a named
       "Empty" entry would only make that discoverable. Is that wanted,
-      or is "no flag" enough? (Asked 2026-09-09.)
-- [ ] you test (device): the new rose size and line, candidate 2 as
-      the shipped default, no keyboard term anywhere.
+      or is "no flag" enough? (Asked 2026-09-09.) Answered: turning
+      every purpose off is the way to blank a term; no named entry.
+      Checked on the simulator: with term 1's only flag off the term
+      clears and stays clear as new messages arrive.
+- [x] code: fix the menu crashes you hit on the device (tapping away
+      from a menu, and turning off the last purpose). One bug, in the
+      toolkit, not in anything added this session:
+      `sdlpui_popdown_dialog` cleared the parent's child link even
+      when the parent had already moved on to a newer child, orphaning
+      that newer menu in the window's dialog list with a dangling
+      parent pointer; the next focus change read through it.
+      2026-09-09: found with an AddressSanitizer simulator build
+      (`build-asan`, untracked; configure with
+      `-D CMAKE_XCODE_ATTRIBUTE_ENABLE_ADDRESS_SANITIZER=YES`), whose
+      report named the freed dialog where the plain build only showed
+      "Exiting on signal 11" from Angband's own SIGSEGV handler (flip
+      the `#if 1` in `src/ui-signals.c` to get a real crash report).
+      Minimal repro: Menu, any Term-N submenu, then a tap outside --
+      the toggle was never needed. Fixed and re-tested clean under
+      ASan, including a long menu stress sequence. The desktop SDL2
+      frontend has the same bug; worth an upstream report.
+- [x] you test (device): the new rose size and line, candidate 2 as
+      the shipped default, no keyboard term anywhere. 2026-09-09:
+      passed on the look ("I like how things look on my device"); the
+      menu crashes found in the same session are the box above.
+- [ ] you test (device): the menu fix -- open a Term-N submenu and tap
+      away, and turn a term's last purpose off, without a crash.
 - [ ] commit; then step 3.
 
 ### Step 3. Core hooks
