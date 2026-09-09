@@ -17,23 +17,26 @@ window-tile-scale:0:height:1
 
 # Layout regions: region:<name>:<orient>:<x>:<y>:<w>:<h>, in per-mille of the
 # window below the status bar. A subwindow with a region for the current
-# orientation ignores its subwindow-full-rect. map is term 0; sub2 shows the
-# monster list, sub3 the item list, sub4 monster recall (see window.prf).
-# sub1 is the touch keyboard term; until the touch panel replaces it, it
-# takes the panel's region.
-region:map:landscape:0:0:760:645
-region:sub2:landscape:0:645:380:178
-region:sub3:landscape:380:645:380:178
-region:sub4:landscape:0:823:760:177
-region:sub1:landscape:760:0:240:1000
-region:panel:landscape:760:0:240:1000
+# orientation ignores its subwindow-full-rect. map is term 0; sub1 shows
+# messages, sub2 the monster list, sub3 the item list, sub4 monster recall
+# (see window.prf). panel is the strip the touch panel's pieces sit on.
+#
+# The map keeps its full height in both orientations: in landscape the four
+# side terms share the right column, in portrait the three lists sit under
+# the map and messages just above the strip, beside the keys.
+region:map:landscape:0:0:760:700
+region:sub1:landscape:760:0:240:175
+region:sub2:landscape:760:175:240:175
+region:sub3:landscape:760:350:240:175
+region:sub4:landscape:760:525:240:175
+region:panel:landscape:0:700:1000:300
 
 region:map:portrait:0:0:1000:520
-region:sub2:portrait:0:520:500:160
-region:sub3:portrait:500:520:500:160
-region:sub1:portrait:0:680:1000:320
-region:panel:portrait:0:680:1000:320
-
+region:sub2:portrait:0:520:333:180
+region:sub3:portrait:333:520:334:180
+region:sub4:portrait:667:520:333:180
+region:sub1:portrait:0:700:1000:80
+region:panel:portrait:0:780:1000:220
 # The touch panel is drawn over its region; panel:off hides it. panel-alpha
 # is the opacity of its background, 0 to 255.
 panel:on
@@ -44,7 +47,7 @@ panel-alpha:160
 # Terms are drawn in file order, so the map (term 0) comes last.
 subwindow-window:1:0:1
 subwindow-full-rect:1:1846:42:574:1337
-subwindow-font:1:59:JuliaMono-Regular.ttf
+subwindow-font:1:30:JuliaMono-Regular.ttf
 subwindow-borders:1:false
 subwindow-top:1:false:false
 subwindow-alpha:1:255
