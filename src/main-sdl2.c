@@ -7396,13 +7396,112 @@ static void free_panel_slots(struct panel_shared *ps)
 }
 
 /*
+ * The faces (section 4.4), keyed by a command's description and shared
+ * across the three variants, so a description only has to appear here
+ * once however many of them have the command.  The first word of the
+ * description is the fallback, but it is often the wrong word ("Display
+ * inventory listing", "Go down staircase") or the same word as another
+ * command's, so most commands are named here instead.  No two faces are
+ * alike, so that a slot can be spoken about without saying which tab it
+ * is on.
+ *
+ * A slot's own "=Face" beats this, which is the place to tune one
+ * without rebuilding.
+ */
+static const struct {
+	const char *desc;
+	const char *face;
+} panel_faces[] = {
+	/* Action commands */
+	{ "Disarm a trap or chest",		"Disarm" },
+	{ "Rest for a while",			"Rest" },
+	{ "Look around",			"Look" },
+	{ "Target monster or location",		"Target" },
+	{ "Target closest monster",		"Closest" },
+	{ "Dig a tunnel",			"Tunnel" },
+	{ "Go up staircase",			"Up" },
+	{ "Go down staircase",			"Down" },
+	{ "Open a door or a chest",		"Open" },
+	{ "Close a door",			"Close" },
+	{ "Fire at nearest target",		"Fire" },
+	{ "Throw an item",			"Throw" },
+	{ "Walk into a trap",			"Trap" },
+
+	/* Items and Manage items */
+	{ "Inscribe an object",			"Inscribe" },
+	{ "Uninscribe an object",		"Uninscr" },
+	{ "Wear/wield an item",			"Wield" },
+	{ "Take off/unwield an item",		"TakeOff" },
+	{ "Examine an item",			"Examine" },
+	{ "Drop an item",			"Drop" },
+	{ "Fire your missile weapon",		"Shoot" },
+	{ "Use a staff",			"Staff" },
+	{ "Aim a wand",				"Aim" },
+	{ "Zap a rod",				"Zap" },
+	{ "Activate an object",			"Activate" },
+	{ "Eat some food",			"Eat" },
+	{ "Quaff a potion",			"Quaff" },
+	{ "Read a scroll",			"Read" },
+	{ "Fuel your light source",		"Fuel" },
+	{ "Use an item",			"Use" },
+	{ "Display equipment listing",		"Equip" },
+	{ "Display inventory listing",		"Inven" },
+	{ "Display quiver listing",		"Quiver" },
+	{ "Pick up objects",			"Pickup" },
+	{ "Ignore an item",			"Ignore" },
+
+	/* Information and Utility */
+	{ "Browse a book",			"Browse" },
+	{ "Gain new spells",			"Study" },
+	{ "View abilities",			"Abilities" },
+	{ "Cast a spell",			"Cast" },
+	{ "Full dungeon map",			"Map" },
+	{ "Toggle ignoring of items",		"Ignoring" },
+	{ "Display visible item list",		"Objects" },
+	{ "Display visible monster list",	"Monsters" },
+	{ "Locate player on map",		"Locate" },
+	{ "Help",				"Help" },
+	{ "Identify symbol",			"Symbol" },
+	{ "Character description",		"Char" },
+	{ "Check knowledge",			"Know" },
+	{ "Repeat level feeling",		"Feeling" },
+	{ "Show previous message",		"Msg" },
+	{ "Show previous messages",		"Msgs" },
+	{ "Interact with options",		"Options" },
+	{ "Save and don't quit",		"Save" },
+	{ "Save and quit",			"Quit" },
+	{ "Retire character and quit",		"Retire" },
+	{ "Redraw the screen",			"Redraw" },
+	{ "Save \"screen dump\"",		"Dump" },
+
+	/*
+	 * Hidden, which the seeder skips but a hand-written slot may name;
+	 * the compass rose's centre is Stay.
+	 */
+	{ "Alter a grid",			"Alter" },
+	{ "Stand still",			"Stay" },
+	{ "Walk",				"Walk" },
+	{ "Start running",			"Run" },
+	{ "Start exploring",			"Explore" },
+	{ "Repeat previous command",		"Repeat" },
+	{ "Do autopickup",			"Autopick" },
+	{ "Center map",				"Center" },
+	{ "Steal from a monster",		"Steal" },
+	{ "Take notes",				"Notes" },
+	{ "Version info",			"Version" },
+	{ "Load a single pref line",		"Pref" },
+	{ "Toggle windows",			"Windows" }
+};
+
+/*
  * The face a slot shows: its =Face override, else, for a command, the
- * first word of its description.
+ * table above, else the first word of the description.
  */
 static void get_panel_slot_face(const struct panel_slot *slot, char *buf,
 		size_t len)
 {
 	const char *p;
+	size_t i;
 
 	if (slot->face) {
 		my_strcpy(buf, slot->face, len);
@@ -7411,6 +7510,12 @@ static void get_panel_slot_face(const struct panel_slot *slot, char *buf,
 	if (slot->kind != PANEL_SLOT_COMMAND) {
 		my_strcpy(buf, slot->text, len);
 		return;
+	}
+	for (i = 0; i < N_ELEMENTS(panel_faces); i++) {
+		if (streq(slot->desc, panel_faces[i].desc)) {
+			my_strcpy(buf, panel_faces[i].face, len);
+			return;
+		}
 	}
 	for (p = slot->desc; *p && !isspace((unsigned char) *p); p++) {
 		/* the first word of the description */

@@ -1300,7 +1300,20 @@ theirs. Nothing in those steps waits on it; see section 4.6.
       seven by four, so 28 cells against 13 Act commands, 21 Items and 22
       Info. Everything fits, which makes the decision below about order
       and wording only.
-- [ ] code: word faces rendered on Act, Items and Info; Mine empty.
+- [x] code: word faces rendered on Act, Items and Info; Mine empty.
+      2026-09-09: done. The face table is in `main-sdl2.c`, keyed by
+      description and shared across the variants; NarSil's additions wait
+      for its own box below. Every face is distinct, so no two slots read
+      alike wherever they sit. Section 4.4's order (table, then `=Face`,
+      then the first word) only makes sense the other way round, so an
+      `=Face` beats the table, which beats the first word.
+      Measured on the simulator, and this is what the decision below has
+      to settle: a cell is 64 points wide and the panel's font is
+      JuliaMono at 30 px, so exactly six characters fit, flush against
+      the border, and the seventh is clipped. Nine of the seeded faces
+      are longer than six: Closest, Inscribe, Uninscr, TakeOff, Examine,
+      Activate, Abilities, Ignoring, Monsters, Feeling, Options,
+      Objects.
 - [ ] you decide: review the generated Angband `panel.txt`. Which sixteen
       go on each tab, in what order, and which face words read badly?
       Whether to mine the Android thread (section 8) before settling this.
