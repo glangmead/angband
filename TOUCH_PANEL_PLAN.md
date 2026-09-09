@@ -582,8 +582,9 @@ that runs on the simulator. Step numbers match the rest of this file.
 **Status 2026-09-09:** step 0 complete. Step 1 done, tested on the
 simulator and the iPad, committed in this repository and cherry-picked to
 NarSil and FAangband; the portrait split decision is deferred until the
-panel exists. Step 2a code done, tested on the simulator and committed
-here; its device test (tap targets) is open. Next: step 2b.
+panel exists. Step 2a done, tested on the simulator and the iPad, and
+committed here. Next: step 2b, which opens with the Keys tab layout
+decision.
 
 ### Step 0. Prerequisites
 
@@ -844,8 +845,13 @@ here; its device test (tap targets) is open. Next: step 2b.
       Screenshots: `~/Downloads/step2a_panel_launch.png` (portrait
       launch, Menu closed, panel over the keyboard term) and
       `step2a_panel_town_menu.png` (in town with the command menu open).
-- [ ] you test (device): tap targets. Are 44 points times `ui_scale` big
+- [x] you test (device): tap targets. Are 44 points times `ui_scale` big
       enough for you? Does anything need to move away from the screen edge?
+      2026-09-09: passed on the iPad Pro 11-inch (M4). The keys are a
+      good size and stay where they are, near the edge. The Menu is
+      closed at launch on hardware too. The keyboard term behind the
+      panel takes no taps, as intended: the panel owns its area, and the
+      term goes in step 6.
 - [x] code: find and fix the Menu-open-at-launch bug (section 2.6). It
       reproduces on the simulator and on the device, in both variants.
       2026-09-09: found with a temporary event trace in `get_event`:
