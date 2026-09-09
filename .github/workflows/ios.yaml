@@ -2,7 +2,7 @@ name: iOS
 
 on:
   push:
-    branches: [ sdl2-term-touch-keyboard ]
+    branches: [ sdl2-term-touch-keyboard, sdl2-touch-panel ]
   pull_request:
 
 jobs:
