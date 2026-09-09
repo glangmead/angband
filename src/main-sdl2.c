@@ -31,6 +31,9 @@
 #endif
 #include "SDL_revision.h"
 
+#include <ctype.h>
+#include <math.h>
+
 #include "main.h"
 #include "init.h"
 #include "ui-term.h"
@@ -566,6 +569,8 @@ static void region_to_rect(const struct sdlpui_window *window,
 static void resolve_panel_rect(struct sdlpui_window *window);
 static void load_panel(struct sdlpui_window *window);
 static void relayout_panel(struct sdlpui_window *window);
+static void panel_tick(struct my_app *a);
+static void panel_cancel_repeat(struct my_app *a);
 static void push_key_event(struct sdlpui_window *window, SDL_Keycode sym,
 		Uint16 mod);
 static void push_text_event(struct sdlpui_window *window, const char *utf8);
@@ -628,6 +633,7 @@ static Uint32 SHORTCUT_EDITOR_CODE;
 /* type codes for the touch panel dialog and its key controls */
 static Uint32 PANEL_CODE;
 static Uint32 PANEL_KEY_CODE;
+static Uint32 PANEL_ROSE_CODE;
 
 /*
  * Provide the hooks needed by primitive UI toolkit for SDL2.
@@ -4767,6 +4773,13 @@ static bool get_event(struct my_app *a)
 		case SDL_QUIT:
 			handle_quit();
 			return false;
+		case SDL_USEREVENT:
+			/* A wake-up pushed by the touch panel after queuing a key */
+			return true;
+		case SDL_APP_WILLENTERBACKGROUND:
+		case SDL_APP_DIDENTERBACKGROUND:
+			panel_cancel_repeat(a);
+			return false;
 		default:
 			return false;
 	}
@@ -4829,6 +4842,7 @@ static errr term_xtra_event(int v)
 	if (v) {
 		while (true) {
 			for (int i = 0; i < DEFAULT_IDLE_UPDATE_PERIOD; i++) {
+				panel_tick(subwindow->app);
 				if (get_event(subwindow->app)) {
 					return 0;
 				}
@@ -4837,6 +4851,7 @@ static errr term_xtra_event(int v)
 			idle_update();
 		}
 	} else {
+		panel_tick(subwindow->app);
 		(void) get_event(subwindow->app);
 	}
 
@@ -4851,6 +4866,14 @@ static errr term_xtra_flush(void)
 		switch (event.type) {
 			case SDL_WINDOWEVENT:
 				handle_windowevent(&g_app, &event.window);
+				break;
+			case SDL_MOUSEBUTTONUP:
+				/*
+				 * A release is not input to discard: the touch
+				 * panel arms a key on the press and must see the
+				 * release to disarm it and give up focus.
+				 */
+				(void) handle_mousebutton(&g_app, &event.button);
 				break;
 		}
 	}
@@ -6039,6 +6062,23 @@ static void push_text_event(struct sdlpui_window *window, const char *utf8)
 }
 
 /*
+ * Queue a keypress for the game's core directly, then wake the event loop
+ * (get_event() treats SDL_USEREVENT as handled) so that Term_inkey()
+ * looks at its queue.  Used for keypad digits, which only reach the core
+ * through SDL key events when the keypad modifier option is on.
+ */
+static void push_term_keypress(keycode_t code, uint8_t mods)
+{
+	SDL_Event ev;
+
+	Term_keypress(code, mods);
+	memset(&ev, 0, sizeof(ev));
+	ev.type = SDL_USEREVENT;
+	ev.user.timestamp = SDL_GetTicks();
+	SDL_PushEvent(&ev);
+}
+
+/*
  * Send what a key of the touch keyboard term shows: the glyphs for the
  * special keys become key presses, anything else is typed as text (a
  * keyboard sends space as text, which is why it is not a key press here).
@@ -6069,17 +6109,21 @@ static void send_sdl_keylike_event(struct sdlpui_window *window, wchar_t command
 
 /*
  * Touch panel (TOUCH_PANEL_PLAN.md, step 2): a pinned, borderless dialog
- * over the "panel" region holding panel_key controls.  A key sends what a
- * keyboard would, a keycode with modifiers or text, when it is pressed.
- * Between taps the panel holds no focus, so the game owns the redraws.
+ * over the "panel" region holding panel_key controls and a compass rose.
+ * A key sends what a keyboard would, a keycode with modifiers or text,
+ * when it is pressed.  Between taps the panel holds no focus, so the game
+ * owns the redraws.
  *
- * Layout, top to bottom: the chrome (two rows of five: Esc, up, Enter,
- * Backspace, Shift; left, down, right, Space, Ctrl), the tab strip (Act,
- * Items, Info, Mine, Keys) and the grid of the current tab, seven by four.
+ * Layout: the chrome (two rows of five: Esc, up, Enter, Backspace, Shift;
+ * left, down, right, Space, Ctrl), the tab strip (Act, Items, Info, Mine,
+ * Keys) and the grid of the current tab, seven by four, stacked at the
+ * top.  The rose sits at the bottom left, lifted off the bottom edge; in
+ * a band (wider than tall) the stack goes to its right instead of above.
  * Only the Keys tab has content yet: a letters layer, a symbols layer and
- * a numbers layer, switched by the key in the grid's last cell.  Shift and
- * Ctrl are sticky: one tap applies to the next key, a second tap locks, a
- * tap when locked clears.
+ * a numbers layer, switched by the key in the grid's last cell.  Shift
+ * and Ctrl are sticky: one tap applies to the next key, a quick second
+ * tap locks, a tap when locked (or a slow second tap) clears.  Keys with
+ * repeat set, and the rose, re-fire while held.
  */
 /* minimum touch target, in points; scaled by the window's ui_scale */
 #define PANEL_MIN_TOUCH_POINTS 44
@@ -6097,6 +6141,24 @@ static void send_sdl_keylike_event(struct sdlpui_window *window, wchar_t command
 #define PANEL_LAYERS 3
 #define PANEL_MAX_KEYS (PANEL_CHROME_COLS * PANEL_CHROME_ROWS + PANEL_TABS \
 	+ PANEL_LAYERS * PANEL_GRID_CELLS)
+/* a second tap on a modifier within this many ms locks it */
+#define PANEL_DOUBLE_TAP_MS 400
+/* a held key re-fires after this delay, then at this interval (ms) */
+#define PANEL_REPEAT_DELAY_MS 350
+#define PANEL_REPEAT_INTERVAL_MS 85
+/* the rose's bottom edge is this far above the panel's, in points */
+#define PANEL_ROSE_LIFT_POINTS 140
+/* rose geometry, as fractions of its radius and half-angles in degrees */
+#define PANEL_ROSE_DIAG_REACH 0.7f
+#define PANEL_ROSE_INNER 0.34f
+#define PANEL_ROSE_CENTER_SIDE 0.45f
+#define PANEL_ROSE_CENTER_HIT 0.3f
+#define PANEL_ROSE_CARDINAL_HALF 27.0f
+#define PANEL_ROSE_DIAGONAL_HALF 18.0f
+#define PANEL_ROSE_PETALS 8
+#define PANEL_ROSE_CENTER 8
+#define PANEL_ROSE_ARC_POINTS 7
+#define PANEL_ROSE_INNER_POINTS 3
 
 enum panel_key_kind {
 	PANEL_KEY_SEND,		/* sends a key or text */
@@ -6138,19 +6200,40 @@ struct panel_key {
 	SDL_Keycode sym;
 	Uint16 mod;
 	char text[8];
-	/* re-fires while held (step 2c) */
+	/* re-fires while held */
 	bool repeat;
 	bool armed;
 	bool has_mouse;
 	bool disabled;
 };
 
+/*
+ * The compass rose: eight petals, the cardinals longer, and a centre
+ * square.  Petal i points at bearing 45 * i degrees clockwise from north.
+ * It sends what a keypad does: the direction's digit with the keypad
+ * modifier, plus Shift to run or Ctrl to alter.
+ */
+struct panel_rose {
+	/* centre and radius, relative to the control's rect */
+	int cx, cy, radius;
+	/* petal under the finger, PANEL_ROSE_CENTER, or -1 */
+	int active;
+	bool armed;
+	bool has_mouse;
+	char face[8];
+};
+
 struct panel_data {
 	struct sdlpui_control keys[PANEL_MAX_KEYS];
 	int nkeys;
+	struct sdlpui_control rose;
 	int cur_tab;
 	int cur_layer;
 	enum panel_mod_state mod_state[PANEL_MOD_COUNT];
+	Uint32 mod_tap_time[PANEL_MOD_COUNT];
+	/* the repeating control being held, if any, and when it next fires */
+	struct sdlpui_control *held;
+	Uint32 next_repeat;
 };
 
 /* Is the key shown for the panel's current tab and layer? */
@@ -6171,13 +6254,54 @@ static bool panel_key_is_letter(const struct panel_key *pk)
 		&& isalpha((unsigned char) pk->text[0]);
 }
 
+/* Which modifiers apply to the next key */
+static void panel_active_mods(const struct panel_data *pd, bool *shift,
+		bool *ctrl)
+{
+	*shift = pd->mod_state[PANEL_MOD_SHIFT] != PANEL_MOD_OFF;
+	*ctrl = pd->mod_state[PANEL_MOD_CTRL] != PANEL_MOD_OFF;
+}
+
+/* A one-shot modifier is spent by the key it applied to. */
+static void panel_spend_oneshots(struct sdlpui_dialog *d,
+		struct sdlpui_window *w)
+{
+	struct panel_data *pd = d->priv;
+	int i;
+
+	for (i = 0; i < PANEL_MOD_COUNT; i++) {
+		if (pd->mod_state[i] == PANEL_MOD_ONESHOT) {
+			pd->mod_state[i] = PANEL_MOD_OFF;
+			d->dirty = true;
+			sdlpui_signal_redraw(w);
+		}
+	}
+}
+
+/* Start or stop repeating a held control. */
+static void panel_hold(struct sdlpui_dialog *d, struct sdlpui_control *c)
+{
+	struct panel_data *pd = d->priv;
+
+	pd->held = c;
+	pd->next_repeat = SDL_GetTicks() + PANEL_REPEAT_DELAY_MS;
+}
+
+static void panel_release(struct sdlpui_dialog *d, struct sdlpui_control *c)
+{
+	struct panel_data *pd = d->priv;
+
+	if (!c || pd->held == c) {
+		pd->held = NULL;
+	}
+}
+
 static void fire_panel_key(struct sdlpui_control *c, struct sdlpui_dialog *d,
 		struct sdlpui_window *w)
 {
 	struct panel_key *pk;
 	struct panel_data *pd;
 	bool shift, ctrl;
-	int i;
 
 	SDL_assert(c->type_code == PANEL_KEY_CODE && c->priv);
 	SDL_assert(d->type_code == PANEL_CODE && d->priv);
@@ -6188,13 +6312,34 @@ static void fire_panel_key(struct sdlpui_control *c, struct sdlpui_dialog *d,
 	}
 
 	switch (pk->kind) {
-		case PANEL_KEY_MODIFIER:
-			/* off, one tap, locked, off again */
-			pd->mod_state[pk->value] =
-				(pd->mod_state[pk->value] + 1) % 3;
+		case PANEL_KEY_MODIFIER: {
+			Uint32 now = SDL_GetTicks();
+			enum panel_mod_state next;
+
+			/*
+			 * One tap arms the modifier for the next key; a quick
+			 * second tap locks it; a slow second tap, or a tap when
+			 * locked, clears it.
+			 */
+			switch (pd->mod_state[pk->value]) {
+				case PANEL_MOD_OFF:
+					next = PANEL_MOD_ONESHOT;
+					break;
+				case PANEL_MOD_ONESHOT:
+					next = (now - pd->mod_tap_time[pk->value]
+						<= PANEL_DOUBLE_TAP_MS) ?
+						PANEL_MOD_LOCKED : PANEL_MOD_OFF;
+					break;
+				default:
+					next = PANEL_MOD_OFF;
+					break;
+			}
+			pd->mod_state[pk->value] = next;
+			pd->mod_tap_time[pk->value] = now;
 			d->dirty = true;
 			sdlpui_signal_redraw(w);
 			return;
+		}
 
 		case PANEL_KEY_TAB:
 			pd->cur_tab = pk->value;
@@ -6212,8 +6357,7 @@ static void fire_panel_key(struct sdlpui_control *c, struct sdlpui_dialog *d,
 			break;
 	}
 
-	shift = pd->mod_state[PANEL_MOD_SHIFT] != PANEL_MOD_OFF;
-	ctrl = pd->mod_state[PANEL_MOD_CTRL] != PANEL_MOD_OFF;
+	panel_active_mods(pd, &shift, &ctrl);
 	if (pk->sym != SDLK_UNKNOWN) {
 		Uint16 mod = pk->mod;
 
@@ -6241,28 +6385,28 @@ static void fire_panel_key(struct sdlpui_control *c, struct sdlpui_dialog *d,
 	} else if (pk->text[0]) {
 		push_text_event(w, pk->text);
 	}
-
-	/* A one-shot modifier is spent by the key it applied to. */
-	for (i = 0; i < PANEL_MOD_COUNT; i++) {
-		if (pd->mod_state[i] == PANEL_MOD_ONESHOT) {
-			pd->mod_state[i] = PANEL_MOD_OFF;
-			d->dirty = true;
-			sdlpui_signal_redraw(w);
-		}
-	}
+	panel_spend_oneshots(d, w);
 }
 
 static bool handle_panel_key_mouseclick(struct sdlpui_control *c,
 		struct sdlpui_dialog *d, struct sdlpui_window *w,
 		const SDL_MouseButtonEvent *e)
 {
+	struct panel_key *pk;
+
+	SDL_assert(c->type_code == PANEL_KEY_CODE && c->priv);
+	pk = c->priv;
 	if (e->button == SDL_BUTTON_LEFT) {
 		if (e->state == SDL_PRESSED) {
-			/* Fire on the press so a held key can repeat later. */
+			/* Fire on the press so a held key can repeat. */
 			(*c->ftb->arm)(c, d, w, SDLPUI_ACTION_HINT_MOUSE);
 			fire_panel_key(c, d, w);
+			if (pk->repeat && pk->kind == PANEL_KEY_SEND) {
+				panel_hold(d, c);
+			}
 		} else {
 			(*c->ftb->disarm)(c, d, w, SDLPUI_ACTION_HINT_MOUSE);
+			panel_release(d, c);
 		}
 	}
 	/* Swallow the event, even if nothing was done. */
@@ -6659,6 +6803,419 @@ static void create_panel_keys(struct panel_data *pd)
 		PANEL_GRID_CELLS - 1, "abc", SDLK_UNKNOWN, NULL, 0, false);
 }
 
+/* --- the compass rose --- */
+
+/* Keypad digit for a petal (bearing 45 * petal from north) or the centre */
+static int rose_digit(int petal)
+{
+	static const int digits[PANEL_ROSE_PETALS + 1] = {
+		8, 9, 6, 3, 2, 1, 4, 7, 5
+	};
+
+	return (petal >= 0 && petal <= PANEL_ROSE_CENTER) ? digits[petal] : 0;
+}
+
+/*
+ * What lies at (x, y), relative to the control: a petal, the centre, or
+ * -1.  Cardinal petals own 54 degrees out to the full radius; diagonal
+ * ones own 36 degrees out to PANEL_ROSE_DIAG_REACH of it.
+ */
+static int rose_hit(const struct panel_rose *pr, int x, int y)
+{
+	float dx = (float)(x - pr->cx);
+	float dy = (float)(y - pr->cy);
+	float dist = sqrtf(dx * dx + dy * dy);
+	float bearing, off;
+	int petal;
+
+	if (pr->radius <= 0) {
+		return -1;
+	}
+	if (dist <= PANEL_ROSE_CENTER_HIT * pr->radius) {
+		return PANEL_ROSE_CENTER;
+	}
+	if (dist > pr->radius) {
+		return -1;
+	}
+	/* clockwise from north, in degrees */
+	bearing = atan2f(dx, -dy) * 180.0f / (float) M_PI;
+	if (bearing < 0.0f) {
+		bearing += 360.0f;
+	}
+	petal = (int)((bearing + 22.5f) / 45.0f) % PANEL_ROSE_PETALS;
+	off = fabsf(bearing - 45.0f * petal);
+	if (off > 180.0f) {
+		off = 360.0f - off;
+	}
+	if (petal % 2 == 0) {
+		return (off <= PANEL_ROSE_CARDINAL_HALF) ? petal : -1;
+	}
+	return (off <= PANEL_ROSE_DIAGONAL_HALF
+		&& dist <= PANEL_ROSE_DIAG_REACH * pr->radius) ? petal : -1;
+}
+
+/*
+ * The outline of a petal as a closed polygon, in window coordinates:
+ * an arc at the tip and a narrower arc near the centre.
+ */
+static int rose_petal_points(const struct panel_rose *pr, int petal,
+		float ox, float oy, SDL_FPoint *pts)
+{
+	float bearing = 45.0f * petal;
+	float half = (petal % 2 == 0) ?
+		PANEL_ROSE_CARDINAL_HALF : PANEL_ROSE_DIAGONAL_HALF;
+	float reach = (petal % 2 == 0) ? 1.0f : PANEL_ROSE_DIAG_REACH;
+	float r1 = reach * pr->radius;
+	float r0 = PANEL_ROSE_INNER * pr->radius;
+	float ihalf = half * 0.55f;
+	int n = 0, k;
+
+	for (k = 0; k < PANEL_ROSE_ARC_POINTS; k++) {
+		float a = (bearing - half + 2.0f * half * k
+			/ (PANEL_ROSE_ARC_POINTS - 1)) * (float) M_PI / 180.0f;
+
+		pts[n].x = ox + pr->cx + r1 * sinf(a);
+		pts[n].y = oy + pr->cy - r1 * cosf(a);
+		n++;
+	}
+	for (k = 0; k < PANEL_ROSE_INNER_POINTS; k++) {
+		float a = (bearing + ihalf - 2.0f * ihalf * k
+			/ (PANEL_ROSE_INNER_POINTS - 1)) * (float) M_PI / 180.0f;
+
+		pts[n].x = ox + pr->cx + r0 * sinf(a);
+		pts[n].y = oy + pr->cy - r0 * cosf(a);
+		n++;
+	}
+	return n;
+}
+
+/* Fill a convex polygon as a fan around its centroid. */
+static void rose_fill_polygon(SDL_Renderer *r, const SDL_FPoint *pts, int n,
+		SDL_Color color)
+{
+	SDL_Vertex verts[1 + PANEL_ROSE_ARC_POINTS + PANEL_ROSE_INNER_POINTS];
+	int indices[3 * (PANEL_ROSE_ARC_POINTS + PANEL_ROSE_INNER_POINTS)];
+	float cx = 0.0f, cy = 0.0f;
+	int i;
+
+	for (i = 0; i < n; i++) {
+		cx += pts[i].x;
+		cy += pts[i].y;
+	}
+	verts[0].position.x = cx / n;
+	verts[0].position.y = cy / n;
+	verts[0].color = color;
+	verts[0].tex_coord.x = 0.0f;
+	verts[0].tex_coord.y = 0.0f;
+	for (i = 0; i < n; i++) {
+		verts[i + 1].position = pts[i];
+		verts[i + 1].color = color;
+		verts[i + 1].tex_coord.x = 0.0f;
+		verts[i + 1].tex_coord.y = 0.0f;
+		indices[3 * i] = 0;
+		indices[3 * i + 1] = i + 1;
+		indices[3 * i + 2] = ((i + 1) % n) + 1;
+	}
+	SDL_RenderGeometry(r, NULL, verts, n + 1, indices, 3 * n);
+}
+
+static void fire_panel_rose(struct sdlpui_control *c, struct sdlpui_dialog *d,
+		struct sdlpui_window *w)
+{
+	struct panel_rose *pr;
+	struct panel_data *pd;
+	bool shift, ctrl;
+	uint8_t mods = KC_MOD_KEYPAD;
+	int digit;
+
+	SDL_assert(c->type_code == PANEL_ROSE_CODE && c->priv);
+	pr = c->priv;
+	pd = d->priv;
+	digit = rose_digit(pr->active);
+	if (!digit) {
+		return;
+	}
+	/* Shift runs and Ctrl alters, through the keypad keymaps. */
+	panel_active_mods(pd, &shift, &ctrl);
+	if (shift) {
+		mods |= KC_MOD_SHIFT;
+	}
+	if (ctrl) {
+		mods |= KC_MOD_CONTROL;
+	}
+	push_term_keypress((keycode_t)('0' + digit), mods);
+	panel_spend_oneshots(d, w);
+}
+
+static bool handle_panel_rose_mouseclick(struct sdlpui_control *c,
+		struct sdlpui_dialog *d, struct sdlpui_window *w,
+		const SDL_MouseButtonEvent *e)
+{
+	struct panel_rose *pr;
+
+	SDL_assert(c->type_code == PANEL_ROSE_CODE && c->priv);
+	pr = c->priv;
+	if (e->button == SDL_BUTTON_LEFT) {
+		if (e->state == SDL_PRESSED) {
+			int hit = rose_hit(pr, e->x - d->rect.x - c->rect.x,
+				e->y - d->rect.y - c->rect.y);
+
+			if (hit >= 0) {
+				pr->active = hit;
+				(*c->ftb->arm)(c, d, w, SDLPUI_ACTION_HINT_MOUSE);
+				fire_panel_rose(c, d, w);
+				panel_hold(d, c);
+			}
+		} else {
+			(*c->ftb->disarm)(c, d, w, SDLPUI_ACTION_HINT_MOUSE);
+			panel_release(d, c);
+		}
+	}
+	return true;
+}
+
+/*
+ * Sliding while held changes the petal without lifting: the new
+ * direction fires at once and the repeat continues from there.
+ */
+static bool handle_panel_rose_mousemove(struct sdlpui_control *c,
+		struct sdlpui_dialog *d, struct sdlpui_window *w,
+		const SDL_MouseMotionEvent *e)
+{
+	struct panel_rose *pr;
+	int hit;
+
+	SDL_assert(c->type_code == PANEL_ROSE_CODE && c->priv);
+	pr = c->priv;
+	hit = rose_hit(pr, e->x - d->rect.x - c->rect.x,
+		e->y - d->rect.y - c->rect.y);
+	if (e->state == 0) {
+		/* Hovering: stay focused while over the rose. */
+		return hit >= 0;
+	}
+	if (pr->armed && hit >= 0 && hit != pr->active) {
+		struct panel_data *pd = d->priv;
+
+		pr->active = hit;
+		d->dirty = true;
+		sdlpui_signal_redraw(w);
+		fire_panel_rose(c, d, w);
+		if (pd->held == c) {
+			pd->next_repeat = SDL_GetTicks()
+				+ PANEL_REPEAT_INTERVAL_MS;
+		}
+	}
+	return true;
+}
+
+static void render_panel_rose(struct sdlpui_control *c,
+		struct sdlpui_dialog *d, struct sdlpui_window *w,
+		SDL_Renderer *r)
+{
+	struct panel_rose *pr;
+	SDL_Color white = w->app->colors[COLOUR_WHITE];
+	SDL_Color ghost = white, outline = white, solid = white;
+	SDL_BlendMode old_mode;
+	SDL_FPoint pts[PANEL_ROSE_ARC_POINTS + PANEL_ROSE_INNER_POINTS + 1];
+	SDL_Rect centre;
+	float ox, oy;
+	int petal, n, side, tw = 0, th = 0;
+
+	SDL_assert(c->type_code == PANEL_ROSE_CODE && c->priv);
+	pr = c->priv;
+	if (pr->radius <= 0) {
+		return;
+	}
+	ghost.a = 40;
+	outline.a = pr->has_mouse ? 160 : 110;
+	solid.a = 220;
+	ox = (float) c->rect.x + ((d->texture) ? 0 : d->rect.x);
+	oy = (float) c->rect.y + ((d->texture) ? 0 : d->rect.y);
+
+	SDL_GetRenderDrawBlendMode(r, &old_mode);
+	SDL_SetRenderDrawBlendMode(r, SDL_BLENDMODE_BLEND);
+	for (petal = 0; petal < PANEL_ROSE_PETALS; petal++) {
+		bool pressed = pr->armed && pr->active == petal;
+
+		n = rose_petal_points(pr, petal, ox, oy, pts);
+		rose_fill_polygon(r, pts, n, pressed ? solid : ghost);
+		pts[n] = pts[0];
+		SDL_SetRenderDrawColor(r, outline.r, outline.g, outline.b,
+			outline.a);
+		SDL_RenderDrawLinesF(r, pts, n + 1);
+	}
+
+	/* The centre: a square with the face of the stay command. */
+	side = (int)(PANEL_ROSE_CENTER_SIDE * pr->radius);
+	centre.x = (int)(ox + pr->cx - side / 2);
+	centre.y = (int)(oy + pr->cy - side / 2);
+	centre.w = side;
+	centre.h = side;
+	if (pr->armed && pr->active == PANEL_ROSE_CENTER) {
+		SDL_SetRenderDrawColor(r, solid.r, solid.g, solid.b, solid.a);
+	} else {
+		SDL_SetRenderDrawColor(r, ghost.r, ghost.g, ghost.b, ghost.a);
+	}
+	SDL_RenderFillRect(r, &centre);
+	SDL_SetRenderDrawColor(r, outline.r, outline.g, outline.b, outline.a);
+	SDL_RenderDrawRect(r, &centre);
+	if (pr->face[0]) {
+		SDL_Rect cap_r;
+		SDL_Color fg = (pr->armed && pr->active == PANEL_ROSE_CENTER) ?
+			w->app->colors[COLOUR_DARK] : white;
+
+		sdlpui_get_utf8_metrics(sdlpui_get_ttf(w), pr->face, &tw, &th);
+		cap_r.w = MIN(tw, side);
+		cap_r.h = MIN(th, side);
+		cap_r.x = centre.x + (side - cap_r.w) / 2;
+		cap_r.y = centre.y + (side - cap_r.h) / 2;
+		sdlpui_render_utf8_line(r, sdlpui_get_ttf(w), &fg, &cap_r,
+			pr->face);
+	}
+	SDL_SetRenderDrawBlendMode(r, old_mode);
+}
+
+static void gain_mouse_panel_rose(struct sdlpui_control *c,
+		struct sdlpui_dialog *d, struct sdlpui_window *w, int comp_ind)
+{
+	struct panel_rose *pr;
+
+	SDL_assert(c->type_code == PANEL_ROSE_CODE && c->priv);
+	pr = c->priv;
+	if (!pr->has_mouse) {
+		pr->has_mouse = true;
+		d->dirty = true;
+		sdlpui_signal_redraw(w);
+	}
+}
+
+static void lose_mouse_panel_rose(struct sdlpui_control *c,
+		struct sdlpui_dialog *d, struct sdlpui_window *w,
+		struct sdlpui_control *new_c, struct sdlpui_dialog *new_d)
+{
+	struct panel_rose *pr;
+
+	SDL_assert(c->type_code == PANEL_ROSE_CODE && c->priv);
+	pr = c->priv;
+	if (pr->has_mouse) {
+		pr->has_mouse = false;
+		d->dirty = true;
+		sdlpui_signal_redraw(w);
+	}
+}
+
+static void arm_panel_rose(struct sdlpui_control *c, struct sdlpui_dialog *d,
+		struct sdlpui_window *w, enum sdlpui_action_hint hint)
+{
+	struct panel_rose *pr;
+
+	SDL_assert(c->type_code == PANEL_ROSE_CODE && c->priv);
+	pr = c->priv;
+	if (!pr->armed) {
+		pr->armed = true;
+		d->dirty = true;
+		sdlpui_signal_redraw(w);
+	}
+}
+
+static void disarm_panel_rose(struct sdlpui_control *c,
+		struct sdlpui_dialog *d, struct sdlpui_window *w,
+		enum sdlpui_action_hint hint)
+{
+	struct panel_rose *pr;
+
+	SDL_assert(c->type_code == PANEL_ROSE_CODE && c->priv);
+	pr = c->priv;
+	if (pr->armed) {
+		pr->armed = false;
+		pr->active = -1;
+		d->dirty = true;
+		sdlpui_signal_redraw(w);
+	}
+}
+
+static int get_panel_rose_interactable_component(struct sdlpui_control *c,
+		bool first)
+{
+	return 1;
+}
+
+static int get_panel_rose_interactable_component_at(struct sdlpui_control *c,
+		Sint32 x, Sint32 y)
+{
+	struct panel_rose *pr;
+
+	SDL_assert(c->type_code == PANEL_ROSE_CODE && c->priv);
+	pr = c->priv;
+	/* x and y are relative to the dialog */
+	return (rose_hit(pr, x - c->rect.x, y - c->rect.y) >= 0) ? 1 : 0;
+}
+
+static void resize_panel_rose(struct sdlpui_control *c,
+		struct sdlpui_dialog *d, struct sdlpui_window *w, int width,
+		int height)
+{
+	struct panel_rose *pr;
+
+	SDL_assert(c->type_code == PANEL_ROSE_CODE && c->priv);
+	pr = c->priv;
+	c->rect.w = width;
+	c->rect.h = height;
+	pr->cx = width / 2;
+	pr->cy = height / 2;
+	pr->radius = MIN(width, height) / 2;
+}
+
+static void query_panel_rose_natural_size(struct sdlpui_control *c,
+		struct sdlpui_dialog *d, struct sdlpui_window *w, int *width,
+		int *height)
+{
+	int min_touch = (int)(PANEL_MIN_TOUCH_POINTS * w->ui_scale + 0.5f);
+
+	*width = 3 * min_touch;
+	*height = 3 * min_touch;
+}
+
+static void cleanup_panel_rose(struct sdlpui_control *c)
+{
+	SDL_assert(c->type_code == PANEL_ROSE_CODE && c->priv);
+	SDL_free(c->priv);
+	c->priv = NULL;
+}
+
+static void create_panel_rose(struct sdlpui_control *c)
+{
+	static const struct sdlpui_control_funcs panel_rose_funcs = {
+		.handle_mouseclick = handle_panel_rose_mouseclick,
+		.handle_mousemove = handle_panel_rose_mousemove,
+		.render = render_panel_rose,
+		.gain_mouse = gain_mouse_panel_rose,
+		.lose_mouse = lose_mouse_panel_rose,
+		.arm = arm_panel_rose,
+		.disarm = disarm_panel_rose,
+		.get_interactable_component =
+			get_panel_rose_interactable_component,
+		.get_interactable_component_at =
+			get_panel_rose_interactable_component_at,
+		.resize = resize_panel_rose,
+		.query_natural_size = query_panel_rose_natural_size,
+		.cleanup = cleanup_panel_rose
+	};
+	struct panel_rose *pr = SDL_calloc(1, sizeof(*pr));
+
+	pr->active = -1;
+	(void) my_strcpy(pr->face, "Stay", sizeof(pr->face));
+	c->ftb = &panel_rose_funcs;
+	c->priv = pr;
+	c->type_code = PANEL_ROSE_CODE;
+	c->rect.x = 0;
+	c->rect.y = 0;
+	c->rect.w = 0;
+	c->rect.h = 0;
+}
+
+/* --- the panel dialog --- */
+
 static struct sdlpui_control *find_panel_control_containing(
 		struct sdlpui_dialog *d, struct sdlpui_window *w, Sint32 x,
 		Sint32 y, int *comp_ind)
@@ -6679,17 +7236,36 @@ static struct sdlpui_control *find_panel_control_containing(
 			return c;
 		}
 	}
+	if (pd->rose.priv && sdlpui_is_in_control(&pd->rose, d, x, y)
+			&& (*pd->rose.ftb->get_interactable_component_at)(
+			&pd->rose, x - d->rect.x, y - d->rect.y)) {
+		return &pd->rose;
+	}
 	return NULL;
 }
 
 /*
- * Drop the panel's hover state and its mouse and key focus.  While a
- * dialog has focus the window is redrawn as if a menu were open, so the
- * panel gives focus back after every tap.
+ * Drop the panel's hover state and its mouse and key focus, and stop any
+ * repeat.  While a dialog has focus the window is redrawn as if a menu
+ * were open, so the panel gives focus back after every tap.
  */
 static void panel_yield_focus(struct sdlpui_dialog *d, struct sdlpui_window *w)
 {
+	panel_release(d, NULL);
 	sdlpui_dialog_handle_window_loses_mouse(d, w);
+}
+
+static void handle_panel_loses_mouse(struct sdlpui_dialog *d,
+		struct sdlpui_window *w, struct sdlpui_control *new_c,
+		struct sdlpui_dialog *new_d)
+{
+	panel_yield_focus(d, w);
+}
+
+static void handle_panel_window_loses_mouse(struct sdlpui_dialog *d,
+		struct sdlpui_window *w)
+{
+	panel_yield_focus(d, w);
 }
 
 static bool handle_panel_mouseclick(struct sdlpui_dialog *d,
@@ -6762,12 +7338,17 @@ static void render_panel(struct sdlpui_dialog *d, struct sdlpui_window *w)
 			(*pd->keys[i].ftb->render)(&pd->keys[i], d, w, r);
 		}
 	}
+	if (pd->rose.priv && pd->rose.ftb->render) {
+		(*pd->rose.ftb->render)(&pd->rose, d, w, r);
+	}
 	d->dirty = false;
 }
 
 /*
- * Lay the keys out at the panel's top left: the chrome, the tab strip and
- * the grid, in rows of one touch target.  Cells are no wider than
+ * Lay the panel out.  The rose goes at the bottom left, its bottom edge
+ * lifted, as large as the space allows.  The chrome, the tab strip and
+ * the grid stack in rows of one touch target, above the rose in a column
+ * and to its right in a band.  Cells are no wider than
  * PANEL_MAX_KEY_POINTS however wide the panel is.
  */
 static void layout_panel_keys(struct sdlpui_dialog *d, struct sdlpui_window *w)
@@ -6776,17 +7357,46 @@ static void layout_panel_keys(struct sdlpui_dialog *d, struct sdlpui_window *w)
 	int min_touch = (int)(PANEL_MIN_TOUCH_POINTS * w->ui_scale + 0.5f);
 	int max_cell = (int)(PANEL_MAX_KEY_POINTS * w->ui_scale + 0.5f);
 	int gap = (int)(PANEL_GAP_POINTS * w->ui_scale + 0.5f);
-	int chrome_w = MIN((d->rect.w - gap) / PANEL_CHROME_COLS, max_cell);
-	int tab_w = MIN((d->rect.w - gap) / PANEL_TABS, max_cell);
-	int grid_w = MIN((d->rect.w - gap) / PANEL_GRID_COLS, max_cell);
+	int lift = (int)(PANEL_ROSE_LIFT_POINTS * w->ui_scale + 0.5f);
+	bool band = d->rect.w > d->rect.h;
 	int rows = PANEL_CHROME_ROWS + 1 + PANEL_GRID_ROWS;
 	int cell_h = min_touch + gap;
-	int i;
+	int stack_x = 0, stack_w, stack_h, avail_w, rose_side;
+	int chrome_w, tab_w, grid_w, i;
 
-	/* A short panel gets shorter rows rather than losing the grid. */
-	if (rows * cell_h + gap > d->rect.h && d->rect.h > 0) {
-		cell_h = MAX((d->rect.h - gap) / rows, 2 * gap);
+	/* The rose first: it takes what the stack leaves. */
+	stack_h = rows * cell_h + gap;
+	if (band) {
+		/* The stack needs the grid's width beside the rose. */
+		int want = PANEL_GRID_COLS * MIN(max_cell, min_touch + gap)
+			+ gap;
+
+		rose_side = MIN(d->rect.h - lift, d->rect.w - want - gap);
+	} else {
+		rose_side = MIN(d->rect.w, d->rect.h - lift - stack_h - gap);
 	}
+	if (rose_side < 2 * min_touch) {
+		rose_side = MIN(2 * min_touch, MIN(d->rect.w, d->rect.h));
+	}
+	if (pd->rose.priv) {
+		pd->rose.rect.x = 0;
+		pd->rose.rect.y = MAX(0, d->rect.h - lift - rose_side);
+		(*pd->rose.ftb->resize)(&pd->rose, d, w, rose_side,
+			rose_side);
+	}
+	if (band) {
+		stack_x = rose_side + gap;
+	}
+	avail_w = d->rect.w - stack_x;
+	if (!band && stack_h + gap > pd->rose.rect.y && d->rect.h > 0) {
+		/* A short column gets shorter rows rather than losing rows. */
+		cell_h = MAX((pd->rose.rect.y - gap) / rows, 2 * gap);
+	}
+	chrome_w = MIN((avail_w - gap) / PANEL_CHROME_COLS, max_cell);
+	tab_w = MIN((avail_w - gap) / PANEL_TABS, max_cell);
+	grid_w = MIN((avail_w - gap) / PANEL_GRID_COLS, max_cell);
+	stack_w = MAX(chrome_w * PANEL_CHROME_COLS, grid_w * PANEL_GRID_COLS);
+	(void) stack_w;
 	for (i = 0; i < pd->nkeys; i++) {
 		struct sdlpui_control *c = &pd->keys[i];
 		struct panel_key *pk = c->priv;
@@ -6805,7 +7415,7 @@ static void layout_panel_keys(struct sdlpui_dialog *d, struct sdlpui_window *w)
 			row = PANEL_CHROME_ROWS + 1 + pk->cell / PANEL_GRID_COLS;
 			cell_w = grid_w;
 		}
-		c->rect.x = gap + col * cell_w;
+		c->rect.x = stack_x + gap + col * cell_w;
 		c->rect.y = gap + row * cell_h;
 		(*c->ftb->resize)(c, d, w, cell_w - gap, cell_h - gap);
 	}
@@ -6840,6 +7450,9 @@ static void cleanup_panel(struct sdlpui_dialog *d)
 			(*pd->keys[i].ftb->cleanup)(&pd->keys[i]);
 		}
 	}
+	if (pd->rose.priv && pd->rose.ftb->cleanup) {
+		(*pd->rose.ftb->cleanup)(&pd->rose);
+	}
 	SDL_free(pd);
 	d->priv = NULL;
 }
@@ -6861,10 +7474,9 @@ static void load_panel(struct sdlpui_window *window)
 	static const struct sdlpui_dialog_funcs panel_funcs = {
 		.handle_mouseclick = handle_panel_mouseclick,
 		.handle_mousemove = handle_panel_mousemove,
-		.handle_loses_mouse = sdlpui_dialog_handle_loses_mouse,
+		.handle_loses_mouse = handle_panel_loses_mouse,
 		.handle_loses_key = sdlpui_dialog_handle_loses_key,
-		.handle_window_loses_mouse =
-			sdlpui_dialog_handle_window_loses_mouse,
+		.handle_window_loses_mouse = handle_panel_window_loses_mouse,
 		.handle_window_loses_key =
 			sdlpui_dialog_handle_window_loses_key,
 		.render = render_panel,
@@ -6887,6 +7499,7 @@ static void load_panel(struct sdlpui_window *window)
 	pd->cur_tab = PANEL_TAB_KEYS;
 	pd->cur_layer = 0;
 	create_panel_keys(pd);
+	create_panel_rose(&pd->rose);
 
 	d->ftb = &panel_funcs;
 	d->pop_callback = hide_panel;
@@ -6907,8 +7520,9 @@ static void load_panel(struct sdlpui_window *window)
 
 	window->panel = d;
 	sdlpui_popup_dialog(d, window, false);
-	SDL_Log("window %u: panel at %d,%d %dx%d, %d keys", window->index,
-		d->rect.x, d->rect.y, d->rect.w, d->rect.h, pd->nkeys);
+	SDL_Log("window %u: panel at %d,%d %dx%d, %d keys, rose %d,%d %d",
+		window->index, d->rect.x, d->rect.y, d->rect.w, d->rect.h,
+		pd->nkeys, pd->rose.rect.x, pd->rose.rect.y, pd->rose.rect.w);
 }
 
 /*
@@ -6934,6 +7548,55 @@ static void relayout_panel(struct sdlpui_window *window)
 		/* hide_panel() clears window->panel */
 		sdlpui_popdown_dialog(window->panel, window, false);
 	}
+}
+
+/* Stop any repeat in every window's panel (the app went to the background). */
+static void panel_cancel_repeat(struct my_app *a)
+{
+	int i;
+
+	for (i = 0; i < MAX_WINDOWS; i++) {
+		struct sdlpui_dialog *d = a->windows[i].panel;
+
+		if (d && d->priv) {
+			panel_release(d, NULL);
+		}
+	}
+}
+
+/*
+ * Re-fire the held control on the repeat schedule.  Called from the
+ * event loop while the game waits for input.  A held control whose
+ * button is no longer down (a release the panel never saw) is dropped.
+ */
+static void panel_tick(struct my_app *a)
+{
+	struct sdlpui_window *w = &a->windows[MAIN_WINDOW];
+	struct sdlpui_dialog *d = w->panel;
+	struct panel_data *pd;
+	Uint32 now;
+
+	if (!d || !d->priv) {
+		return;
+	}
+	pd = d->priv;
+	if (!pd->held) {
+		return;
+	}
+	if (!(SDL_GetMouseState(NULL, NULL) & SDL_BUTTON_LMASK)) {
+		panel_release(d, NULL);
+		return;
+	}
+	now = SDL_GetTicks();
+	if ((Sint32)(now - pd->next_repeat) < 0) {
+		return;
+	}
+	if (pd->held->type_code == PANEL_ROSE_CODE) {
+		fire_panel_rose(pd->held, d, w);
+	} else {
+		fire_panel_key(pd->held, d, w);
+	}
+	pd->next_repeat = now + PANEL_REPEAT_INTERVAL_MS;
 }
 
 static void handle_button_open_subwindow(struct sdlpui_control *ctrl,
@@ -8508,6 +9171,7 @@ static void init_systems(void)
 	SHORTCUT_EDITOR_CODE = sdlpui_register_code("ANGBAND_SHORTCUT_EDITOR");
 	PANEL_CODE = sdlpui_register_code("ANGBAND_TOUCH_PANEL");
 	PANEL_KEY_CODE = sdlpui_register_code("ANGBAND_TOUCH_PANEL_KEY");
+	PANEL_ROSE_CODE = sdlpui_register_code("ANGBAND_TOUCH_PANEL_ROSE");
 	SDL_assert(SHORTCUT_EDITOR_CODE);
 
 	/* On (some?) Macs the touchpad sends both mouse events and touch events;

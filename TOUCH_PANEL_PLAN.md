@@ -582,9 +582,11 @@ that runs on the simulator. Step numbers match the rest of this file.
 **Status 2026-09-09:** step 0 complete. Step 1 done, tested on the
 simulator and the iPad, committed in this repository and cherry-picked to
 NarSil and FAangband; the portrait split decision is deferred until the
-panel exists. Step 2a done, tested on the simulator and the iPad. Step
-2b code done, tested on the simulator and committed here; its simulator
-test (the modifier feel) is open. Next: step 2c.
+panel exists. Step 2a and 2b done and tested by you. Step 2c (repeat)
+and the step 5 rose code done, tested on the simulator with `idb` and
+committed here; their device tests are open. You have asked for movable
+panel pieces (two-finger drag, as in Brogue) before any layout or size
+decision; feasibility notes are in section 8. Next: that, then step 3.
 
 ### Step 0. Prerequisites
 
@@ -917,20 +919,42 @@ test (the modifier feel) is open. Next: step 2c.
       Screenshots `~/Downloads/step2b_shift_oneshot.png`,
       `step2b_shift_locked.png`, `step2b_symbols_layer.png`,
       `step2b_numbers_layer.png`.
-- [ ] you test (simulator): the modifier feel: tap once, double tap locks,
+- [x] you test (simulator): the modifier feel: tap once, double tap locks,
       tap from lock clears. Does the one-shot state read clearly?
+      2026-09-09: the one-shot and locked states read clearly, and the
+      keycaps changing case was liked. Wrong: a second tap seconds later
+      locked, where iOS locks only on a quick double tap. Fixed: a second
+      tap within 400 ms locks, a later one clears. Also found and fixed:
+      the core's input flush (`term_xtra_flush`) dropped every queued
+      SDL event including touch releases, so a key pressed just before a
+      flush (the last Enter of birth) stayed armed and lit and the panel
+      kept focus; releases now go through `handle_mousebutton` during a
+      flush. You do not want to discuss layout or key sizes until the
+      rose exists and everything works.
 - [x] commit. 2026-09-09.
 
 2c. Repeat.
 
-- [ ] code: press time recorded in the control's mouse-down; `panel_tick`
+- [x] code: press time recorded in the control's mouse-down; `panel_tick`
       from the main loop re-fires held repeatable controls at 350 ms then
       every 85 ms; release, focus loss and app background cancel.
+      2026-09-09: done. The panel records the held control on the press;
+      `panel_tick`, called from `term_xtra_event` before each poll (so
+      only while the game waits for input), re-fires it on the schedule.
+      Release, the panel yielding focus, the app entering the background
+      and a button no longer down (`SDL_GetMouseState`, for a release
+      the panel never saw) all cancel. Repeat keys: the arrows,
+      Backspace, Del, PgUp, PgDn, and the rose. Verified: `idb ui tap
+      --duration 1.5` on the rose's south petal moved the character
+      about 13 squares.
 - [ ] you test (device): hold an arrow; hold Backspace in a name prompt.
       Are 350 and 85 right for you?
-- [ ] test: a full turn from the panel with `idb` taps only, then by you by
-      hand on the simulator.
-- [ ] commit.
+- [x] test: a full turn from the panel with `idb` taps only, then by you by
+      hand on the simulator. 2026-09-09: `idb` only: walk, run, stay,
+      the command menu, the character sheet, help and the knowledge
+      menu, all from the panel. The by-hand half is yours, with the
+      device tests.
+- [x] commit. 2026-09-09.
 
 ### Step 3. Core hooks
 
@@ -982,17 +1006,42 @@ test (the modifier feel) is open. Next: step 2c.
 
 ### Step 5. Compass rose
 
-- [ ] code: check `textui_process_key` in all three variants for keypad
+- [x] code: check `textui_process_key` in all three variants for keypad
       digits with Shift and Ctrl mapping to run and alter. Report; choose
-      keypad emission or command prefixes.
-- [ ] code: `panel_rose` control: geometry from section 4.5, hit test,
+      keypad emission or command prefixes. 2026-09-09: the core does not
+      handle them; `lib/customize/pref.prf` does, in all three games and
+      for every keyset (NarSil's modes 0 to 3): `{K}N` walks (`;N`),
+      `{SK}N` runs (`.N` or `,N`), `{^K}N` alters (`+N`, or `/N` for
+      NarSil's Sil keyset), and keypad 5 stays (`,` in Angband and
+      FAangband, `z` in NarSil). Chosen: keypad emission. It bypasses
+      SDL: the frontend only turns keypad keycodes into keypad digits
+      when the "keypad modifier" option is on, so the rose calls
+      `Term_keypress` with the digit and `KC_MOD_KEYPAD` (plus
+      `KC_MOD_SHIFT` or `KC_MOD_CONTROL`) and pushes an `SDL_USEREVENT`,
+      which `get_event` treats as handled, to wake `Term_inkey`.
+- [x] code: `panel_rose` control: geometry from section 4.5, hit test,
       `SDL_RenderGeometry` petals with a ghost outline and a solid pressed
-      petal, center face.
-- [ ] code: behaviour: tap steps, hold repeats, slide while held changes
+      petal, center face. 2026-09-09: done, as a third control type
+      (`PANEL_ROSE_CODE`) in the panel dialog. Petals are ten-point
+      polygons (an arc at the tip, a narrower arc near the centre)
+      filled as fans at alpha 40, outlined at 110, solid at 220 when
+      pressed; the centre is a square with the face "Stay". Placement
+      for now: bottom left of the panel, lifted 140 points, as large as
+      the space allows; in a band (portrait) the key stack moves to the
+      rose's right, in a column (landscape) it stays above. On the
+      11-inch in portrait the rose is 481 px (240 points) across.
+- [x] code: behaviour: tap steps, hold repeats, slide while held changes
       petal, Shift runs, Ctrl alters, center is `Stand still` by reference.
+      2026-09-09: done, except that the centre sends keypad 5 (the stay
+      keymap) rather than a command reference, which waits for step 4.
+      Verified with `idb`: a tap steps, a 1.5 s hold repeats, a swipe
+      from the east petal to the south petal stepped east then south,
+      Shift then a petal ran. Ctrl (alter) is wired but untested.
 - [ ] you decide: after seeing it, the rose radius, the 140 point lift, and
       bottom-left versus a right-hand mirror. Whether center long-press
-      should do anything yet.
+      should do anything yet. 2026-09-09: deferred by you in favour of
+      movable pieces (section 8), which would make the position a drag
+      rather than a decision.
 - [ ] you test (device): walk, run, alter, stay; sliding; that a finger
       resting on the rose does not fire twice.
 - [ ] commit; cherry-pick to the other two.
@@ -1092,3 +1141,33 @@ test (the modifier feel) is open. Next: step 2c.
 - Rebasing `../NarSil_fork` `main` onto upstream, 124 commits behind as of
   2026-09-08. Nothing there touches `main-sdl2.c`.
 - The Menu dropdown open at launch (section 2.6): fixed in step 2a.
+- Movable panel pieces (asked for 2026-09-09, after the rose): the rose
+  and the key stack draggable, drawn above whatever they land on, moved
+  with a two-finger drag as in Brogue. Feasibility, from the code as it
+  stands:
+  - Drawing above the terms already works: the panel is a toolkit dialog
+    drawn straight to the window after the terms in `render_all` and
+    last in the menu-active pass, wherever its rect is. Taps inside its
+    rect never reach a term (`get_subwindow_by_xy`), taps outside do.
+    Terms under a piece keep updating and show through its alpha.
+  - What changes: one dialog per piece (rose, key stack, later the
+    fast-keys strip) instead of one panel dialog, sharing the modifier
+    and layer state through a common struct; the render and hit-test
+    exclusions generalised from `window->panel` to a list of pieces.
+    Controls are already positioned relative to their dialog, so moving
+    a piece is moving its rect.
+  - Persistence for free: make each piece a region (`region:rose:...`,
+    `region:keys:...`) so positions are per orientation, survive
+    rotation, and are written back by `dump_config_file`; a drag updates
+    the per-mille values for the current orientation. `region:panel`
+    would become the pieces' home area or go away.
+  - Two-finger drag: SDL only emulates the mouse from the first finger,
+    so enable the finger events the frontend disables at init
+    (`SDL_FINGERDOWN`, `MOTION`, `UP`) and ignore them except for
+    counting fingers: a second finger down while the first is on a
+    piece starts a drag that follows the centroid; any finger up ends
+    it and writes the region. Finger coordinates are normalised to the
+    window, so scale by the renderer size. One wrinkle: the first
+    finger's press has already fired its key (a step, or a letter) by
+    the time the second finger lands; Brogue lives with the same.
+  - Size: a few hundred lines, mostly moving code; no toolkit changes.
