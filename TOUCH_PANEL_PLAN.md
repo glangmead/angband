@@ -10,14 +10,24 @@ day; its results are in sections 2.6, 4.9, 5 and 7. The same plan applies
 afterwards to `../FAangband_fork` and `../NarSil_fork`, which carry the same
 branch and the same current keyboard hack.
 
+2026-09-09: one feature was split out of this file. The patch to the game
+core that tells the panel which keys are valid at the current prompt --
+section 4.6 and step 3 -- now lives in `CORE_HOOKS_PLAN.md` with its own
+design and checklist. Both stubs are kept here so the section and step
+numbers, and the references to them, still resolve. Nothing left in this
+file waits on that work.
+
 ## 1. Goal
 
 The whole screen stays SDL. Term windows are laid out from fractional
 "regions" that differ per orientation. One region is not a term: it is a
 **panel** drawn by `main-sdl2.c` with its own toolkit, containing a compass
-rose, a few fixed keys, and five tabs of buttons. The game core is patched to
-tell the panel which keys are valid at the current prompt. No UIKit views, no
+rose, a few fixed keys, and five tabs of buttons. No UIKit views, no
 frameworks, one app per variant.
+
+Separately, the game core is patched to tell the panel which keys are valid
+at the current prompt; that is `CORE_HOOKS_PLAN.md` now. The panel is usable
+without it, as a keyboard that does not know what the game is asking.
 
 This replaces the current approach, where a term subwindow displays a grid of
 characters that acts as a keyboard.
@@ -123,13 +133,10 @@ them.
 
 - **angbandroid** (`../angbandroid`), the Android port. The reusable part is
   the core patch, not the Java:
-  - `app/src/main/cpp/curses/droid.h`, `droid.c`: the `soft_kbd_*` buffer
-    (flash, linger, clear, flush, append) and `Term_control` message kinds.
-  - `app/src/main/cpp/angband/android_changes.txt`: list of patched core
-    files. `grep -n soft_kbd_ app/src/main/cpp/angband/*.c` gives the 79 hook
-    sites.
-  - `app/src/main/cpp/angband/ui-menu.c` `keys_to_ui` (about line 780):
-    collects a menu's valid tags and flashes them.
+  - The `soft_kbd_*` buffer, the `Term_control` kinds, `android_changes.txt`
+    and `ui-menu.c` `keys_to_ui`: all of that is the core-hooks work and now
+    lives in `CORE_HOOKS_PLAN.md` section 2, which also corrects the site
+    count (42, not the 79 this file used to claim).
   - `app/src/main/cpp/angband/ui-input.c:1749` `feed_keymap`: turns a string
     into an `inkey_next` buffer so a multi-key button behaves like a keymap.
   - `app/src/main/cpp/common/angdroid.c` `process_special_command`: how the
@@ -345,7 +352,7 @@ a slice of the map region if wanted.
     on the Keys tab, and shifted symbols. Ctrl affects the rose (alter) and
     letters (KTRL).
   - Tab strip with five labels.
-  - Fast-keys strip fed by the core hook (section 4.6). When the core signals
+  - Fast-keys strip fed by the core hook (`CORE_HOOKS_PLAN.md`). When the core signals
     a yes/no prompt, the Enter and Backspace slots show `y` and `n` instead,
     as angbandroid does.
 - Tabs: Act, Items, Info, Mine are four by four grids of word-faced buttons.
@@ -438,26 +445,15 @@ a menu item. Output is a complete `panel.txt` the user can edit.
 
 ### 4.6 Core to panel hooks
 
-Port the angbandroid patch, renamed so nothing says Android:
+2026-09-09: moved to `CORE_HOOKS_PLAN.md`, which owns the design and the
+checklist for the core patch that tells the panel which keys are valid at
+the current prompt. This section number is kept so the references to it
+elsewhere in this file still land somewhere.
 
-- New `src/ui-panel.h` and `src/ui-panel.c`: the `soft_kbd_*` buffer from
-  `droid.c`, and `extern void (*ui_control_hook)(int what, const char *msg)`
-  defaulting to NULL. Message kinds: `UI_CTRL_LIST_KEYS` with a key string or
-  `${clear}`, and tokens `${yes_no}`, `${quant}`, `${fkeys}`, plus a new
-  `${text}` emitted by `askfor_aux` so the panel can switch to the Keys tab
-  during string entry.
-- Hook sites: follow `grep -n soft_kbd_ ../angbandroid/app/src/main/cpp/angband/*.c`.
-  The important ones: `inkey_ex` flushes right before blocking and clears
-  after a key; `get_check` flashes `${yes_no}`; `get_char` flashes its
-  options; `get_quantity` lingers `${quant}*`; `ui-menu.c` gets
-  `keys_to_ui`; targeting lingers `t*+-rpogmkq?`; birth, knowledge, options,
-  player sheet, monster list and command menus flash their keys.
-- Frontend implementation of the hook: update the fast-keys strip (up to
-  twelve character buttons; longer lists fill the top rows of the Keys tab and
-  switch to it), relabel Enter and Backspace for `${yes_no}`, switch to Keys
-  for `${text}`, restore on `${clear}`.
-- Desktop builds without the panel leave the pointer NULL and compile
-  unchanged.
+What is left here is the seam. The panel needs from that work only a
+consumer for one hook; that work needs from the panel only the fast-keys
+strip to fill and the Keys tab to switch to, both of which exist. The two
+can be built and landed in either order.
 
 ### 4.7 Panel to core input path
 
@@ -724,7 +720,7 @@ box). What is left before step 3 is your re-test on the device.
       recall, not messages: see `window.prf`) has no region in the 4.1
       defaults and sits at its clamped landscape rect with the error
       border, which is the next box's question.
-- [ ] you decide: the portrait split. Does `sub4` (messages) get a slice of
+- [x] you decide: the portrait split. Does `sub4` (messages) get a slice of
       the map region? What fraction goes to the panel band? Two candidate
       files can be prepared for you to compare on the simulator.
       2026-09-08: `sub4` is monster recall today (`window.prf`), not
@@ -752,6 +748,9 @@ box). What is left before step 3 is your re-test on the device.
       before the commit. 2026-09-09: deferred. The layout decision waits
       until the panel exists; the 4.1 defaults stay in
       `lib/ios/sdl2init.txt` and the two candidate files stay untracked.
+      2026-09-09, later: answered by the step 2d strip candidates, which
+      superseded these two. Candidate 2 shipped; all four candidate files
+      are deleted.
 - [x] you test (simulator): rotate by hand while the game runs; both
       orientations re-lay out without a restart; the keyboard term is
       visible in both; the map never drops below 80 by 24. Also try the
@@ -1128,7 +1127,7 @@ panel pieces"). Replaces the placement decisions of steps 2a, 2b and 5.
       `idb ui swipe` on a piece drags it; used to exercise pickup,
       move, put-down and the stored region on the simulator. Third
       round on the iPad: passed, "great".
-- [ ] you decide: whether the keyboard term (`sub1`) should go now that
+- [x] you decide: whether the keyboard term (`sub1`) should go now that
       pieces float over the map, or wait for step 6; and what
       `region:panel` still means once pieces have their own regions.
       2026-09-09, your answer in part: `region:panel` stays, as a
@@ -1169,6 +1168,8 @@ panel pieces"). Replaces the placement decisions of steps 2a, 2b and 5.
       strip; `sub1`, the touch keyboard term, goes now (it still shows
       on the iPad, and its window flag shows in the menus). The
       remaining items are the "Next session" list below.
+      2026-09-09, later: all of that is done and committed; `sub1` now
+      shows messages and the hack's code is gone from Angband.
 - [x] commit. 2026-09-09.
 
 Next session (from the 2026-09-09 evening hand-off; in order):
@@ -1242,32 +1243,14 @@ Next session (from the 2026-09-09 evening hand-off; in order):
       menu crashes found in the same session are the box above.
 - [ ] you test (device): the menu fix -- open a Term-N submenu and tap
       away, and turn a term's last purpose off, without a crash.
-- [ ] commit; then step 3.
+- [ ] commit; then step 4 here, or the core hooks in
+      `CORE_HOOKS_PLAN.md`. Neither waits on the other.
 
 ### Step 3. Core hooks
 
-- [ ] code: `src/ui-panel.h` and `.c`: the buffer from angbandroid's
-      `droid.c`, `ui_control_hook` defaulting to NULL, and a stderr
-      consumer enabled by a `-m` subopt or environment variable. Done when
-      both variants build with the hook unset and behave exactly as before.
-- [ ] code: hook sites in `ui-input.c` (`inkey_ex` flush and clear,
-      `get_check`, `get_char`, `get_quantity`, `askfor_aux` `${text}`) and
-      `ui-menu.c` `keys_to_ui`. Done when stderr shows the expected strings
-      at an inventory prompt, a yes/no prompt and a text prompt.
-- [ ] code: remaining sites: targeting, birth, knowledge, options, player
-      sheet, monster list, command menus.
-- [ ] code: frontend consumer: fast-keys strip up to twelve, overflow fills
-      the Keys tab and switches to it, Enter and Backspace relabel for
-      `${yes_no}`, `${text}` switches to Keys, `${clear}` restores.
-- [ ] you decide: when the core offers more than twelve keys, is switching
-      to the Keys tab the right behaviour, or should the strip scroll?
-- [ ] you test (simulator): inventory letters appear at an item prompt; y
-      and n at a confirmation; the Keys tab appears at the name prompt.
-- [ ] commit (angband).
-- [ ] code: hand-merge the core side into `../NarSil_fork` (its `ui-*.c`
-      differ; section 2.5). Cherry-pick into FAangband.
-- [ ] you test: the same three prompts in NarSil.
-- [ ] commit.
+2026-09-09: moved to `CORE_HOOKS_PLAN.md`, with its checklist expanded into
+five stages there. The step number is kept so steps 4 to 8 below keep
+theirs. Nothing in those steps waits on it; see section 4.6.
 
 ### Step 4. Slots and seeding
 
@@ -1347,7 +1330,7 @@ Next session (from the 2026-09-09 evening hand-off; in order):
       Angband and NarSil; term 1 becomes messages; region files updated.
       2026-09-09: moved up to the step 2d follow-up and done there for
       Angband. NarSil and FAangband still carry the hack; they get it
-      with the step 3 port.
+      when the panel work is ported to them.
 - [ ] code: NarSil `Info.plist` orientations.
 - [ ] code: the Menu-open-at-launch bug, if still open.
 - [ ] you test (device): both orientations, a session from launch to the
@@ -1371,7 +1354,8 @@ Next session (from the 2026-09-09 evening hand-off; in order):
 ### Step 8. Port and publish
 
 - [ ] code: FAangband caught up at each milestone above (after steps 1, 6
-      and 7); NarSil at the same points, with hand-merges only for step 3.
+      and 7); NarSil at the same points. The core hooks port separately
+  (`CORE_HOOKS_PLAN.md` stage E), by hand for NarSil.
 - [ ] you test: one device session in each of the three.
 - [ ] you decide: which of the three get published `.ipa` artifacts, and
       whether to open an upstream conversation about the panel.
@@ -1382,7 +1366,8 @@ Next session (from the 2026-09-09 evening hand-off; in order):
   yield map >= 80 by 24 and no overlapping rects.
 - Seeding: output for each variant matches the table in section 2.3, and
   NarSil resolves correctly under all four keyset combinations.
-- Hooks: no change in behaviour for desktop builds with the hook unset.
+- Hooks: verification moved with the feature, to `CORE_HOOKS_PLAN.md`
+  section 7.
 - Input: `feed_keymap` text honours more-prompt skipping the same way a
   pref-file keymap does.
 - Rose: repeat cancels on release and on focus loss; slide changes direction.
@@ -1412,9 +1397,9 @@ Next session (from the 2026-09-09 evening hand-off; in order):
 - NarSil, after unification: `key[4]` and the keyset index at
   `ui-game.c:520`; `Z` rests, Tab opens abilities, extra commands listed in
   section 2.3. `angband_keyset` is set to `no` in
-  `lib/ios/customized_interface_options.txt`. The core hooks (step 3) will
-  need hand-merging because `ui-display.c`, `ui-game.c` and `ui-input.c`
-  differ substantially from Angband's.
+  `lib/ios/customized_interface_options.txt`. The core hooks will need
+  hand-merging because `ui-display.c`, `ui-game.c` and `ui-input.c` differ
+  substantially from Angband's; that is stage E of `CORE_HOOKS_PLAN.md`.
 
 ## 8. Later and open items
 
