@@ -582,9 +582,9 @@ that runs on the simulator. Step numbers match the rest of this file.
 **Status 2026-09-09:** step 0 complete. Step 1 done, tested on the
 simulator and the iPad, committed in this repository and cherry-picked to
 NarSil and FAangband; the portrait split decision is deferred until the
-panel exists. Step 2a done, tested on the simulator and the iPad, and
-committed here. Next: step 2b, which opens with the Keys tab layout
-decision.
+panel exists. Step 2a done, tested on the simulator and the iPad. Step
+2b code done, tested on the simulator and committed here; its simulator
+test (the modifier feel) is open. Next: step 2c.
 
 ### Step 0. Prerequisites
 
@@ -869,17 +869,57 @@ decision.
 
 2b. Tabs and modifiers.
 
-- [ ] you decide: the Keys tab layout. Reuse the rows from
+- [x] you decide: the Keys tab layout. Reuse the rows from
       `lib/help/keyboard_horiz.txt` as the letters and symbols layers, or a
-      fresh grid? Where do F1 to F12 go?
-- [ ] code: tab strip with five labels; only Keys populated: letters layer,
-      symbols layer, a layer toggle, arrows, F-keys.
-- [ ] code: sticky Shift and Ctrl per decision 9, with a visible state
+      fresh grid? Where do F1 to F12 go? 2026-09-09: a fresh grid, seven
+      by four, alphabetical like the keyboard files (neither file fits at
+      touch size: one is 13 columns, the other 17 rows). Three layers
+      behind one key in the grid's last cell: letters (a to z, Tab),
+      symbols (the 27 command symbols), numbers (digits, the other five
+      symbols, Del, Home, End, PgUp, PgDn). F1 to F12 are left out: no
+      core binds them; their only use would be as keymap triggers at the
+      "create a keymap" prompt (where the Android port flashes
+      `${fkeys}`), and the Mine tab covers user macros. The chrome keeps
+      the arrows (you liked the keys as they were) and grows Shift and
+      Ctrl as a fifth column; section 4.2's "arrows on Keys" is dropped.
+- [x] code: tab strip with five labels; only Keys populated: letters layer,
+      symbols layer, a layer toggle, arrows, F-keys. 2026-09-09: done.
+      One control type still: a `panel_key` has a kind (send, modifier,
+      tab, layer), a group (chrome, tabs, or a layer) and a cell; keys
+      of a layer are visible when their tab and layer are current. Rows
+      are one touch target high; cells are capped at 64 points wide, so
+      the stack is the same in both orientations at the panel's top
+      left (in landscape the grid's keys are 36 points wide, narrower
+      than the chrome's). Verified on the simulator with `idb`: `~` on
+      the symbols layer opens the knowledge menu, `?` on the numbers
+      layer opens help. Key centres in portrait, in points: chrome row
+      855 (Esc 34, ↑ 98, Enter 162, ⌫ 226, Shift 290), row 903 (← 34,
+      ↓ 98, → 162, Space 226, Ctrl 290); tabs row 951 (34 to 290 in
+      steps of 64); grid rows 999, 1047, 1095, 1143 at columns 34 to
+      418 in steps of 64; the layer key is at 418,1143.
+- [x] code: sticky Shift and Ctrl per decision 9, with a visible state
       (off, one-shot, locked). Shift affects letters and shifted symbols;
-      Ctrl produces KTRL codes.
+      Ctrl produces KTRL codes. 2026-09-09: done. Taps cycle off,
+      one-shot, locked, off. One-shot lights the key (slate face, white
+      border); locked inverts it (white face, dark text), like the
+      selected tab; the letters show upper case while Shift is active.
+      A send key spends the one-shots; tab and layer keys do not. Shift
+      on a letter sends the capital as text; Ctrl on a letter sends a
+      key event with the control modifier, which the frontend turns
+      into a KTRL code as it does for a keyboard; either on a keycode
+      key (arrows, Enter) goes as the modifier, so Shift plus an arrow
+      reaches the `{S}[Down]` run keymaps in `pref.prf` (there are no
+      Ctrl arrow keymaps, so Ctrl on an arrow is inert until the rose).
+      Symbols and digits ignore both. Verified on the simulator: Shift
+      then `c` opened the character sheet and cleared Shift; Ctrl then
+      `f` gave "Looks like a typical town."; Shift then ↓ moved the
+      character, which in open town stops after one step either way.
+      Screenshots `~/Downloads/step2b_shift_oneshot.png`,
+      `step2b_shift_locked.png`, `step2b_symbols_layer.png`,
+      `step2b_numbers_layer.png`.
 - [ ] you test (simulator): the modifier feel: tap once, double tap locks,
       tap from lock clears. Does the one-shot state read clearly?
-- [ ] commit.
+- [x] commit. 2026-09-09.
 
 2c. Repeat.
 

@@ -6072,20 +6072,69 @@ static void send_sdl_keylike_event(struct sdlpui_window *window, wchar_t command
  * over the "panel" region holding panel_key controls.  A key sends what a
  * keyboard would, a keycode with modifiers or text, when it is pressed.
  * Between taps the panel holds no focus, so the game owns the redraws.
+ *
+ * Layout, top to bottom: the chrome (two rows of five: Esc, up, Enter,
+ * Backspace, Shift; left, down, right, Space, Ctrl), the tab strip (Act,
+ * Items, Info, Mine, Keys) and the grid of the current tab, seven by four.
+ * Only the Keys tab has content yet: a letters layer, a symbols layer and
+ * a numbers layer, switched by the key in the grid's last cell.  Shift and
+ * Ctrl are sticky: one tap applies to the next key, a second tap locks, a
+ * tap when locked clears.
  */
-#define PANEL_MAX_KEYS 16
 /* minimum touch target, in points; scaled by the window's ui_scale */
 #define PANEL_MIN_TOUCH_POINTS 44
+/* keys are no wider than this, in points, however wide the panel is */
+#define PANEL_MAX_KEY_POINTS 64
 /* space between keys, in points */
 #define PANEL_GAP_POINTS 4
-/* keys per row of the chrome grid */
-#define PANEL_CHROME_COLS 4
+#define PANEL_CHROME_COLS 5
+#define PANEL_CHROME_ROWS 2
+#define PANEL_TABS 5
+#define PANEL_TAB_KEYS 4
+#define PANEL_GRID_COLS 7
+#define PANEL_GRID_ROWS 4
+#define PANEL_GRID_CELLS (PANEL_GRID_COLS * PANEL_GRID_ROWS)
+#define PANEL_LAYERS 3
+#define PANEL_MAX_KEYS (PANEL_CHROME_COLS * PANEL_CHROME_ROWS + PANEL_TABS \
+	+ PANEL_LAYERS * PANEL_GRID_CELLS)
+
+enum panel_key_kind {
+	PANEL_KEY_SEND,		/* sends a key or text */
+	PANEL_KEY_MODIFIER,	/* sticky Shift or Ctrl; value is the modifier */
+	PANEL_KEY_TAB,		/* selects a tab; value is the tab */
+	PANEL_KEY_LAYER		/* selects a Keys layer; value is the layer */
+};
+
+/* Where a key lives; a layer group is PANEL_GROUP_LAYER0 + the layer. */
+enum panel_group {
+	PANEL_GROUP_CHROME,
+	PANEL_GROUP_TABS,
+	PANEL_GROUP_LAYER0
+};
+
+enum panel_modifier {
+	PANEL_MOD_SHIFT,
+	PANEL_MOD_CTRL,
+	PANEL_MOD_COUNT
+};
+
+enum panel_mod_state {
+	PANEL_MOD_OFF,
+	PANEL_MOD_ONESHOT,
+	PANEL_MOD_LOCKED
+};
 
 struct panel_key {
 	char *caption;
 	/* relative to the control's rect */
 	SDL_Rect caption_rect;
-	/* what a press sends: sym with mod, or text if sym is SDLK_UNKNOWN */
+	enum panel_key_kind kind;
+	int group;
+	/* cell within the group's grid */
+	int cell;
+	/* modifier, tab or layer for the kinds that select one */
+	int value;
+	/* what a send key sends: sym with mod, or text if sym is SDLK_UNKNOWN */
 	SDL_Keycode sym;
 	Uint16 mod;
 	char text[8];
@@ -6099,21 +6148,107 @@ struct panel_key {
 struct panel_data {
 	struct sdlpui_control keys[PANEL_MAX_KEYS];
 	int nkeys;
+	int cur_tab;
+	int cur_layer;
+	enum panel_mod_state mod_state[PANEL_MOD_COUNT];
 };
 
-static void fire_panel_key(struct sdlpui_control *c, struct sdlpui_window *w)
+/* Is the key shown for the panel's current tab and layer? */
+static bool panel_key_visible(const struct panel_data *pd,
+		const struct panel_key *pk)
+{
+	if (pk->group == PANEL_GROUP_CHROME || pk->group == PANEL_GROUP_TABS) {
+		return true;
+	}
+	return pd->cur_tab == PANEL_TAB_KEYS
+		&& pk->group == PANEL_GROUP_LAYER0 + pd->cur_layer;
+}
+
+/* A single ASCII letter, which Shift and Ctrl act on */
+static bool panel_key_is_letter(const struct panel_key *pk)
+{
+	return pk->sym == SDLK_UNKNOWN && pk->text[0] && !pk->text[1]
+		&& isalpha((unsigned char) pk->text[0]);
+}
+
+static void fire_panel_key(struct sdlpui_control *c, struct sdlpui_dialog *d,
+		struct sdlpui_window *w)
 {
 	struct panel_key *pk;
+	struct panel_data *pd;
+	bool shift, ctrl;
+	int i;
 
 	SDL_assert(c->type_code == PANEL_KEY_CODE && c->priv);
+	SDL_assert(d->type_code == PANEL_CODE && d->priv);
 	pk = c->priv;
+	pd = d->priv;
 	if (pk->disabled) {
 		return;
 	}
+
+	switch (pk->kind) {
+		case PANEL_KEY_MODIFIER:
+			/* off, one tap, locked, off again */
+			pd->mod_state[pk->value] =
+				(pd->mod_state[pk->value] + 1) % 3;
+			d->dirty = true;
+			sdlpui_signal_redraw(w);
+			return;
+
+		case PANEL_KEY_TAB:
+			pd->cur_tab = pk->value;
+			d->dirty = true;
+			sdlpui_signal_redraw(w);
+			return;
+
+		case PANEL_KEY_LAYER:
+			pd->cur_layer = pk->value;
+			d->dirty = true;
+			sdlpui_signal_redraw(w);
+			return;
+
+		case PANEL_KEY_SEND:
+			break;
+	}
+
+	shift = pd->mod_state[PANEL_MOD_SHIFT] != PANEL_MOD_OFF;
+	ctrl = pd->mod_state[PANEL_MOD_CTRL] != PANEL_MOD_OFF;
 	if (pk->sym != SDLK_UNKNOWN) {
-		push_key_event(w, pk->sym, pk->mod);
+		Uint16 mod = pk->mod;
+
+		if (shift) {
+			mod |= KMOD_LSHIFT;
+		}
+		if (ctrl) {
+			mod |= KMOD_LCTRL;
+		}
+		push_key_event(w, pk->sym, mod);
+	} else if (panel_key_is_letter(pk) && ctrl) {
+		/*
+		 * Control characters come from key events, as they do from
+		 * a keyboard; the frontend turns them into KTRL codes.
+		 */
+		SDL_Keycode sym = SDLK_a
+			+ (tolower((unsigned char) pk->text[0]) - 'a');
+
+		push_key_event(w, sym, KMOD_LCTRL | (shift ? KMOD_LSHIFT : 0));
+	} else if (panel_key_is_letter(pk) && shift) {
+		char text[2] = { (char) toupper((unsigned char) pk->text[0]),
+			'\0' };
+
+		push_text_event(w, text);
 	} else if (pk->text[0]) {
 		push_text_event(w, pk->text);
+	}
+
+	/* A one-shot modifier is spent by the key it applied to. */
+	for (i = 0; i < PANEL_MOD_COUNT; i++) {
+		if (pd->mod_state[i] == PANEL_MOD_ONESHOT) {
+			pd->mod_state[i] = PANEL_MOD_OFF;
+			d->dirty = true;
+			sdlpui_signal_redraw(w);
+		}
 	}
 }
 
@@ -6125,7 +6260,7 @@ static bool handle_panel_key_mouseclick(struct sdlpui_control *c,
 		if (e->state == SDL_PRESSED) {
 			/* Fire on the press so a held key can repeat later. */
 			(*c->ftb->arm)(c, d, w, SDLPUI_ACTION_HINT_MOUSE);
-			fire_panel_key(c, w);
+			fire_panel_key(c, d, w);
 		} else {
 			(*c->ftb->disarm)(c, d, w, SDLPUI_ACTION_HINT_MOUSE);
 		}
@@ -6134,15 +6269,14 @@ static bool handle_panel_key_mouseclick(struct sdlpui_control *c,
 	return true;
 }
 
-static void place_panel_key_caption(struct sdlpui_control *c,
-		struct sdlpui_window *w)
+/* Centre a caption in the control's rect. */
+static void place_caption(struct sdlpui_control *c, struct sdlpui_window *w,
+		const char *caption, SDL_Rect *out)
 {
-	struct panel_key *pk = c->priv;
 	int tw = 0, th = 0;
 
-	if (pk->caption && pk->caption[0]) {
-		sdlpui_get_utf8_metrics(sdlpui_get_ttf(w), pk->caption,
-			&tw, &th);
+	if (caption && caption[0]) {
+		sdlpui_get_utf8_metrics(sdlpui_get_ttf(w), caption, &tw, &th);
 	}
 	if (tw > c->rect.w) {
 		tw = c->rect.w;
@@ -6150,10 +6284,10 @@ static void place_panel_key_caption(struct sdlpui_control *c,
 	if (th > c->rect.h) {
 		th = c->rect.h;
 	}
-	pk->caption_rect.x = (c->rect.w - tw) / 2;
-	pk->caption_rect.y = (c->rect.h - th) / 2;
-	pk->caption_rect.w = tw;
-	pk->caption_rect.h = th;
+	out->x = (c->rect.w - tw) / 2;
+	out->y = (c->rect.h - th) / 2;
+	out->w = tw;
+	out->h = th;
 }
 
 static void change_panel_key_caption(struct sdlpui_control *c,
@@ -6166,7 +6300,7 @@ static void change_panel_key_caption(struct sdlpui_control *c,
 	pk = c->priv;
 	string_free(pk->caption);
 	pk->caption = string_make(new_caption);
-	place_panel_key_caption(c, w);
+	place_caption(c, w, pk->caption, &pk->caption_rect);
 	d->dirty = true;
 	sdlpui_signal_redraw(w);
 }
@@ -6175,16 +6309,38 @@ static void render_panel_key(struct sdlpui_control *c,
 		struct sdlpui_dialog *d, struct sdlpui_window *w,
 		SDL_Renderer *r)
 {
-	const SDL_Color *fg = sdlpui_get_color(w, SDLPUI_COLOR_DIALOG_FG);
-	const SDL_Color *bg, *border;
+	const SDL_Color *fg = &w->app->colors[COLOUR_WHITE];
+	const SDL_Color *bg = &w->app->colors[COLOUR_L_DARK];
+	const SDL_Color *border = &w->app->colors[COLOUR_SLATE];
 	struct panel_key *pk;
-	SDL_Rect dst_r;
+	struct panel_data *pd;
+	const char *caption;
+	char shifted[2];
+	SDL_Rect dst_r, cap_r;
 
 	SDL_assert(c->type_code == PANEL_KEY_CODE && c->priv);
+	SDL_assert(d->type_code == PANEL_CODE && d->priv);
 	pk = c->priv;
-	bg = &w->app->colors[pk->armed ? COLOUR_SLATE : COLOUR_L_DARK];
-	border = &w->app->colors[(pk->armed || pk->has_mouse) ?
-		COLOUR_WHITE : COLOUR_SLATE];
+	pd = d->priv;
+
+	/* Selected tabs and locked modifiers are inverted; one-shot is lit. */
+	if ((pk->kind == PANEL_KEY_TAB && pk->value == pd->cur_tab)
+			|| (pk->kind == PANEL_KEY_MODIFIER
+			&& pd->mod_state[pk->value] == PANEL_MOD_LOCKED)) {
+		fg = &w->app->colors[COLOUR_DARK];
+		bg = &w->app->colors[COLOUR_WHITE];
+		border = bg;
+	} else if (pk->kind == PANEL_KEY_MODIFIER
+			&& pd->mod_state[pk->value] == PANEL_MOD_ONESHOT) {
+		bg = &w->app->colors[COLOUR_SLATE];
+		border = &w->app->colors[COLOUR_WHITE];
+	}
+	if (pk->armed) {
+		bg = &w->app->colors[COLOUR_SLATE];
+	}
+	if (pk->armed || pk->has_mouse) {
+		border = &w->app->colors[COLOUR_WHITE];
+	}
 
 	dst_r = c->rect;
 	if (!d->texture) {
@@ -6197,13 +6353,21 @@ static void render_panel_key(struct sdlpui_control *c,
 	SDL_SetRenderDrawColor(r, border->r, border->g, border->b, border->a);
 	SDL_RenderDrawRect(r, &dst_r);
 
-	if (pk->caption_rect.w > 0 && pk->caption_rect.h > 0) {
-		SDL_Rect cap_r = pk->caption_rect;
-
+	/* Letters show their case while Shift is active. */
+	caption = pk->caption;
+	cap_r = pk->caption_rect;
+	if (panel_key_is_letter(pk)
+			&& pd->mod_state[PANEL_MOD_SHIFT] != PANEL_MOD_OFF) {
+		shifted[0] = (char) toupper((unsigned char) pk->text[0]);
+		shifted[1] = '\0';
+		caption = shifted;
+		place_caption(c, w, caption, &cap_r);
+	}
+	if (cap_r.w > 0 && cap_r.h > 0) {
 		cap_r.x += dst_r.x;
 		cap_r.y += dst_r.y;
 		sdlpui_render_utf8_line(r, sdlpui_get_ttf(w), fg, &cap_r,
-			pk->caption);
+			caption);
 	}
 
 	if (pk->disabled) {
@@ -6215,7 +6379,7 @@ static void respond_default_panel_key(struct sdlpui_control *c,
 		struct sdlpui_dialog *d, struct sdlpui_window *w,
 		enum sdlpui_action_hint hint)
 {
-	fire_panel_key(c, w);
+	fire_panel_key(c, d, w);
 }
 
 static void gain_mouse_panel_key(struct sdlpui_control *c,
@@ -6290,10 +6454,13 @@ static void resize_panel_key(struct sdlpui_control *c,
 		struct sdlpui_dialog *d, struct sdlpui_window *w, int width,
 		int height)
 {
+	struct panel_key *pk;
+
 	SDL_assert(c->type_code == PANEL_KEY_CODE && c->priv);
+	pk = c->priv;
 	c->rect.w = width;
 	c->rect.h = height;
-	place_panel_key_caption(c, w);
+	place_caption(c, w, pk->caption, &pk->caption_rect);
 }
 
 static void query_panel_key_natural_size(struct sdlpui_control *c,
@@ -6352,11 +6519,14 @@ static void cleanup_panel_key(struct sdlpui_control *c)
 }
 
 /*
- * Initialize c as a panel key.  sym and mod are sent as a key press; if
- * sym is SDLK_UNKNOWN, text is sent as typed text instead.
+ * Initialize the panel's next control as a key in the given group and
+ * cell.  A send key sends sym with mod, or text if sym is SDLK_UNKNOWN;
+ * the other kinds use value.
  */
-static void create_panel_key(struct sdlpui_control *c, const char *caption,
-		SDL_Keycode sym, Uint16 mod, const char *text, bool repeat)
+static struct sdlpui_control *add_panel_key(struct panel_data *pd,
+		enum panel_key_kind kind, int group, int cell,
+		const char *caption, SDL_Keycode sym, const char *text,
+		int value, bool repeat)
 {
 	static const struct sdlpui_control_funcs panel_key_funcs = {
 		.handle_mouseclick = handle_panel_key_mouseclick,
@@ -6376,11 +6546,19 @@ static void create_panel_key(struct sdlpui_control *c, const char *caption,
 		.set_disabled = set_panel_key_disabled,
 		.cleanup = cleanup_panel_key
 	};
-	struct panel_key *pk = SDL_calloc(1, sizeof(*pk));
+	struct sdlpui_control *c;
+	struct panel_key *pk;
 
+	SDL_assert(pd->nkeys < PANEL_MAX_KEYS);
+	c = &pd->keys[pd->nkeys++];
+	pk = SDL_calloc(1, sizeof(*pk));
 	pk->caption = string_make(caption ? caption : "");
+	pk->kind = kind;
+	pk->group = group;
+	pk->cell = cell;
+	pk->value = value;
 	pk->sym = sym;
-	pk->mod = mod;
+	pk->mod = 0;
 	if (text) {
 		(void) my_strcpy(pk->text, text, sizeof(pk->text));
 	}
@@ -6393,6 +6571,92 @@ static void create_panel_key(struct sdlpui_control *c, const char *caption,
 	c->rect.y = 0;
 	c->rect.w = 0;
 	c->rect.h = 0;
+	return c;
+}
+
+/* A key that sends a keycode */
+static void add_panel_sym(struct panel_data *pd, int group, int cell,
+		const char *caption, SDL_Keycode sym, bool repeat)
+{
+	add_panel_key(pd, PANEL_KEY_SEND, group, cell, caption, sym, NULL, 0,
+		repeat);
+}
+
+/* A key that sends text; its caption is the text unless given */
+static void add_panel_text(struct panel_data *pd, int group, int cell,
+		const char *text, const char *caption)
+{
+	add_panel_key(pd, PANEL_KEY_SEND, group, cell, caption ? caption : text,
+		SDLK_UNKNOWN, text, 0, false);
+}
+
+/* Fill a layer's cells from a string of single-character text keys. */
+static int add_panel_chars(struct panel_data *pd, int layer, int cell,
+		const char *chars)
+{
+	const char *p;
+
+	for (p = chars; *p; p++) {
+		char text[2] = { *p, '\0' };
+
+		add_panel_text(pd, PANEL_GROUP_LAYER0 + layer, cell++, text,
+			NULL);
+	}
+	return cell;
+}
+
+static void create_panel_keys(struct panel_data *pd)
+{
+	static const char *tab_names[PANEL_TABS] = {
+		"Act", "Items", "Info", "Mine", "Keys"
+	};
+	int i, cell;
+
+	/* Chrome, two rows of five */
+	add_panel_sym(pd, PANEL_GROUP_CHROME, 0, "Esc", SDLK_ESCAPE, false);
+	add_panel_sym(pd, PANEL_GROUP_CHROME, 1, "↑", SDLK_UP, true);
+	add_panel_sym(pd, PANEL_GROUP_CHROME, 2, "Enter", SDLK_RETURN, false);
+	add_panel_sym(pd, PANEL_GROUP_CHROME, 3, "⌫", SDLK_BACKSPACE, true);
+	add_panel_key(pd, PANEL_KEY_MODIFIER, PANEL_GROUP_CHROME, 4, "Shift",
+		SDLK_UNKNOWN, NULL, PANEL_MOD_SHIFT, false);
+	add_panel_sym(pd, PANEL_GROUP_CHROME, 5, "←", SDLK_LEFT, true);
+	add_panel_sym(pd, PANEL_GROUP_CHROME, 6, "↓", SDLK_DOWN, true);
+	add_panel_sym(pd, PANEL_GROUP_CHROME, 7, "→", SDLK_RIGHT, true);
+	add_panel_text(pd, PANEL_GROUP_CHROME, 8, " ", "Space");
+	add_panel_key(pd, PANEL_KEY_MODIFIER, PANEL_GROUP_CHROME, 9, "Ctrl",
+		SDLK_UNKNOWN, NULL, PANEL_MOD_CTRL, false);
+
+	/* Tab strip */
+	for (i = 0; i < PANEL_TABS; i++) {
+		add_panel_key(pd, PANEL_KEY_TAB, PANEL_GROUP_TABS, i,
+			tab_names[i], SDLK_UNKNOWN, NULL, i, false);
+	}
+
+	/* Keys tab, letters layer: a to z, Tab, then the layer key */
+	cell = add_panel_chars(pd, 0, 0, "abcdefghijklmnopqrstuvwxyz");
+	add_panel_sym(pd, PANEL_GROUP_LAYER0, cell++, "⇥", SDLK_TAB, false);
+	add_panel_key(pd, PANEL_KEY_LAYER, PANEL_GROUP_LAYER0,
+		PANEL_GRID_CELLS - 1, "#+=", SDLK_UNKNOWN, NULL, 1, false);
+
+	/* Symbols layer: the command symbols, then the layer key */
+	cell = add_panel_chars(pd, 1, 0, "!@#$%^&*()-=[];',./\\`~_+{}:");
+	add_panel_key(pd, PANEL_KEY_LAYER, PANEL_GROUP_LAYER0 + 1,
+		PANEL_GRID_CELLS - 1, "123", SDLK_UNKNOWN, NULL, 2, false);
+
+	/* Numbers layer: digits, the remaining symbols, editing keys */
+	cell = add_panel_chars(pd, 2, 0, "1234567890\"<>?|");
+	add_panel_sym(pd, PANEL_GROUP_LAYER0 + 2, cell++, "Del", SDLK_DELETE,
+		true);
+	add_panel_sym(pd, PANEL_GROUP_LAYER0 + 2, cell++, "Home", SDLK_HOME,
+		false);
+	add_panel_sym(pd, PANEL_GROUP_LAYER0 + 2, cell++, "End", SDLK_END,
+		false);
+	add_panel_sym(pd, PANEL_GROUP_LAYER0 + 2, cell++, "PgUp", SDLK_PAGEUP,
+		true);
+	add_panel_sym(pd, PANEL_GROUP_LAYER0 + 2, cell++, "PgDn",
+		SDLK_PAGEDOWN, true);
+	add_panel_key(pd, PANEL_KEY_LAYER, PANEL_GROUP_LAYER0 + 2,
+		PANEL_GRID_CELLS - 1, "abc", SDLK_UNKNOWN, NULL, 0, false);
 }
 
 static struct sdlpui_control *find_panel_control_containing(
@@ -6408,7 +6672,8 @@ static struct sdlpui_control *find_panel_control_containing(
 	for (i = 0; i < pd->nkeys; i++) {
 		struct sdlpui_control *c = &pd->keys[i];
 
-		if (c->ftb->get_interactable_component
+		if (panel_key_visible(pd, c->priv)
+				&& c->ftb->get_interactable_component
 				&& (*c->ftb->get_interactable_component)(c, true)
 				&& sdlpui_is_in_control(c, d, x, y)) {
 			return c;
@@ -6492,7 +6757,8 @@ static void render_panel(struct sdlpui_dialog *d, struct sdlpui_window *w)
 	SDL_RenderFillRect(r, &d->rect);
 	SDL_SetRenderDrawBlendMode(r, old_mode);
 	for (i = 0; i < pd->nkeys; i++) {
-		if (pd->keys[i].ftb->render) {
+		if (panel_key_visible(pd, pd->keys[i].priv)
+				&& pd->keys[i].ftb->render) {
 			(*pd->keys[i].ftb->render)(&pd->keys[i], d, w, r);
 		}
 	}
@@ -6500,27 +6766,47 @@ static void render_panel(struct sdlpui_dialog *d, struct sdlpui_window *w)
 }
 
 /*
- * Lay the chrome keys out as a grid at the panel's top left corner.  Keys
- * are at least the minimum touch target and, in a wide band, no more than
- * twice it.
+ * Lay the keys out at the panel's top left: the chrome, the tab strip and
+ * the grid, in rows of one touch target.  Cells are no wider than
+ * PANEL_MAX_KEY_POINTS however wide the panel is.
  */
 static void layout_panel_keys(struct sdlpui_dialog *d, struct sdlpui_window *w)
 {
 	struct panel_data *pd = d->priv;
 	int min_touch = (int)(PANEL_MIN_TOUCH_POINTS * w->ui_scale + 0.5f);
+	int max_cell = (int)(PANEL_MAX_KEY_POINTS * w->ui_scale + 0.5f);
 	int gap = (int)(PANEL_GAP_POINTS * w->ui_scale + 0.5f);
-	int cell_w = (d->rect.w - gap) / PANEL_CHROME_COLS;
+	int chrome_w = MIN((d->rect.w - gap) / PANEL_CHROME_COLS, max_cell);
+	int tab_w = MIN((d->rect.w - gap) / PANEL_TABS, max_cell);
+	int grid_w = MIN((d->rect.w - gap) / PANEL_GRID_COLS, max_cell);
+	int rows = PANEL_CHROME_ROWS + 1 + PANEL_GRID_ROWS;
 	int cell_h = min_touch + gap;
 	int i;
 
-	if (cell_w > 2 * min_touch) {
-		cell_w = 2 * min_touch;
+	/* A short panel gets shorter rows rather than losing the grid. */
+	if (rows * cell_h + gap > d->rect.h && d->rect.h > 0) {
+		cell_h = MAX((d->rect.h - gap) / rows, 2 * gap);
 	}
 	for (i = 0; i < pd->nkeys; i++) {
 		struct sdlpui_control *c = &pd->keys[i];
+		struct panel_key *pk = c->priv;
+		int col, row, cell_w;
 
-		c->rect.x = gap + (i % PANEL_CHROME_COLS) * cell_w;
-		c->rect.y = gap + (i / PANEL_CHROME_COLS) * cell_h;
+		if (pk->group == PANEL_GROUP_CHROME) {
+			col = pk->cell % PANEL_CHROME_COLS;
+			row = pk->cell / PANEL_CHROME_COLS;
+			cell_w = chrome_w;
+		} else if (pk->group == PANEL_GROUP_TABS) {
+			col = pk->cell;
+			row = PANEL_CHROME_ROWS;
+			cell_w = tab_w;
+		} else {
+			col = pk->cell % PANEL_GRID_COLS;
+			row = PANEL_CHROME_ROWS + 1 + pk->cell / PANEL_GRID_COLS;
+			cell_w = grid_w;
+		}
+		c->rect.x = gap + col * cell_w;
+		c->rect.y = gap + row * cell_h;
 		(*c->ftb->resize)(c, d, w, cell_w - gap, cell_h - gap);
 	}
 }
@@ -6568,7 +6854,7 @@ static void hide_panel(struct sdlpui_dialog *d, struct sdlpui_window *w,
 
 /*
  * Create the touch panel over the window's panel rect, if the window has
- * one and the panel is enabled.  Step 2a: the chrome keys only.
+ * one and the panel is enabled.
  */
 static void load_panel(struct sdlpui_window *window)
 {
@@ -6589,7 +6875,6 @@ static void load_panel(struct sdlpui_window *window)
 	};
 	struct sdlpui_dialog *d;
 	struct panel_data *pd;
-	int n = 0;
 
 	if (window->panel || window->index != MAIN_WINDOW
 			|| !window->has_panel || !window->config
@@ -6599,15 +6884,9 @@ static void load_panel(struct sdlpui_window *window)
 
 	d = SDL_calloc(1, sizeof(*d));
 	pd = SDL_calloc(1, sizeof(*pd));
-	create_panel_key(&pd->keys[n++], "Esc", SDLK_ESCAPE, 0, NULL, false);
-	create_panel_key(&pd->keys[n++], "↑", SDLK_UP, 0, NULL, true);
-	create_panel_key(&pd->keys[n++], "Enter", SDLK_RETURN, 0, NULL, false);
-	create_panel_key(&pd->keys[n++], "⌫", SDLK_BACKSPACE, 0, NULL, true);
-	create_panel_key(&pd->keys[n++], "←", SDLK_LEFT, 0, NULL, true);
-	create_panel_key(&pd->keys[n++], "↓", SDLK_DOWN, 0, NULL, true);
-	create_panel_key(&pd->keys[n++], "→", SDLK_RIGHT, 0, NULL, true);
-	create_panel_key(&pd->keys[n++], "Space", SDLK_UNKNOWN, 0, " ", false);
-	pd->nkeys = n;
+	pd->cur_tab = PANEL_TAB_KEYS;
+	pd->cur_layer = 0;
+	create_panel_keys(pd);
 
 	d->ftb = &panel_funcs;
 	d->pop_callback = hide_panel;
