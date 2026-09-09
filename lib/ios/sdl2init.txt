@@ -1,3 +1,9 @@
+# SDL2 frontend defaults for iOS (lib/ios/sdl2init.txt). On first launch the
+# game reads this file; on exit it writes its own copy to
+# Documents/Angband/sdl2init.txt, which is used from then on.
+#
+# The window fills the screen. Its size comes from the renderer at start-up
+# and on every rotation, so the window rect below is only a fallback.
 window-display:0:0
 window-full-rect:0:0:0:2420:1668
 window-fullscreen:0:true
@@ -9,12 +15,34 @@ window-graphics-id:0:0
 window-tile-scale:0:width:1
 window-tile-scale:0:height:1
 
-subwindow-window:3:0:1
-subwindow-full-rect:3:923:1090:923:289
-subwindow-font:3:30:JuliaMono-Regular.ttf
-subwindow-borders:3:false
-subwindow-top:3:false:false
-subwindow-alpha:3:255
+# Layout regions: region:<name>:<orient>:<x>:<y>:<w>:<h>, in per-mille of the
+# window below the status bar. A subwindow with a region for the current
+# orientation ignores its subwindow-full-rect. map is term 0; sub2 shows the
+# monster list, sub3 the item list, sub4 monster recall (see window.prf).
+# sub1 is the touch keyboard term; until the touch panel replaces it, it
+# takes the panel's region.
+region:map:landscape:0:0:760:645
+region:sub2:landscape:0:645:380:178
+region:sub3:landscape:380:645:380:178
+region:sub4:landscape:0:823:760:177
+region:sub1:landscape:760:0:240:1000
+region:panel:landscape:760:0:240:1000
+
+region:map:portrait:0:0:1000:520
+region:sub2:portrait:0:520:500:160
+region:sub3:portrait:500:520:500:160
+region:sub1:portrait:0:680:1000:320
+region:panel:portrait:0:680:1000:320
+
+# The map font is chosen between font-min and font-max: the largest size at
+# which 80 by 24 fits the map region. The other terms keep their font size.
+# Terms are drawn in file order, so the map (term 0) comes last.
+subwindow-window:1:0:1
+subwindow-full-rect:1:1846:42:574:1337
+subwindow-font:1:59:JuliaMono-Regular.ttf
+subwindow-borders:1:false
+subwindow-top:1:false:false
+subwindow-alpha:1:255
 
 subwindow-window:2:0:1
 subwindow-full-rect:2:0:1090:923:289
@@ -23,6 +51,13 @@ subwindow-borders:2:false
 subwindow-top:2:false:false
 subwindow-alpha:2:255
 
+subwindow-window:3:0:1
+subwindow-full-rect:3:923:1090:923:289
+subwindow-font:3:30:JuliaMono-Regular.ttf
+subwindow-borders:3:false
+subwindow-top:3:false:false
+subwindow-alpha:3:255
+
 subwindow-window:4:0:1
 subwindow-full-rect:4:0:1379:2420:289
 subwindow-font:4:30:JuliaMono-Regular.ttf
@@ -30,18 +65,12 @@ subwindow-borders:4:false
 subwindow-top:4:false:false
 subwindow-alpha:4:255
 
-subwindow-window:1:0:1
-subwindow-full-rect:1:1846:42:574:1337
-subwindow-font:1:59:JuliaMono-Regular.ttf
-subwindow-borders:1:false
-subwindow-top:1:false:false
-subwindow-alpha:1:255
-
 subwindow-window:0:0:1
 subwindow-full-rect:0:0:42:1846:1048
 subwindow-font:0:36:JuliaMono-Regular.ttf
+subwindow-font-max:0:48
+subwindow-font-min:0:16
 subwindow-borders:0:false
 subwindow-top:0:true:false
 subwindow-alpha:0:255
-
 kp-as-modifier:0

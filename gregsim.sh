@@ -2,7 +2,7 @@
 # iPad simulator loop for the SDL2 frontend.
 #   ./gregsim.sh            configure (first time), build, install, launch
 #   ./gregsim.sh shot out.png   screenshot the booted simulator
-#   ./gregsim.sh rotate     rotate the simulator (portrait/landscape toggle)
+#   ./gregsim.sh rotate [left|right]   rotate the simulator
 # Works from any of the three repos; the app name comes from CMakeLists.txt.
 set -e
 APP=$(sed -n 's/^PROJECT(\([A-Za-z]*\).*/\1/p' CMakeLists.txt)
@@ -16,10 +16,13 @@ case "$1" in
   shot)
     xcrun simctl io "$SIM" screenshot "${2:-shot.png}"; exit ;;
   rotate)
-    # Needs Accessibility permission for this terminal; otherwise rotate by hand (Cmd-Left in Simulator).
+    # ./gregsim.sh rotate [left|right]; default left. From portrait, left gives landscape;
+    # from that landscape, right gives portrait again (upside-down portrait is not allowed).
+    # Needs Accessibility permission for this terminal; otherwise rotate by hand (Cmd-Left/Right in Simulator).
+    DIR=Left; [ "$2" = right ] && DIR=Right
     osascript -e 'tell application "Simulator" to activate' \
-      -e 'tell application "System Events" to tell process "Simulator" to click menu item "Rotate Left" of menu "Device" of menu bar 1' \
-      || echo "Rotation needs Accessibility permission for this terminal; use Cmd-Left in Simulator."; exit ;;
+      -e "tell application \"System Events\" to tell process \"Simulator\" to click menu item \"Rotate $DIR\" of menu \"Device\" of menu bar 1" \
+      || echo "Rotation needs Accessibility permission for this terminal; use Cmd-Left/Right in Simulator."; exit ;;
 esac
 
 xcrun simctl bootstatus "$SIM" -b >/dev/null

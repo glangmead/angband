@@ -224,6 +224,40 @@ struct subwindow_border {
 struct subwindow_config {
 	char *font_name;
 	int font_size;
+	/*
+	 * If font_size_max is positive, the font size is chosen at layout
+	 * time: the largest size in [font_size_min, font_size_max] at which
+	 * the subwindow's minimum columns and rows fit its rect.
+	 */
+	int font_size_max;
+	int font_size_min;
+};
+
+/*
+ * Layout regions: fractional rectangles, in per-mille of the window's inner
+ * rect (the part below the status bar), for a subwindow or the touch panel
+ * in one orientation.  They come from "region:" lines in the configuration
+ * file and are resolved to pixel rects when the window starts and whenever
+ * it is resized.
+ */
+enum region_orient {
+	REGION_ORIENT_ANY = 0,
+	REGION_ORIENT_PORTRAIT,
+	REGION_ORIENT_LANDSCAPE
+};
+
+/* Region target that is the touch panel rather than a subwindow */
+#define REGION_TARGET_PANEL MAX_SUBWINDOWS
+/* Enough for every target in both orientations plus "any" */
+#define MAX_REGIONS (3 * (MAX_SUBWINDOWS + 1))
+#define REGION_PER_MILLE 1000
+
+struct layout_region {
+	/* MAIN_SUBWINDOW to MAX_SUBWINDOWS - 1, or REGION_TARGET_PANEL */
+	int target;
+	enum region_orient orient;
+	/* per-mille of the window's inner rect */
+	int x, y, w, h;
 };
 
 struct window_config {
@@ -234,6 +268,9 @@ struct window_config {
 	char *wallpaper_path;
 	char *font_name;
 	int font_size;
+
+	struct layout_region regions[MAX_REGIONS];
+	int num_regions;
 };
 
 /* struct subwindow is representation of angband's term */
@@ -399,6 +436,15 @@ struct sdlpui_window {
 
 	struct subwindow *subwindows[MAX_SUBWINDOWS];
 
+	/*
+	 * The touch panel's rect, from the "panel" region for the current
+	 * orientation; has_panel is false when there is no such region.
+	 */
+	SDL_Rect panel_rect;
+	bool has_panel;
+	/* renderer output pixels per window unit; 2 on HiDPI displays */
+	float ui_scale;
+
 	/* Point back to the containing application */
 	struct my_app *app;
 
@@ -502,6 +548,13 @@ static struct sdlpui_window *get_window_by_id(struct my_app *a, Uint32 id);
 static struct sdlpui_window *get_window_direct(struct my_app *a,
 		unsigned index);
 static void resize_window(struct sdlpui_window *window, int w, int h);
+static const struct layout_region *find_region(
+		const struct sdlpui_window *window, int target);
+static void region_to_rect(const struct sdlpui_window *window,
+		const struct layout_region *r, SDL_Rect *rect);
+static void resolve_panel_rect(struct sdlpui_window *window);
+static void ensure_minimum_rect(const struct subwindow *subwindow,
+		SDL_Rect *rect);
 static void resize_subwindow(struct subwindow *subwindow);
 static struct subwindow *get_new_subwindow(struct my_app *a, unsigned index);
 static void load_subwindow(struct sdlpui_window *window,
@@ -3664,14 +3717,22 @@ static void handle_last_resize_event(struct my_app *a, int num_events,
 
 			struct sdlpui_window *window =
 				get_window_by_id(a, event.windowID);
+			int rw, rh;
+
 			assert(window != NULL);
-			if (window->config->window_flags | SDL_WINDOW_ALLOW_HIGHDPI) {
-				resize_window(window, event.data1*2, event.data2*2);
-			} else {
-				resize_window(window, event.data1, event.data2);
+			/*
+			 * The event carries window units; render in the
+			 * renderer's output pixels (more on a HiDPI display)
+			 * and refresh the logical size, or SDL scales the old
+			 * one into the new window.
+			 */
+			if (SDL_GetRendererOutputSize(window->renderer,
+					&rw, &rh) != 0) {
+				rw = event.data1;
+				rh = event.data2;
 			}
-
-
+			SDL_RenderSetLogicalSize(window->renderer, rw, rh);
+			resize_window(window, rw, rh);
 			return;
 		}
 	}
@@ -4640,6 +4701,16 @@ static bool get_event(struct my_app *a)
 
 static void refresh_angband_terms(struct my_app *a)
 {
+	/*
+	 * A term the frontend resized keeps its old contents until the core
+	 * draws it again.  The redraw flags below cover the map and the usual
+	 * subwindows once a level exists; EVENT_REFRESH lets the others (the
+	 * touch keyboard term) notice at any time after the game's init.
+	 */
+	if (player) {
+		event_signal(EVENT_REFRESH);
+	}
+
 	if (!character_dungeon) {
 		return;
 	}
@@ -6054,6 +6125,224 @@ static void fit_subwindow_in_window(const struct sdlpui_window *window,
 	}
 }
 
+/*
+ * Return the region for target (a subwindow index or REGION_TARGET_PANEL)
+ * in the window's current orientation, or NULL if there is none.  A region
+ * for the specific orientation wins over one for "any".
+ */
+static const struct layout_region *find_region(
+		const struct sdlpui_window *window, int target)
+{
+	const struct layout_region *found = NULL;
+	enum region_orient want =
+		(window->inner_rect.w > window->inner_rect.h) ?
+		REGION_ORIENT_LANDSCAPE : REGION_ORIENT_PORTRAIT;
+	int i;
+
+	if (!window->config) {
+		return NULL;
+	}
+	for (i = 0; i < window->config->num_regions; i++) {
+		const struct layout_region *r = &window->config->regions[i];
+
+		if (r->target != target) {
+			continue;
+		}
+		if (r->orient == want) {
+			return r;
+		}
+		if (r->orient == REGION_ORIENT_ANY) {
+			found = r;
+		}
+	}
+	return found;
+}
+
+/*
+ * Convert a region to a pixel rect in the window.  Both edges come from
+ * the region's end points so that adjacent regions tile exactly.
+ */
+static void region_to_rect(const struct sdlpui_window *window,
+		const struct layout_region *r, SDL_Rect *rect)
+{
+	const SDL_Rect *in = &window->inner_rect;
+	int x0 = in->w * r->x / REGION_PER_MILLE;
+	int y0 = in->h * r->y / REGION_PER_MILLE;
+	int x1 = in->w * (r->x + r->w) / REGION_PER_MILLE;
+	int y1 = in->h * (r->y + r->h) / REGION_PER_MILLE;
+
+	rect->x = in->x + x0;
+	rect->y = in->y + y0;
+	rect->w = x1 - x0;
+	rect->h = y1 - y0;
+}
+
+/*
+ * Set the window's panel rect from the "panel" region for the current
+ * orientation, if there is one.
+ */
+static void resolve_panel_rect(struct sdlpui_window *window)
+{
+	const struct layout_region *r =
+		find_region(window, REGION_TARGET_PANEL);
+
+	if (r) {
+		region_to_rect(window, r, &window->panel_rect);
+		window->has_panel = true;
+	} else {
+		memset(&window->panel_rect, 0, sizeof(window->panel_rect));
+		window->has_panel = false;
+	}
+}
+
+/*
+ * If rect cannot hold the subwindow's minimum columns and rows with its
+ * current font, grow it to the minimum and clamp it into the window, as
+ * fit_subwindow_in_window() would.  A region that is too small then shows
+ * the error border instead of aborting the game.
+ */
+static void ensure_minimum_rect(const struct subwindow *subwindow,
+		SDL_Rect *rect)
+{
+	int min_w, min_h;
+
+	get_minimum_subwindow_size(subwindow->index == MAIN_SUBWINDOW,
+		subwindow->font->ttf.glyph.w, subwindow->font->ttf.glyph.h,
+		&min_w, &min_h);
+	if (rect->w < min_w || rect->h < min_h) {
+		rect->w = MAX(rect->w, min_w);
+		rect->h = MAX(rect->h, min_h);
+		coerce_rect_in_rect(rect, &subwindow->window->inner_rect,
+			min_w, min_h);
+	}
+}
+
+/*
+ * Measure a vector font's glyph cell at a size without building a cache.
+ * Uses the same metrics as load_font().
+ */
+static bool measure_font(const char *path, int size, int *w, int *h)
+{
+	TTF_Font *handle = TTF_OpenFont(path, size);
+
+	if (handle == NULL) {
+		return false;
+	}
+	*h = TTF_FontHeight(handle);
+	if (TTF_GlyphMetrics(handle, GLYPH_FOR_ADVANCE, NULL, NULL, NULL,
+			NULL, w) != 0) {
+		TTF_CloseFont(handle);
+		return false;
+	}
+	TTF_CloseFont(handle);
+	return true;
+}
+
+/*
+ * Return the largest size in the subwindow's configured font range at
+ * which font, a vector font, fits the subwindow's minimum columns and rows
+ * in rect.  Returns 0 if the subwindow has no range, the font is a raster
+ * font, or no size in the range fits.
+ */
+static int fit_font_size(const struct subwindow *subwindow,
+		const struct font_info *info, const SDL_Rect *rect)
+{
+	int max_size, min_size, size;
+
+	if (subwindow->config == NULL || subwindow->config->font_size_max <= 0
+			|| info->type != FONT_TYPE_VECTOR) {
+		return 0;
+	}
+	max_size = MIN(subwindow->config->font_size_max, MAX_VECTOR_FONT_SIZE);
+	min_size = MAX(subwindow->config->font_size_min, MIN_VECTOR_FONT_SIZE);
+	for (size = max_size; size >= min_size; size--) {
+		int w, h;
+
+		if (!measure_font(info->path, size, &w, &h)) {
+			return 0;
+		}
+		if (is_ok_col_row(subwindow, rect, w, h)) {
+			return size;
+		}
+	}
+	return 0;
+}
+
+/*
+ * Move a loaded subwindow into rect, refitting its font if it has a font
+ * range (see ensure_minimum_rect() for a rect that is too small).
+ */
+static void relayout_subwindow(struct subwindow *subwindow,
+		const SDL_Rect *rect)
+{
+	struct sdlpui_window *window = subwindow->window;
+
+	assert(subwindow->loaded);
+
+	if (subwindow->config && subwindow->config->font_size_max > 0) {
+		const struct font_info *info =
+			&window->app->fonts[subwindow->font->index];
+		int size = fit_font_size(subwindow, info, rect);
+
+		if (size > 0 && size != subwindow->font->size) {
+			struct font *new_font =
+				make_font(window, info->name, size);
+
+			if (new_font) {
+				free_font(subwindow->font);
+				subwindow->font = new_font;
+			}
+		}
+	}
+
+	subwindow->sizing_rect = *rect;
+	ensure_minimum_rect(subwindow, &subwindow->sizing_rect);
+	resize_subwindow(subwindow);
+	SDL_Log("subwindow %u: region %d,%d %dx%d, font %d, %dx%d cells",
+		subwindow->index, subwindow->full_rect.x,
+		subwindow->full_rect.y, subwindow->full_rect.w,
+		subwindow->full_rect.h, subwindow->font->size,
+		subwindow->cols, subwindow->rows);
+}
+
+/*
+ * Lay out the window's subwindows and panel for its current size and
+ * orientation.  Subwindows with a region move into it; the others are only
+ * clamped into the window.  Called from resize_window().  At start-up,
+ * load_subwindow() applies the region itself, because the term does not
+ * exist yet.
+ */
+static void resolve_layout(struct sdlpui_window *window)
+{
+	int minw, minh;
+
+	SDL_Log("window %u: layout for %dx%d (%s)", window->index,
+		window->inner_rect.w, window->inner_rect.h,
+		(window->inner_rect.w > window->inner_rect.h) ?
+		"landscape" : "portrait");
+	resolve_panel_rect(window);
+	for (size_t i = 0; i < N_ELEMENTS(window->subwindows); i++) {
+		struct subwindow *subwindow = window->subwindows[i];
+		const struct layout_region *r;
+		SDL_Rect rect;
+
+		if (subwindow == NULL) {
+			continue;
+		}
+		r = find_region(window, subwindow->index);
+		if (r == NULL) {
+			fit_subwindow_in_window(window, subwindow);
+			continue;
+		}
+		region_to_rect(window, r, &rect);
+		relayout_subwindow(subwindow, &rect);
+	}
+
+	/* A change of font can change the minimum window size. */
+	get_minimum_window_size(window, &minw, &minh);
+	SDL_SetWindowMinimumSize(window->window, minw, minh);
+}
+
 static void resize_window(struct sdlpui_window *window, int w, int h)
 {
 	if (window->full_rect.w == w
@@ -6070,12 +6359,7 @@ static void resize_window(struct sdlpui_window *window, int w, int h)
 	adjust_window_geometry(window);
 	
 	clear_all_borders(window);
-	for (size_t i = 0; i < N_ELEMENTS(window->subwindows); i++) {
-		struct subwindow *subwindow = window->subwindows[i];
-		if (subwindow != NULL) {
-			fit_subwindow_in_window(window, subwindow);
-		}
-	}
+	resolve_layout(window);
 
 	redraw_window(window);
 }
@@ -6260,17 +6544,26 @@ static void start_window(struct sdlpui_window *window)
 				window->index, SDL_GetError());
 	}
 	{
-		int rw = 0, rh = 0;
+		int rw = 0, rh = 0, ww = 0, wh = 0;
+
+		/*
+		 * Render in the renderer's output pixels, which on a HiDPI
+		 * display are more than the window's units; with the
+		 * logical size set, SDL scales mouse events to match.
+		 */
 		SDL_GetRendererOutputSize(window->renderer, &rw, &rh);
+		SDL_GetWindowSize(window->window, &ww, &wh);
 		SDL_RenderSetLogicalSize(window->renderer, rw, rh);
-		if(rw != window->full_rect.w) {
-			float widthScale = (float)rw / (float) window->full_rect.w;
-			float heightScale = (float)rh / (float) window->full_rect.h;
-			if(widthScale != heightScale) {
-				fprintf(stderr, "WARNING: width scale != height scale\n");
-			}
-			// SDL_RenderSetScale(window->renderer, widthScale, heightScale);
-		}
+		window->ui_scale = (ww > 0) ? (float)rw / (float)ww : 1.0f;
+		/*
+		 * The window need not have the configured size: a fullscreen
+		 * window takes the display's size, and the display may have
+		 * been rotated since the configuration was written.
+		 */
+		window->full_rect.w = rw;
+		window->full_rect.h = rh;
+		SDL_Log("window %u: %dx%d units, %dx%d pixels, ui_scale %.2f",
+			window->index, ww, wh, rw, rh, window->ui_scale);
 	}
 
 	SDL_RendererInfo info;
@@ -6283,6 +6576,7 @@ static void start_window(struct sdlpui_window *window)
 	}
 
 	load_window(window);
+	resolve_panel_rect(window);
 
 	for (size_t i = 0; i < N_ELEMENTS(window->subwindows); i++) {
 		if (window->subwindows[i] != NULL) {
@@ -6390,8 +6684,33 @@ static void wipe_window(struct sdlpui_window *window, int display)
 
 	window->dirty = true;
 
+	window->has_panel = false;
+	window->ui_scale = 1.0f;
+
 	window->config = NULL;
 	window->inited = true;
+}
+
+/* Inverse of region_target_from_name(); buf must hold at least 8 bytes. */
+static const char *region_target_name(int target, char *buf, size_t len)
+{
+	if (target == MAIN_SUBWINDOW) {
+		return "map";
+	}
+	if (target == REGION_TARGET_PANEL) {
+		return "panel";
+	}
+	strnfmt(buf, len, "sub%d", target);
+	return buf;
+}
+
+static const char *region_orient_name(enum region_orient orient)
+{
+	switch (orient) {
+		case REGION_ORIENT_PORTRAIT: return "portrait";
+		case REGION_ORIENT_LANDSCAPE: return "landscape";
+		default: return "any";
+	}
 }
 
 static void dump_subwindow(const struct subwindow *subwindow, ang_file *config)
@@ -6417,6 +6736,12 @@ static void dump_subwindow(const struct subwindow *subwindow, ang_file *config)
 	}
 	DUMP_SUBWINDOW("font", "%d:%s",
 			subwindow->font->size, subwindow->font->name);
+	if (subwindow->config && subwindow->config->font_size_max > 0) {
+		DUMP_SUBWINDOW("font-max", "%d",
+			subwindow->config->font_size_max);
+		DUMP_SUBWINDOW("font-min", "%d",
+			subwindow->config->font_size_min);
+	}
 	DUMP_SUBWINDOW("borders", "%s",
 			subwindow->borders.visible ? "true" : "false");
 	DUMP_SUBWINDOW("top", "%s:%s",
@@ -6477,6 +6802,20 @@ static void dump_window(const struct sdlpui_window *window, ang_file *config)
 	DUMP_WINDOW("tile-scale", "height:%d", tile_height);
 #undef DUMP_WINDOW
 	file_put(config, "\n");
+
+	if (window->config && window->config->num_regions > 0) {
+		for (int i = 0; i < window->config->num_regions; i++) {
+			const struct layout_region *r =
+				&window->config->regions[i];
+			char buf[8];
+
+			file_putf(config, "region:%s:%s:%d:%d:%d:%d\n",
+				region_target_name(r->target, buf, sizeof(buf)),
+				region_orient_name(r->orient),
+				r->x, r->y, r->w, r->h);
+		}
+		file_put(config, "\n");
+	}
 
 	for (size_t i = 0; i < N_ELEMENTS(window->subwindows); i++) {
 		struct subwindow *subwindow = window->subwindows[i];
@@ -6597,14 +6936,47 @@ static void load_subwindow(struct sdlpui_window *window,
 	assert(window->loaded);
 	assert(!subwindow->loaded);
 
+	/*
+	 * For newer configuration files, stored_rect will have the desired
+	 * size for fullscreen.  Older configuration files only save the
+	 * size of whatever mode (fullscreen, not fullscreen) the game was in
+	 * so those will already have the right size in full_rect.
+	 */
+	if (subwindow->config && window->config && (window->config->window_flags
+			& SDL_WINDOW_FULLSCREEN_DESKTOP)
+			&& subwindow->stored_rect.w
+			&& subwindow->stored_rect.h) {
+		SDL_Rect tmp_rect = subwindow->full_rect;
+
+		subwindow->full_rect = subwindow->stored_rect;
+		subwindow->stored_rect = tmp_rect;
+	}
+
+	/* A region for the current orientation overrides the configured rect. */
+	{
+		const struct layout_region *r =
+			find_region(window, subwindow->index);
+
+		if (r) {
+			region_to_rect(window, r, &subwindow->full_rect);
+		}
+	}
+
 	if (subwindow->font == NULL) {
 		const char *try_names[3];
 		int try_sizes[3];
 		int n_tries = 0, i = 0;
 
 		if (subwindow->config && subwindow->config->font_name) {
+			const struct font_info *info = find_font_info(
+				window->app->fonts, window->app->font_count,
+				subwindow->config->font_name);
+			int fitted = (info) ? fit_font_size(subwindow, info,
+				&subwindow->full_rect) : 0;
+
 			try_names[n_tries] = subwindow->config->font_name;
-			try_sizes[n_tries] = subwindow->config->font_size;
+			try_sizes[n_tries] = (fitted > 0) ?
+				fitted : subwindow->config->font_size;
 			++n_tries;
 		}
 		try_names[n_tries] = DEFAULT_FONT;
@@ -6642,26 +7014,20 @@ static void load_subwindow(struct sdlpui_window *window,
 		}
 	}
 
-	/*
-	 * For newer configuration files, stored_rect will have the desired
-	 * size for fullscreen.  Older configuration files only save the
-	 * size of whatever mode (fullscreen, not fullscreen) the game was in
-	 * so those will already have the right size in full_rect.
-	 */
-	if (subwindow->config && window->config && (window->config->window_flags
-			& SDL_WINDOW_FULLSCREEN_DESKTOP)
-			&& subwindow->stored_rect.w
-			&& subwindow->stored_rect.h) {
-		SDL_Rect tmp_rect = subwindow->full_rect;
-
-		subwindow->full_rect = subwindow->stored_rect;
-		subwindow->stored_rect = tmp_rect;
+	/* The region, if any, may be too small for the font chosen above. */
+	if (find_region(window, subwindow->index)) {
+		ensure_minimum_rect(subwindow, &subwindow->full_rect);
 	}
 
 	if (!adjust_subwindow_geometry(window, subwindow)) {
 		quit_fmt("cannot adjust geometry of subwindow %u in window %u",
 				subwindow->index, window->index);
 	}
+	SDL_Log("subwindow %u: rect %d,%d %dx%d, font %d, %dx%d cells",
+		subwindow->index, subwindow->full_rect.x,
+		subwindow->full_rect.y, subwindow->full_rect.w,
+		subwindow->full_rect.h, subwindow->font->size,
+		subwindow->cols, subwindow->rows);
 	subwindow->texture = make_subwindow_texture(window,
 			subwindow->full_rect.w, subwindow->full_rect.h);
 	assert(subwindow->texture != NULL);
@@ -7880,6 +8246,41 @@ static enum parser_error config_subwindow_font(struct parser *parser)
 	return PARSE_ERROR_NONE;
 }
 
+static enum parser_error config_subwindow_font_range(struct parser *parser,
+		bool is_max)
+{
+	struct subwindow *subwindow = get_subwindow_from_parser(parser);
+	int size = parser_getint(parser, "size");
+
+	if (!subwindow) {
+		return PARSE_ERROR_OUT_OF_BOUNDS;
+	}
+	if (!subwindow->inited) {
+		return PARSE_ERROR_MISSING_RECORD_HEADER;
+	}
+	if (size < MIN_VECTOR_FONT_SIZE || size > MAX_VECTOR_FONT_SIZE) {
+		return PARSE_ERROR_OUT_OF_BOUNDS;
+	}
+
+	if (is_max) {
+		subwindow->config->font_size_max = size;
+	} else {
+		subwindow->config->font_size_min = size;
+	}
+
+	return PARSE_ERROR_NONE;
+}
+
+static enum parser_error config_subwindow_font_max(struct parser *parser)
+{
+	return config_subwindow_font_range(parser, true);
+}
+
+static enum parser_error config_subwindow_font_min(struct parser *parser)
+{
+	return config_subwindow_font_range(parser, false);
+}
+
 static enum parser_error config_subwindow_borders(struct parser *parser)
 {
 	struct subwindow *subwindow = get_subwindow_from_parser(parser);
@@ -7956,6 +8357,92 @@ static enum parser_error config_subwindow_alpha(struct parser *parser)
 	return PARSE_ERROR_NONE;
 }
 
+/*
+ * Map the name in a "region:" line to a subwindow index or
+ * REGION_TARGET_PANEL.  Returns -1 for an unknown name.
+ */
+static int region_target_from_name(const char *name)
+{
+	if (streq(name, "map")) {
+		return MAIN_SUBWINDOW;
+	}
+	if (streq(name, "panel")) {
+		return REGION_TARGET_PANEL;
+	}
+	if (strncmp(name, "sub", 3) == 0 && name[3] >= '0' && name[3] <= '9'
+			&& name[4] == '\0') {
+		int index = name[3] - '0';
+
+		if (index > MAIN_SUBWINDOW && index < MAX_SUBWINDOWS) {
+			return index;
+		}
+	}
+	return -1;
+}
+
+static bool region_orient_from_name(const char *name,
+		enum region_orient *orient)
+{
+	if (streq(name, "any")) {
+		*orient = REGION_ORIENT_ANY;
+	} else if (streq(name, "portrait")) {
+		*orient = REGION_ORIENT_PORTRAIT;
+	} else if (streq(name, "landscape")) {
+		*orient = REGION_ORIENT_LANDSCAPE;
+	} else {
+		return false;
+	}
+	return true;
+}
+
+static enum parser_error config_region(struct parser *parser)
+{
+	struct my_app *a = parser_priv(parser);
+	struct sdlpui_window *window = &a->windows[MAIN_WINDOW];
+	struct window_config *config;
+	struct layout_region reg;
+	int i;
+
+	/* Regions belong to the main window, which must come first. */
+	if (!window->inited || !window->config) {
+		return PARSE_ERROR_MISSING_RECORD_HEADER;
+	}
+	config = window->config;
+
+	reg.target = region_target_from_name(parser_getsym(parser, "name"));
+	if (reg.target < 0) {
+		return PARSE_ERROR_INVALID_VALUE;
+	}
+	if (!region_orient_from_name(parser_getsym(parser, "orient"),
+			&reg.orient)) {
+		return PARSE_ERROR_INVALID_VALUE;
+	}
+	reg.x = parser_getint(parser, "x");
+	reg.y = parser_getint(parser, "y");
+	reg.w = parser_getint(parser, "w");
+	reg.h = parser_getint(parser, "h");
+	if (reg.x < 0 || reg.y < 0 || reg.w <= 0 || reg.h <= 0
+			|| reg.x + reg.w > REGION_PER_MILLE
+			|| reg.y + reg.h > REGION_PER_MILLE) {
+		return PARSE_ERROR_OUT_OF_BOUNDS;
+	}
+
+	/* A later line for the same target and orientation replaces it. */
+	for (i = 0; i < config->num_regions; i++) {
+		if (config->regions[i].target == reg.target
+				&& config->regions[i].orient == reg.orient) {
+			config->regions[i] = reg;
+			return PARSE_ERROR_NONE;
+		}
+	}
+	if (config->num_regions >= MAX_REGIONS) {
+		return PARSE_ERROR_TOO_MANY_ENTRIES;
+	}
+	config->regions[config->num_regions++] = reg;
+
+	return PARSE_ERROR_NONE;
+}
+
 static enum parser_error config_menu_shortcut(struct parser *parser)
 {
 	struct my_app *a = parser_priv(parser);
@@ -8025,12 +8512,19 @@ static struct parser *init_parse_config(struct my_app *a)
 			"int w int h", config_subwindow_rect_fs);
 	parser_reg(parser, "subwindow-font uint index int size str name",
 			config_subwindow_font);
+	parser_reg(parser, "subwindow-font-max uint index int size",
+			config_subwindow_font_max);
+	parser_reg(parser, "subwindow-font-min uint index int size",
+			config_subwindow_font_min);
 	parser_reg(parser, "subwindow-borders uint index sym borders",
 			config_subwindow_borders);
 	parser_reg(parser, "subwindow-top uint index sym top sym always",
 			config_subwindow_top);
 	parser_reg(parser, "subwindow-alpha uint index int alpha",
 			config_subwindow_alpha);
+
+	parser_reg(parser, "region sym name sym orient int x int y int w int h",
+			config_region);
 
 	parser_reg(parser, "menu-shortcut uint index str keypress",
 			config_menu_shortcut);

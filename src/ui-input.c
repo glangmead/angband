@@ -658,12 +658,20 @@ void display_touch_keyboard(game_event_type unused, game_event_data *data, void 
 
 	int term_line = 0;
 	int wstrlen = 0;
-	while (file_getl(key_file, keyboard_text, sizeof(keyboard_text))) {
+	/* Clip to the term: Term_queue_chars() does not check its bounds */
+	while (term_line < term_height
+			&& file_getl(key_file, keyboard_text, sizeof(keyboard_text))) {
 		strunescape(keyboard_text);
 		wstrlen = text_mbstowcs(w_keyboard_text, keyboard_text, strlen(keyboard_text));
-		Term_queue_chars(0, term_line, wstrlen, COLOUR_L_WHITE, w_keyboard_text);
+		if (wstrlen > term_width) {
+			wstrlen = term_width;
+		}
+		if (wstrlen > 0) {
+			Term_queue_chars(0, term_line, wstrlen, COLOUR_L_WHITE, w_keyboard_text);
+		}
 		term_line++;
 	}
+	file_close(key_file);
 }
 
 /**

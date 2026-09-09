@@ -2113,16 +2113,36 @@ static void update_player_compact_subwindow(game_event_type type,
 
 static void update_touch_keyboard_subwindow(game_event_type type, game_event_data *data, void* user)
 {
+	/* Size of each term when its keyboard was last drawn */
+	static int drawn_w[ANGBAND_TERM_MAX], drawn_h[ANGBAND_TERM_MAX];
 	term *old = Term;
 	term *inv_term = user;
+	int i, w, h;
+
+	for (i = 0; i < ANGBAND_TERM_MAX && angband_term[i] != inv_term; i++) ;
 
 	/* Activate */
 	Term_activate(inv_term);
+	Term_get_size(&w, &h);
 
-	/* Display touch keyboard */
-	display_touch_keyboard(type, data, user);
+	/*
+	 * EVENT_REFRESH fires every turn, and the frontend signals it after
+	 * resizing a term; for it, only redraw when the size has changed.
+	 */
+	if (type != EVENT_REFRESH || i >= ANGBAND_TERM_MAX
+			|| w != drawn_w[i] || h != drawn_h[i]) {
+		/* The layout depends on the size; drop what the old size drew */
+		Term_clear();
 
-	Term_fresh();
+		/* Display touch keyboard */
+		display_touch_keyboard(type, data, user);
+
+		Term_fresh();
+		if (i < ANGBAND_TERM_MAX) {
+			drawn_w[i] = w;
+			drawn_h[i] = h;
+		}
+	}
 
 	/* Restore */
 	Term_activate(old);
@@ -2274,6 +2294,9 @@ static void subwindow_flag_changed(int win_idx, uint32_t flag, bool new_state)
 		case PW_TOUCH_KEYBOARD:
 		{
 			register_or_deregister(EVENT_INITSTATUS, update_touch_keyboard_subwindow, angband_term[win_idx]);
+			register_or_deregister(EVENT_INPUT_FLUSH, update_touch_keyboard_subwindow, angband_term[win_idx]);
+			/* The SDL2 frontend signals this after resizing a term; see the size check in the handler */
+			register_or_deregister(EVENT_REFRESH, update_touch_keyboard_subwindow, angband_term[win_idx]);
 			break;
 		}
 

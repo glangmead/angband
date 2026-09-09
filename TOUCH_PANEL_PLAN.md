@@ -508,6 +508,45 @@ simulator, where touches arrive as mouse events exactly as on the device.
   paths.
 - A `panel` config line still makes sense so the panel can be turned off;
   the desktop-only toggle from the first draft is no longer needed.
+- Learned during step 1 (2026-09-08):
+  - The user config is `Documents/Angband/sdl2init.txt` inside the app's
+    data container (`PRIVATE_USER_PATH` makes the user dir
+    `Documents/<VERSION_NAME>`), not `Documents/`. A file there overrides
+    the bundled one, so it is the quickest way to try a layout without a
+    rebuild. `xcrun simctl get_app_container <udid> org.rephial.Angband
+    data` gives the container, and the path changes on every
+    `simctl install`, so query it after installing.
+  - On the simulator the app bundle is writable, so a normal quit writes
+    the config into the bundle's own `lib/ios/sdl2init.txt` (the first
+    path tried) instead of `Documents/Angband/`. `simctl install`
+    replaces it. `simctl terminate` kills without writing.
+  - The Menu dropdown that is open at launch has keyboard focus: `idb ui
+    key` presses go into it (a run of Returns changed the map font).
+    Tap once anywhere first to close it, then send keys.
+  - Simulator rotation: from portrait, "Rotate Left" gives landscape;
+    from that landscape, "Rotate Right" gives portrait and "Rotate Left"
+    gives upside-down portrait, which the app does not support.
+    `./gregsim.sh rotate right` exists now. The menu click sometimes does
+    nothing; check the screenshot size (`sips -g pixelWidth`) and retry.
+  - Twice, rotating to landscape after a portrait launch put the app in
+    an iPadOS 26 floating window: SDL still reported 2420 by 1626 and the
+    canvas was drawn scaled down inside the window. A third run of the
+    same sequence stayed full screen. Portrait was always full screen.
+    `UIRequiresFullScreen` in `Info.plist` is the likely lever if this
+    matters; see the step 1 "you test" box.
+  - The frontend logs every layout with `SDL_Log` (window size and
+    scale, each subwindow's rect, font size and cells), visible with
+    `xcrun simctl launch --console`.
+  - Rotation and keystrokes through System Events need the Mac unlocked:
+    with the screen locked (`CGSSessionScreenIsLocked` in
+    `CGSessionCopyCurrentDictionary()`), the Simulator's menu items are
+    disabled and the clicks do nothing, while `simctl` and `idb` keep
+    working. A headless stand-in for a rotation is the status bar's Size
+    button plus `idb ui swipe` on a term: it takes the same
+    `resize_subwindow` path. With a crash that the game's own handler
+    catches ("Exiting on signal 11"), no report is written; attach
+    `lldb -p <pid> --batch -o "process continue" -o "bt 30"` before
+    reproducing to get a backtrace.
 
 ## 5. Implementation steps
 
@@ -524,8 +563,10 @@ Tick boxes in place. When something surprising happens, add a dated line
 under the step rather than editing history. Each step still ends in a state
 that runs on the simulator. Step numbers match the rest of this file.
 
-**Status 2026-09-08:** step 0 complete, including the device test; step 1
-not started.
+**Status 2026-09-09:** step 0 complete. Step 1 done, tested on the
+simulator and the iPad, and committed in this repository; the portrait
+split decision is deferred until the panel exists. Next: the step 1
+cherry-picks to NarSil and FAangband, then step 2.
 
 ### Step 0. Prerequisites
 
@@ -562,44 +603,141 @@ not started.
 
 ### Step 1. Regions
 
-- [ ] code: `region:<name>:<orient>:<x>:<y>:<w>:<h>` parser line
+- [x] code: `region:<name>:<orient>:<x>:<y>:<w>:<h>` parser line
       (per-mille), stored on the window config as a small array; unknown
       names rejected with a parse error like the other keys. Done when a
       file with region lines loads without complaint and nothing else
-      changes.
-- [ ] code: `resolve_layout(window)`: pick the regions for the current
+      changes. 2026-09-08: regions bind to window 0 and need its
+      `window-display` line first; the C struct is `layout_region` because
+      `ui-output.h` already owns `struct region`. Verified on the
+      simulator: the landscape layout is unchanged with region lines
+      present, a region line before the window header reports "missing
+      record header", `region:bogus:...` reports "invalid value". The
+      user config on iOS lives in `Documents/Angband/sdl2init.txt`
+      (`PRIVATE_USER_PATH`), not `Documents/`.
+- [x] code: `resolve_layout(window)`: pick the regions for the current
       orientation (`w > h`), set each named subwindow's `full_rect`, call
       `adjust_subwindow_geometry`, store the panel rect. Called from
       `start_window` and from `handle_last_resize_event` in place of the
       clamp-only path. Subwindows with no region keep today's behaviour.
       While there, fix the `|` that should be `&` on the HiDPI check in
       `handle_last_resize_event`. Done when a portrait launch shows a
-      portrait layout.
-- [ ] code: on resize, refresh `SDL_RenderSetLogicalSize` to the new
+      portrait layout. 2026-09-08: done. `resolve_layout` serves the
+      resize path (`resize_window`); at start-up `load_subwindow` applies
+      the region itself because the term does not exist yet, and
+      `start_window` only resolves the panel rect. `start_window` now also
+      takes the window size from the renderer instead of the config, which
+      is what made a portrait launch lay out as 2420 wide before. A region
+      too small for its subwindow's minimum grows to the minimum and shows
+      the error border instead of aborting (`ensure_minimum_rect`); the
+      first portrait launch hit that abort. The HiDPI flag test is gone
+      rather than fixed: the resize path now asks the renderer for its
+      output size, which is right with or without HiDPI. The keyboard term
+      only redrew on `EVENT_INITSTATUS`, so after a rotation it kept its
+      old layout; it is now also registered on `EVENT_INPUT_FLUSH`, which
+      `do_cmd_redraw` signals when the core sees the main term's resize.
+      Layout is logged with `SDL_Log` for `simctl launch --console`.
+- [x] code: on resize, refresh `SDL_RenderSetLogicalSize` to the new
       renderer output size (or drop the logical size and use the output
       size directly) before re-laying out. Today it is set once in
       `start_window`; the rotated-device screenshot in section 2.6 shows the
       consequence. Done when a rotation on the device fills the screen.
-- [ ] code: map font fit: new `subwindow-font-max` and `subwindow-font-min`
+      2026-09-08: refreshed in `handle_last_resize_event`; on the simulator
+      a rotation fills the screen in both directions. The device check is
+      in the "you test (device)" box below.
+- [x] code: map font fit: new `subwindow-font-max` and `subwindow-font-min`
       keys; try sizes downward with `reload_font` until cols >= 80 and rows
       >= 24. Done when the portrait map is 80 by 24 at the largest size that
-      fits and landscape is unchanged.
-- [ ] code: `dump_config_file` writes region lines and the font range back;
-      a relaunch reproduces the layout.
-- [ ] code: `ui_scale` computed once in `start_window`.
-- [ ] code: `lib/ios/sdl2init.txt` for Angband rewritten with the section
+      fits and landscape is unchanged. 2026-09-08: done, but not with
+      `reload_font`, which needs a live term and resizes the rect to the
+      font; `fit_font_size` measures candidate sizes with `TTF_OpenFont`
+      alone (no glyph cache) and the chosen size goes through the normal
+      font load. With `48` and `16` on the 11 inch: landscape stays at 36
+      (82 by 24), portrait fits at 34 (82 by 30).
+- [x] code: `dump_config_file` writes region lines and the font range back;
+      a relaunch reproduces the layout. 2026-09-08: verified by quitting
+      from the status bar Menu in portrait and relaunching. Note for
+      simulator work: the app bundle is writable there, so the dump goes
+      into the bundle's own `lib/ios/sdl2init.txt` (the first path
+      `init_globals` tries) rather than `Documents/Angband/`; each
+      `simctl install` replaces it. On a device the bundle is read-only
+      and the fallback path is used.
+- [x] code: `ui_scale` computed once in `start_window`. 2026-09-08: stored
+      on the window (`window->ui_scale`), 2.00 on the simulator.
+- [x] code: `lib/ios/sdl2init.txt` for Angband rewritten with the section
       4.1 region defaults, keeping the keyboard term as `sub1` for now so
-      the game stays playable by touch until step 6.
+      the game stays playable by touch until step 6. 2026-09-08: done,
+      with comments (the parser skips `#` lines). `sub1` takes the
+      panel's region in both orientations and the `panel` lines are there
+      too, so the panel rect is already resolved for step 2. The absolute
+      `subwindow-full-rect` lines stay as fallbacks. Both orientations
+      launch and rotate on the simulator; in portrait `sub4` (monster
+      recall, not messages: see `window.prf`) has no region in the 4.1
+      defaults and sits at its clamped landscape rect with the error
+      border, which is the next box's question.
 - [ ] you decide: the portrait split. Does `sub4` (messages) get a slice of
       the map region? What fraction goes to the panel band? Two candidate
       files can be prepared for you to compare on the simulator.
-- [ ] you test (simulator): rotate by hand while the game runs; both
+      2026-09-08: `sub4` is monster recall today (`window.prf`), not
+      messages; messages get a term in step 6. Two complete config files
+      sit untracked in the repository root, differing only in their
+      portrait lines; screenshots of both at the birth screen, with term
+      borders turned on for the comparison, are
+      `~/Downloads/step1_portrait_A.png` and `step1_portrait_B.png`
+      (`step1_portrait_default.png` shows the 4.1 defaults with `sub4`
+      left at its landscape rect; `step1_landscape_borders.png` the
+      landscape layout). Scripted birth through `idb` dropped keys, so
+      in-town shots are quicker by hand:
+      - `sdl2init.portraitA.txt`: recall takes a slice of the map. Map
+        `0:0:1000:420` (24 rows at 34 point), recall `0:420:1000:100`
+        (6 rows), monsters and items `0:520:500:160` and `500:520:500:160`
+        (10 rows, 45 columns), panel band `0:680:1000:320` (761 px).
+      - `sdl2init.portraitB.txt`: map keeps `0:0:1000:520` (30 rows);
+        monsters, items and recall share a taller band as three columns
+        `0:520:333:200`, `333:520:334:200`, `667:520:333:200` (12 rows,
+        30 columns each); panel band `0:720:1000:280` (666 px, still 9
+        rows of the 59 point keyboard).
+      To try one: copy it over `lib/ios/sdl2init.txt` and `./gregsim.sh`,
+      or drop it into the app's `Documents/Angband/` (section 4.9). The
+      chosen file replaces the portrait lines in `lib/ios/sdl2init.txt`
+      before the commit. 2026-09-09: deferred. The layout decision waits
+      until the panel exists; the 4.1 defaults stay in
+      `lib/ios/sdl2init.txt` and the two candidate files stay untracked.
+- [x] you test (simulator): rotate by hand while the game runs; both
       orientations re-lay out without a restart; the keyboard term is
       visible in both; the map never drops below 80 by 24. Also try the
       iPadOS 26 floating window if the simulator offers it, and resize it.
-- [ ] you test (device): the same on the iPad, plus HiDPI crispness and
-      that a hardware keyboard still works after a rotation.
-- [ ] commit (angband).
+      Passed 2026-09-09; the keyboard redraw fix below confirmed by hand.
+      2026-09-08 notes: scripted rotation passes in both directions (map
+      82 by 24 landscape, 82 by 30 portrait). The keyboard term redraws
+      its layout after a rotation only once the game processes input
+      (`EVENT_INPUT_FLUSH`), so on the splash screen it shows the old
+      layout until a key is pressed. The floating window appeared twice
+      out of three portrait-launch-then-landscape runs (section 4.9): the
+      app is drawn scaled inside it and SDL still reports the full
+      screen, so nothing re-lays out. Decide whether to drop
+      `UIRequiresFullScreen` from `os/ios/Info.plist` so iPadOS resizes
+      the window instead of scaling it; regions would then apply.
+      2026-09-09, by hand: rotation worked, mouse and hardware keyboard
+      both worked. The keyboard term kept its old layout after a rotation
+      until something in the game redrew it. Fixed: `refresh_angband_terms`
+      (called after every term resize) now signals `EVENT_REFRESH` in any
+      state after init, and the keyboard term listens to it, redrawing
+      only when its size changed and clearing first (the original NarSil
+      commit used `EVENT_INPUT_FLUSH`, which only fires in play).
+      Exercised on the simulator through the status bar's Size button and
+      an `idb ui swipe`, which takes the same `resize_subwindow` path as a
+      rotation: the term redrew at once with the layout for its new size.
+      That test also caught a crash in the hack itself:
+      `display_touch_keyboard` queued every line of the layout file with
+      no bounds check (`Term_queue_chars` has none in a release build),
+      so a term shorter than the 17 line narrow layout segfaulted; it
+      also never closed the layout file. Both fixed in `ui-input.c`. The
+      keyboard still shows only as many rows as fit.
+- [x] you test (device): the same on the iPad, plus HiDPI crispness and
+      that a hardware keyboard still works after a rotation. Passed
+      2026-09-09, including the keyboard redraw fix.
+- [x] commit (angband). 2026-09-09.
 - [ ] code: cherry-pick to `../NarSil_fork` and `../FAangband_fork`; NarSil
       `sdl2init.txt` gets its own region file with the 54 px status bar.
 - [ ] you test: NarSil on the simulator in both orientations.
