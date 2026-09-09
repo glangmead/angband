@@ -462,7 +462,10 @@ Port the angbandroid patch, renamed so nothing says Android:
 ### 4.7 Panel to core input path
 
 - Special keys and single characters: `send_sdl_keylike_event`, extended to
-  carry modifiers.
+  carry modifiers. 2026-09-09: stale. That function went with the touch
+  keyboard hack; the panel's keys already push events themselves through
+  `push_key_event` (keycode plus modifiers) and `push_text_event`, which is
+  what this bullet wanted. Use those.
 - Command references: resolve, then the same path.
 - Literal multi-character text: port `feed_keymap` from angbandroid
   `ui-input.c:1749`, then push one harmless event so the poll loop wakes.
