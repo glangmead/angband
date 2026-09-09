@@ -6275,9 +6275,9 @@ static void send_sdl_keylike_event(struct sdlpui_window *window, wchar_t command
 /* in a column, the rose's bottom edge is this far above the panel's */
 #define PANEL_ROSE_LIFT_POINTS 140
 /* the rose's default diameter, in points */
-#define PANEL_ROSE_SIZE_POINTS 120
+#define PANEL_ROSE_SIZE_POINTS 156
 /* the petals' outline thickness, in points */
-#define PANEL_ROSE_LINE_POINTS 10
+#define PANEL_ROSE_LINE_POINTS 9
 /*
  * Rose geometry, as fractions of its radius and half-angles in degrees.
  * A petal is a cone from an apex near the centre to a semicircular cap:
