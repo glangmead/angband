@@ -6144,8 +6144,8 @@ static void send_sdl_keylike_event(struct sdlpui_window *window, wchar_t command
 /* a second tap on a modifier within this many ms locks it */
 #define PANEL_DOUBLE_TAP_MS 400
 /* a held key re-fires after this delay, then at this interval (ms) */
-#define PANEL_REPEAT_DELAY_MS 350
-#define PANEL_REPEAT_INTERVAL_MS 85
+#define PANEL_REPEAT_DELAY_MS 450
+#define PANEL_REPEAT_INTERVAL_MS 120
 /* the rose's bottom edge is this far above the panel's, in points */
 #define PANEL_ROSE_LIFT_POINTS 140
 /* rose geometry, as fractions of its radius and half-angles in degrees */

@@ -268,7 +268,8 @@ them.
 9. Modifier rule from pocketzot: tap once, double tap locks, tap from lock
    clears.
 10. Repeat: 350 ms then every 85 ms, for the rose, arrows and Backspace.
-    Commands fire once.
+    Commands fire once. 2026-09-09: 450 ms then every 120 ms, after the
+    device test.
 11. Tab and Shift-Tab are not chrome. Tab is an ordinary command that
     seeding places per variant.
 
@@ -583,10 +584,10 @@ that runs on the simulator. Step numbers match the rest of this file.
 simulator and the iPad, committed in this repository and cherry-picked to
 NarSil and FAangband; the portrait split decision is deferred until the
 panel exists. Step 2a and 2b done and tested by you. Step 2c (repeat)
-and the step 5 rose code done, tested on the simulator with `idb` and
-committed here; their device tests are open. You have asked for movable
-panel pieces (two-finger drag, as in Brogue) before any layout or size
-decision; feasibility notes are in section 8. Next: that, then step 3.
+and the step 5 rose code done, tested on the simulator and the iPad,
+and committed here. You have asked for movable panel pieces (two-finger
+drag, as in Brogue) before any layout or size decision: step 2d, with
+the design in section 8. Next: step 2d, then step 3.
 
 ### Step 0. Prerequisites
 
@@ -947,14 +948,49 @@ decision; feasibility notes are in section 8. Next: that, then step 3.
       Backspace, Del, PgUp, PgDn, and the rose. Verified: `idb ui tap
       --duration 1.5` on the rose's south petal moved the character
       about 13 squares.
-- [ ] you test (device): hold an arrow; hold Backspace in a name prompt.
-      Are 350 and 85 right for you?
+- [x] you test (device): hold an arrow; hold Backspace in a name prompt.
+      Are 350 and 85 right for you? 2026-09-09: both too fast; now 450
+      and 120. The iPad looks and feels like the simulator.
 - [x] test: a full turn from the panel with `idb` taps only, then by you by
       hand on the simulator. 2026-09-09: `idb` only: walk, run, stay,
       the command menu, the character sheet, help and the knowledge
       menu, all from the panel. The by-hand half is yours, with the
       device tests.
 - [x] commit. 2026-09-09.
+
+2d. Movable pieces (added 2026-09-09; design in section 8, "Movable
+panel pieces"). Replaces the placement decisions of steps 2a, 2b and 5.
+
+- [ ] code: split the panel into pieces, one pinned dialog each (the
+      rose; the key stack of chrome, tabs and grid), sharing the modifier,
+      tab and layer state through one struct; `render_all`,
+      `get_subwindow_by_xy`, `relayout_panel` and `free_window` treat
+      every piece as they treat `window->panel` now. Done when both
+      pieces draw and work exactly as before, on the simulator via `idb`.
+- [ ] code: piece positions as regions (`region:rose:<orient>:x:y:w:h`
+      and `region:keys:...`), per-mille like the others and written back
+      by `dump_config_file`; a piece without a region takes its present
+      place inside `region:panel`. Done when a hand-edited position in
+      `Documents/Angband/sdl2init.txt` shows on launch in both
+      orientations.
+- [ ] code: two-finger drag. Re-enable `SDL_FINGERDOWN`, `SDL_FINGERMOTION`
+      and `SDL_FINGERUP` (disabled in `init_systems`) and count fingers;
+      a second finger down while the first is on a piece starts a drag
+      that follows the centroid, cancels any repeat and disarms the
+      pressed key; any finger up ends it, clamps the piece into the
+      window and stores its region for the current orientation. Finger
+      coordinates are normalised to the window; scale by the renderer
+      output size. `idb` cannot do two fingers and the Simulator's
+      two-finger gesture (Option plus the mouse) needs a hand and an
+      unlocked Mac, so the code test is a "you test".
+- [ ] you test (simulator, then device): two-finger drag both pieces
+      anywhere, including over the map; rotate; relaunch; a left-hand
+      and a right-hand arrangement. Note what the first finger's press
+      did before the second finger landed.
+- [ ] you decide: whether the keyboard term (`sub1`) should go now that
+      pieces float over the map, or wait for step 6; and what
+      `region:panel` still means once pieces have their own regions.
+- [ ] commit.
 
 ### Step 3. Core hooks
 
@@ -1042,9 +1078,11 @@ decision; feasibility notes are in section 8. Next: that, then step 3.
       should do anything yet. 2026-09-09: deferred by you in favour of
       movable pieces (section 8), which would make the position a drag
       rather than a decision.
-- [ ] you test (device): walk, run, alter, stay; sliding; that a finger
-      resting on the rose does not fire twice.
-- [ ] commit; cherry-pick to the other two.
+- [x] you test (device): walk, run, alter, stay; sliding; that a finger
+      resting on the rose does not fire twice. 2026-09-09: passed on the
+      iPad; it behaves as on the simulator.
+- [x] commit. 2026-09-09. The cherry-pick to the other two waits for the
+      step 8 milestone.
 
 ### Step 6. iOS
 
