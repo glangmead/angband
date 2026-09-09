@@ -619,6 +619,7 @@ static void region_to_rect(const struct sdlpui_window *window,
 static void resolve_panel_rect(struct sdlpui_window *window);
 static void load_panel(struct sdlpui_window *window);
 static void relayout_panel(struct sdlpui_window *window);
+static void reset_panel_slots(struct sdlpui_window *window);
 static void panel_tick(struct my_app *a);
 static void panel_cancel_repeat(struct my_app *a);
 static bool handle_finger(struct my_app *a, const SDL_TouchFingerEvent *e);
@@ -2756,6 +2757,13 @@ static void handle_menu_kp_mod(struct sdlpui_control *ctrl,
 	window->app->kp_as_mod = !window->app->kp_as_mod;
 }
 
+static void handle_menu_reset_slots(struct sdlpui_control *ctrl,
+		struct sdlpui_dialog *dlg, struct sdlpui_window *window)
+{
+	sdlpui_popdown_dialog(dlg, window, true);
+	reset_panel_slots(window);
+}
+
 static void handle_menu_about(struct sdlpui_control *ctrl,
 		struct sdlpui_dialog *dlg, struct sdlpui_window *window)
 {
@@ -3484,6 +3492,10 @@ static struct sdlpui_dialog *handle_menu_button(struct sdlpui_control *ctrl,
 			SDLPUI_MFLG_NONE);
 		sdlpui_create_submenu_button(c, "Windows", SDLPUI_HOR_LEFT,
 			handle_menu_windows, SDLPUI_CHILD_MENU_RIGHT, 0, false);
+		c = sdlpui_get_simple_menu_next_unused(result,
+			SDLPUI_MFLG_NONE);
+		sdlpui_create_menu_button(c, "Reset Panel Slots",
+			SDLPUI_HOR_LEFT, handle_menu_reset_slots, 0, false);
 	}
 	c = sdlpui_get_simple_menu_next_unused(result, SDLPUI_MFLG_NONE);
 	sdlpui_create_menu_button(c, "About...", SDLPUI_HOR_LEFT,
@@ -6976,6 +6988,8 @@ static int add_panel_chars(struct panel_piece *pp, int layer, int cell,
  * order the game's own customizable files use.
  */
 #define PANEL_SLOT_FILE "panel.txt"
+/* where reset_panel_slots() keeps the file it replaces */
+#define PANEL_OLD_SLOT_FILE "panel.old.txt"
 #define PANEL_SLOT_VERSION 1
 
 /* The slot tabs, in tab-strip order; the Keys tab is fixed and not one */
@@ -7221,8 +7235,110 @@ static struct parser *init_parse_panel(struct panel_shared *ps)
 }
 
 /*
- * Read the slots.  With no panel.txt in either place the slot tabs are
- * simply empty; the seeder (section 4.4) is what puts one there.
+ * The seeder (section 4.4): writes a panel.txt from the game's own
+ * command tables, so that there is always something on the tabs and the
+ * player has a complete file to edit rather than a blank one.  It runs
+ * when there is no panel.txt in either place, and from the Menu.
+ */
+
+/* Which slot tab a group of cmds_all seeds, or -1 for one that seeds none */
+static int panel_seed_tab(const char *group)
+{
+	if (streq(group, "Action commands")) {
+		return 0;
+	}
+	if (streq(group, "Items") || streq(group, "Manage items")) {
+		return 1;
+	}
+	if (streq(group, "Information") || streq(group, "Utility")) {
+		return 2;
+	}
+
+	/* "Hidden" and the debug groups seed nothing; Mine starts empty. */
+	return -1;
+}
+
+/* Write one tab's rows; what will not fit in the grid is commented out. */
+static void seed_panel_tab(ang_file *f, int tab)
+{
+	int row = 0, col = 0, g;
+
+	file_putf(f, "\ntab:%s\n", panel_tab_names[tab]);
+	for (g = 0; cmds_all[g].name; g++) {
+		size_t j;
+
+		if (panel_seed_tab(cmds_all[g].name) != tab) {
+			continue;
+		}
+		for (j = 0; j < cmds_all[g].len; j++) {
+			const struct cmd_info *cmd = &cmds_all[g].list[j];
+
+			/* A command no keyset has a key for cannot be sent. */
+			if (!cmd->key[0] && !cmd->key[1]) {
+				continue;
+			}
+			if (col == 0) {
+				file_putf(f, "%srow:", (row < PANEL_GRID_ROWS) ?
+					"" : "#");
+			}
+			file_putf(f, "%s[%s]", (col) ? "  " : "", cmd->desc);
+			col++;
+			if (col == PANEL_GRID_COLS) {
+				file_put(f, "\n");
+				col = 0;
+				row++;
+			}
+		}
+	}
+	if (col) {
+		file_put(f, "\n");
+	}
+}
+
+static bool seed_panel_file(const char *path)
+{
+	ang_file *f = file_open(path, MODE_WRITE, FTYPE_TEXT);
+	int tab;
+
+	if (!f) {
+		SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+			"could not write %s", path);
+		return false;
+	}
+	file_putf(f,
+		"# The touch panel's slot tabs, written from the game's own\n"
+		"# command tables.  Edit it freely.\n"
+		"#\n"
+		"# tab:Name  starts one of the tabs Act, Items, Info and Mine.\n"
+		"# row:...   fills that tab's next row of cells; a tab holds\n"
+		"#           %d rows of %d.  Rows past that are commented out\n"
+		"#           here, ready to be swapped in.\n"
+		"#\n"
+		"# A cell is one of\n"
+		"#   [Description]  a command, named as the command menu names\n"
+		"#                  it; its key is looked up for whichever\n"
+		"#                  keyset is in force when it is pressed.\n"
+		"#   \"text\"         literal text, sent as a keymap's action is.\n"
+		"#   {Esc} {Ent} {BS} {Sp} {Tab} {Up} {Down} {Left} {Right}\n"
+		"#   {F1} to {F12}, {^A} to {^Z}\n"
+		"#   {}             nothing.\n"
+		"# Any of them may end in =Face to change the word shown on it.\n"
+		"\n"
+		"panel-version:%d\n",
+		PANEL_GRID_ROWS, PANEL_GRID_COLS, PANEL_SLOT_VERSION);
+	for (tab = 0; tab < PANEL_TAB_KEYS; tab++) {
+		seed_panel_tab(f, tab);
+	}
+	file_close(f);
+	SDL_Log("wrote panel slots to %s", path);
+
+	return true;
+}
+
+/*
+ * Read the slots: the player's panel.txt if there is one, else the
+ * shipped one, else one seeded from the command tables and written to the
+ * player's directory.
  */
 static void load_panel_slots(struct panel_shared *ps)
 {
@@ -7233,13 +7349,20 @@ static void load_panel_slots(struct panel_shared *ps)
 
 	path_build(path, sizeof(path), ANGBAND_DIR_USER, PANEL_SLOT_FILE);
 	if (!file_exists(path)) {
-		path_build(path, sizeof(path), ANGBAND_DIR_CUSTOMIZE,
+		char shipped[1024];
+
+		path_build(shipped, sizeof(shipped), ANGBAND_DIR_CUSTOMIZE,
 			PANEL_SLOT_FILE);
+		if (file_exists(shipped)) {
+			my_strcpy(path, shipped, sizeof(path));
+		} else if (!seed_panel_file(path)) {
+			return;
+		}
 	}
 	f = file_open(path, MODE_READ, FTYPE_TEXT);
 	if (!f) {
-		SDL_Log("no %s to read; the slot tabs are empty",
-			PANEL_SLOT_FILE);
+		SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION, "could not read %s",
+			path);
 		return;
 	}
 	SDL_Log("reading panel slots from %s", path);
@@ -8549,6 +8672,31 @@ static void unload_panel(struct sdlpui_window *window)
 	free_panel_slots(window->panel);
 	SDL_free(window->panel);
 	window->panel = NULL;
+}
+
+/*
+ * Write a fresh panel.txt from the command tables and show it: what the
+ * Menu's "Reset Panel Slots" does.  The old file is kept, because the
+ * player may have spent time on it.
+ */
+static void reset_panel_slots(struct sdlpui_window *window)
+{
+	char path[1024], old[1024];
+
+	path_build(path, sizeof(path), ANGBAND_DIR_USER, PANEL_SLOT_FILE);
+	path_build(old, sizeof(old), ANGBAND_DIR_USER, PANEL_OLD_SLOT_FILE);
+	if (file_exists(path)) {
+		file_delete(old);
+		if (file_move(path, old)) {
+			SDL_Log("kept the old panel slots as %s", old);
+		}
+	}
+	if (!seed_panel_file(path)) {
+		return;
+	}
+	unload_panel(window);
+	load_panel(window);
+	sdlpui_signal_redraw(window);
 }
 
 /*

@@ -1287,9 +1287,19 @@ theirs. Nothing in those steps waits on it; see section 4.6.
       open-codes. Verified on the simulator: `[Rest for a while]` raised
       the rest prompt, and `"za."` gave "no rods to zap", "no wands to
       aim" and then the run prompt, in that order.
-- [ ] code: seeder from `cmds_all` with the section 4.4 group-to-tab rules,
+- [x] code: seeder from `cmds_all` with the section 4.4 group-to-tab rules,
       the face table, commented overflow rows, and a menu item to
-      regenerate.
+      regenerate. 2026-09-09: done for Angband. It runs when there is no
+      `panel.txt` in either place, writing one to the user directory, and
+      from the Menu's "Reset Panel Slots", which keeps whatever it
+      replaces as `panel.old.txt`. Its output is now shipped as
+      `lib/customize/panel.txt`. The faces are not written into the file:
+      they come from the table in the next box, so that the file stays
+      readable and one `=Face` can override any of them. Overflow rows
+      are written commented, but Angband has none: a slot tab's grid is
+      seven by four, so 28 cells against 13 Act commands, 21 Items and 22
+      Info. Everything fits, which makes the decision below about order
+      and wording only.
 - [ ] code: word faces rendered on Act, Items and Info; Mine empty.
 - [ ] you decide: review the generated Angband `panel.txt`. Which sixteen
       go on each tab, in what order, and which face words read badly?

@@ -1,0 +1,36 @@
+# The touch panel's slot tabs, written from the game's own
+# command tables.  Edit it freely.
+#
+# tab:Name  starts one of the tabs Act, Items, Info and Mine.
+# row:...   fills that tab's next row of cells; a tab holds
+#           4 rows of 7.  Rows past that are commented out
+#           here, ready to be swapped in.
+#
+# A cell is one of
+#   [Description]  a command, named as the command menu names
+#                  it; its key is looked up for whichever
+#                  keyset is in force when it is pressed.
+#   "text"         literal text, sent as a keymap's action is.
+#   {Esc} {Ent} {BS} {Sp} {Tab} {Up} {Down} {Left} {Right}
+#   {F1} to {F12}, {^A} to {^Z}
+#   {}             nothing.
+# Any of them may end in =Face to change the word shown on it.
+
+panel-version:1
+
+tab:Act
+row:[Disarm a trap or chest]  [Rest for a while]  [Look around]  [Target monster or location]  [Target closest monster]  [Dig a tunnel]  [Go up staircase]
+row:[Go down staircase]  [Open a door or a chest]  [Close a door]  [Fire at nearest target]  [Throw an item]  [Walk into a trap]
+
+tab:Items
+row:[Inscribe an object]  [Uninscribe an object]  [Wear/wield an item]  [Take off/unwield an item]  [Examine an item]  [Drop an item]  [Fire your missile weapon]
+row:[Use a staff]  [Aim a wand]  [Zap a rod]  [Activate an object]  [Eat some food]  [Quaff a potion]  [Read a scroll]
+row:[Fuel your light source]  [Use an item]  [Display equipment listing]  [Display inventory listing]  [Display quiver listing]  [Pick up objects]  [Ignore an item]
+
+tab:Info
+row:[Browse a book]  [Gain new spells]  [View abilities]  [Cast a spell]  [Full dungeon map]  [Toggle ignoring of items]  [Display visible item list]
+row:[Display visible monster list]  [Locate player on map]  [Help]  [Identify symbol]  [Character description]  [Check knowledge]  [Repeat level feeling]
+row:[Show previous message]  [Show previous messages]  [Interact with options]  [Save and don't quit]  [Save and quit]  [Retire character and quit]  [Redraw the screen]
+row:[Save "screen dump"]
+
+tab:Mine
