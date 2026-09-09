@@ -45,8 +45,6 @@ MACRO(CONFIGURE_SDL2_FRONTEND _NAME_TARGET)
         set(SDL2IMAGE_WEBP OFF)
         set(SDL2IMAGE_TIF OFF)
         FetchContent_Declare(sdl2_image
-
-        PKG_SEARCH_MODULE(SDL2 sdl2)
                 GIT_REPOSITORY "https://github.com/libsdl-org/SDL_image"
                 GIT_TAG "SDL2"
         )

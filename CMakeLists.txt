@@ -408,7 +408,6 @@ ADD_EXECUTABLE(OurExecutable
 )
 
 if(IOS)
-    set(DEPLOYMENT_TARGET "18.5" CACHE STRING "")
     set(CMAKE_OSX_ARCHITECTURES "arm64" CACHE STRING "")
     add_compile_definitions(USE_SDL2 GAMEDATA_IN_LIB)
     set(RESOURCES

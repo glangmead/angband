@@ -350,6 +350,7 @@ void init_file_paths(const char *configpath, const char *libpath, const char *da
 	BUILD_DIRECTORY_PATH(ANGBAND_DIR_HELP, libpath, "help");
 	BUILD_DIRECTORY_PATH(ANGBAND_DIR_SCREENS, libpath, "screens");
 	BUILD_DIRECTORY_PATH(ANGBAND_DIR_FONTS, libpath, "fonts");
+	BUILD_DIRECTORY_PATH(ANGBAND_DIR_PLATFORM, libpath, "ios");
 	BUILD_DIRECTORY_PATH(ANGBAND_DIR_TILES, libpath, "tiles");
 	BUILD_DIRECTORY_PATH(ANGBAND_DIR_SOUNDS, libpath, "sounds");
 	BUILD_DIRECTORY_PATH(ANGBAND_DIR_ICONS, libpath, "icons");
