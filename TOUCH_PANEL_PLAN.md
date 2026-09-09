@@ -258,7 +258,10 @@ them.
 4. Chrome: compass rose, Escape, Enter, Backspace, Space, sticky Shift,
    sticky Ctrl, tab strip, fast-keys strip.
 5. Rose: Brogue-style petals, cardinals larger, bottom-left, lifted 140
-   points, fixed position for now.
+   points, fixed position for now. 2026-09-09: after seeing it, half the
+   size (120 points across), petals drawn as 10 point outlines rather
+   than fills, shaped as in Brogue (a cone from an apex near the centre
+   to a semicircular cap); position by two-finger drag (step 2d).
 6. Tabs: Act, Items, Info (seeded from `cmds_all`), Mine (user macros),
    Keys (full keyboard).
 7. Slots reference commands by description, resolved to a key at press time
@@ -587,7 +590,16 @@ panel exists. Step 2a and 2b done and tested by you. Step 2c (repeat)
 and the step 5 rose code done, tested on the simulator and the iPad,
 and committed here. You have asked for movable panel pieces (two-finger
 drag, as in Brogue) before any layout or size decision: step 2d, with
-the design in section 8. Next: step 2d, then step 3.
+the design in section 8. Step 2d: the split into pieces and the piece
+regions are done and tested on the simulator; the two-finger drag is
+built and waits for your hand test (`idb` has one finger). Nothing from
+2d is committed yet; its commit box follows your test and decision.
+Next: your 2d test, then step 3.
+2026-09-09, evening: your 2d tests passed (third round: drag
+performance on the iPad "great"); you chose candidate 2 for the strip
+layout. Nothing from 2d is committed yet. The session ended with a
+list of to-dos and questions under step 2d ("Next session") and two
+TBD discussion items in section 8. Committed 2026-09-09.
 
 ### Step 0. Prerequisites
 
@@ -961,19 +973,61 @@ the design in section 8. Next: step 2d, then step 3.
 2d. Movable pieces (added 2026-09-09; design in section 8, "Movable
 panel pieces"). Replaces the placement decisions of steps 2a, 2b and 5.
 
-- [ ] code: split the panel into pieces, one pinned dialog each (the
+- [x] code: split the panel into pieces, one pinned dialog each (the
       rose; the key stack of chrome, tabs and grid), sharing the modifier,
       tab and layer state through one struct; `render_all`,
       `get_subwindow_by_xy`, `relayout_panel` and `free_window` treat
       every piece as they treat `window->panel` now. Done when both
       pieces draw and work exactly as before, on the simulator via `idb`.
-- [ ] code: piece positions as regions (`region:rose:<orient>:x:y:w:h`
+      2026-09-09: done. `window->panel` is now a `panel_shared` (the
+      tab, layer, modifier and repeat state, and the two piece dialogs);
+      each piece dialog's private data is a `panel_piece` with its kind,
+      the shared pointer and its controls. The type code `PANEL_CODE`
+      marks a piece dialog, which is how `render_all`,
+      `get_subwindow_by_xy` and the drag find them. The `panel` region
+      stays as the home area: its dimmed background and tap shield are
+      drawn and checked outside any dialog (`render_panel_home`), and a
+      piece draws its own background only where it lies outside the
+      home rect, so the default look is unchanged. Verified on the
+      simulator with `idb`: the pieces logged at `0,1659 481x481` (rose)
+      and `489,1659 904x680` (keys) in portrait, the old places; birth by
+      Enter; arrows (the wall message); two rose taps stepped twice and
+      a 1.5 s hold repeated about ten squares; Shift then `c` opened the
+      character sheet; the symbols layer's `~` opened the knowledge
+      menu; a tap on the home area off both pieces did nothing. Key
+      centres in portrait moved with the stack to the rose's right:
+      chrome row 855 (Esc 280, ↑ 344, Enter 408, ⌫ 472, Shift 536), row
+      903 (← 280, ↓ 344, → 408, Space 472, Ctrl 536), tabs 951, grid
+      rows 999 to 1143 at columns 280 to 664 in steps of 64; the rose's
+      centre is 120,950 with the petals 90 points out. Seen, not
+      chased: right after a launch, a first tap on the status bar's Menu
+      button advanced the splash instead of opening the dropdown; after
+      a tap anywhere else the Menu opens (with its Angband submenu open
+      under it). The step 1 notes already advise a tap elsewhere first.
+- [x] code: piece positions as regions (`region:rose:<orient>:x:y:w:h`
       and `region:keys:...`), per-mille like the others and written back
       by `dump_config_file`; a piece without a region takes its present
       place inside `region:panel`. Done when a hand-edited position in
       `Documents/Angband/sdl2init.txt` shows on launch in both
-      orientations.
-- [ ] code: two-finger drag. Re-enable `SDL_FINGERDOWN`, `SDL_FINGERMOTION`
+      orientations. 2026-09-09: done. `rose` and `keys` are region
+      targets like `panel`; `get_panel_piece_rect` takes the piece's
+      region for the orientation, else its default place in
+      `region:panel`, else there is no piece. A piece region sets the
+      size too: the rose takes the shorter side as its diameter; the
+      key stack fits cells to the width (capped at 64 points) and
+      shrinks its rows when the height is short. Verified with a user
+      config carrying `region:rose:portrait:720:690:280:200`,
+      `region:keys:portrait:20:690:560:300`,
+      `region:rose:landscape:760:400:240:350` and
+      `region:keys:landscape:0:640:400:360`: a portrait launch logged
+      `rose piece at 1200,1682 468x476` and `keys piece at 33,1682
+      934x714`; a scripted rotation (the Mac was unlocked) moved them to
+      `1839,692 581x569` and `0,1082 968x586`, the stack over the lower
+      terms with shrunk rows and its own dimmed background outside the
+      home column; a launch in landscape gave the same; Ctrl-x, Enter
+      and Esc quit the game and the rewritten user config kept all four
+      lines. The test config was removed afterwards.
+- [x] code: two-finger drag. Re-enable `SDL_FINGERDOWN`, `SDL_FINGERMOTION`
       and `SDL_FINGERUP` (disabled in `init_systems`) and count fingers;
       a second finger down while the first is on a piece starts a drag
       that follows the centroid, cancels any repeat and disarms the
@@ -982,15 +1036,158 @@ panel pieces"). Replaces the placement decisions of steps 2a, 2b and 5.
       coordinates are normalised to the window; scale by the renderer
       output size. `idb` cannot do two fingers and the Simulator's
       two-finger gesture (Option plus the mouse) needs a hand and an
-      unlocked Mac, so the code test is a "you test".
-- [ ] you test (simulator, then device): two-finger drag both pieces
+      unlocked Mac, so the code test is a "you test". 2026-09-09: built;
+      the drag itself is untested. Finger events are enabled again;
+      `handle_finger` (from `get_event`, and from `term_xtra_flush` so
+      a flush cannot lose a finger) acts only on a direct touch device,
+      so a Mac touchpad still does nothing, and the first finger's mouse
+      emulation is untouched. A second finger down while the mouse
+      button (the first finger) is down on a piece picks the piece up:
+      repeat cancelled, every control of the piece disarmed, the piece
+      pushed to the top of the dialog stack. Any finger up puts it
+      down, clamped into the inner rect, with its region stored for the
+      current orientation and `... piece put down at ...` logged. A
+      layout during a drag drops the drag. Everything else on the panel
+      was re-verified on this build with single-finger `idb` taps, so
+      the enabled finger events are harmless to taps.
+      2026-09-09, after your iPad test: flaky. The rose, dragged to the
+      bottom left, moved again when you next tried to drag the keys,
+      then the app crashed; after a relaunch one drag of the keys
+      worked and then nothing would drag. The first version took the
+      first finger to be "the other finger in SDL's finger list" and
+      followed the list's centroid, and both symptoms fit a phantom
+      finger in that list (a lift SDL never received, which the iPad
+      can do): a phantom resting where the rose was dropped makes the
+      next single press look like two fingers with the phantom on the
+      rose, so the rose follows half of the motion; and with a phantom
+      the "exactly two fingers" test never passes again. Rewritten to
+      read nothing from the list: the first finger is known by SDL's
+      own rule mirrored from the events (the first finger down while
+      none is tracked, until it lifts), a finger-down from any other
+      finger while the mouse button is down on a piece picks the piece
+      up, the piece follows the first finger's mouse motion in
+      `handle_mousemotion` (so the drag is exact in the pieces' own
+      coordinates, not a centroid), and the first finger's release in
+      `handle_mousebutton` or any finger-up puts it down. The crash was
+      not identified from the code; the finger-list reads are gone with
+      the rewrite. Re-verified single-finger use with `idb` on the new
+      build. If it crashes again, Console.app with the iPad attached
+      shows the app's stderr, where the game's handler prints "Exiting
+      on signal 11".
+- [x] you test (simulator, then device): two-finger drag both pieces
       anywhere, including over the map; rotate; relaunch; a left-hand
       and a right-hand arrangement. Note what the first finger's press
-      did before the second finger landed.
+      did before the second finger landed. 2026-09-09, how: in the
+      Simulator hold Option and Shift to get two fingers that move
+      together (Option alone pinches), press on a piece and drag. The
+      console logs `picked up at` and `put down at` with the rect
+      (`xcrun simctl launch --console`; the launch made at hand-off
+      logs to `/tmp/panel/console5.log`). Check that keys under a moved
+      piece take taps and the terms beside it do; that nothing repeats
+      during the drag; that each orientation keeps its own positions
+      and a piece never dragged in an orientation stays at its default
+      place there; and that a quit from the game (not `simctl
+      terminate`) and a relaunch without reinstalling bring the
+      positions back (on the simulator with no user file they are
+      written into the bundle's own `lib/ios/sdl2init.txt`).
+      2026-09-09: first iPad round failed; see the drag box. Second
+      round: the drag worked but updated once or twice over a few
+      inches, with every touch backlogged for seconds afterwards. Not
+      the rendering: on the simulator a drag frame measured 7 to 9 ms
+      (the key stack's 92 captions go through TTF at 5 to 7 ms, and were
+      rendered twice per frame, once by `render_status_bar`). The
+      cause was `term_xtra_event`, which slept 16 ms after every event
+      it polled and did not handle; with finger events enabled, the
+      iPad's 120 Hz finger motion cost nearly two seconds of sleep per
+      second of dragging, and the queue drained for seconds afterwards.
+      `idb` sends few events, so the simulator never showed it. Fixed:
+      `get_events` drains the queue before the loop sleeps, and each
+      piece is cached in a texture, redrawn only when it changes and
+      dropped on resize and renderer reset, so a drag frame is one
+      copy (2 to 5 ms on the simulator, none of it the panel). `xctrace`
+      could not attach to the simulator process (it hung), so the
+      numbers came from temporary `SDL_Log` timing. A testing aid
+      stays: with `ANGBAND_PANEL_DRAG_TEST` in the environment (on the
+      simulator, `SIMCTL_CHILD_ANGBAND_PANEL_DRAG_TEST=1 xcrun simctl
+      launch ...`) the first finger's own touch starts a drag, so an
+      `idb ui swipe` on a piece drags it; used to exercise pickup,
+      move, put-down and the stored region on the simulator. Third
+      round on the iPad: passed, "great".
 - [ ] you decide: whether the keyboard term (`sub1`) should go now that
       pieces float over the map, or wait for step 6; and what
       `region:panel` still means once pieces have their own regions.
-- [ ] commit.
+      2026-09-09, your answer in part: `region:panel` stays, as a
+      blank buffer strip along the bottom in both orientations for the
+      pieces to sit on; above it, in portrait a few terms between the
+      strip and the map, in landscape a couple under the map and a
+      tall right column carved into three. Messages, the monster list
+      and the item list first; the rest by the menu as today. Done so
+      far: term 1 shows messages instead of the touch keyboard
+      (`lib/ios/window.prf`; the hack's code stays until step 6); in a
+      band the pieces default to the rose at the left and the key
+      stack at the right, both centred vertically, and the stack takes
+      a wide form there, the chrome block beside the tabs and grid,
+      five rows instead of seven (the three empty rows under the chrome
+      are where the step 3 fast-keys strip can go); the rose is 120
+      points across with outlined petals (decision 5). Two candidate
+      files sit untracked in the repository root, each with both
+      orientations; screenshots of both in the town are
+      `~/Downloads/step2d_strip1_portrait.png` and so on:
+      - `sdl2init.strip1.txt`: messages under the map in both
+        orientations (4 rows in portrait, 3 in landscape); monsters,
+        items and recall as three columns above the strip in portrait
+        (15 rows) and as the right column in landscape (10 rows each);
+        the strip is 220 per mille in portrait (262 points) and 300 in
+        landscape (244 points); the map is 82 by 27 at 34 point in
+        portrait and 91 by 24 at 34 in landscape.
+      - `sdl2init.strip2.txt`: the map keeps its height (82 by 30 at
+        34 in portrait, 82 by 25 at 37 in landscape); in portrait
+        monsters, items and recall are three columns of 11 rows and
+        messages sit just above the strip, by the keys; in landscape
+        all four side terms share the right column at 7 rows each.
+      Open with the choice: the strip's dim, which now lies over black
+      (nothing under it), the rose's outline weight at this size (10
+      points is a third of a cardinal petal's width), and the rose's
+      centre, which shows a dot because a word does not fit the dialog
+      font at 120 points.
+      2026-09-09, decided: candidate 2. `region:panel` stays as the
+      strip; `sub1`, the touch keyboard term, goes now (it still shows
+      on the iPad, and its window flag shows in the menus). The
+      remaining items are the "Next session" list below.
+- [x] commit. 2026-09-09.
+
+Next session (from the 2026-09-09 evening hand-off; in order):
+
+- [x] commit 2d as it stands (the split, piece regions, the drag, the
+      event-loop and texture fixes, the rose, the wide key stack, term
+      1 as messages, this file), then the items below as their own
+      commits. 2026-09-09: committed.
+- [ ] code: `lib/ios/sdl2init.txt` takes candidate 2's regions
+      (`sdl2init.strip2.txt`) and `subwindow-font:1:30`; the candidate
+      files and `sdl2init.portraitA/B.txt` can then go.
+- [ ] code: rose 30 percent bigger in both directions (156 points,
+      `PANEL_ROSE_SIZE_POINTS`) and the outline 10 percent thinner (9
+      points, `PANEL_ROSE_LINE_POINTS`). Check the strip still holds
+      it (candidate 2's strip is 262 points in portrait, 244 in
+      landscape; the rose is centred, so it fits, with 40 points to
+      spare in landscape).
+- [ ] code: remove the touch keyboard hack now rather than in step 6:
+      `PW_TOUCH_KEYBOARD` in `src/ui-term.h`,
+      `update_touch_keyboard_subwindow` in `src/ui-display.c`,
+      `display_touch_keyboard` in `src/ui-input.c`, the defaults in
+      `src/ui-init.c`, `lib/help/keyboard_horiz.txt` and
+      `keyboard_vert.txt`, and the "Display touch keyboard" entry in
+      the window-flags menu, which you saw and which is not a thing.
+      `send_sdl_keylike_event` in `main-sdl2.c` goes with it if nothing
+      else uses it. Move the step 6 box here.
+- [ ] you decide: a blank term. Angband's window flags are a bitmask
+      and a term with no flag set draws nothing, so "empty" already
+      exists as "every flag off" in the window-flags menu; a named
+      "Empty" entry would only make that discoverable. Is that wanted,
+      or is "no flag" enough? (Asked 2026-09-09.)
+- [ ] you test (device): the new rose size and line, candidate 2 as
+      the shipped default, no keyboard term anywhere.
+- [ ] commit; then step 3.
 
 ### Step 3. Core hooks
 
@@ -1179,6 +1376,25 @@ panel pieces"). Replaces the placement decisions of steps 2a, 2b and 5.
 - Rebasing `../NarSil_fork` `main` onto upstream, 124 commits behind as of
   2026-09-08. Nothing there touches `main-sdl2.c`.
 - The Menu dropdown open at launch (section 2.6): fixed in step 2a.
+- TBD, discussion (asked 2026-09-09): a new branch with a squashed
+  history that groups the work thematically rather than by session:
+  building for iOS; term windows specified as fractional regions;
+  responding to rotation and resize; the new touch keyboard (the panel:
+  pieces, rose, key stack, drag); and whatever else turns up in the
+  log (the `init.c` platform-directory fix, the cmake macro fix, the
+  Menu-at-launch fix, `gregsim.sh`). To settle: which base (upstream
+  `master` at the branch point), what the commits are, whether this
+  file travels with them or stays a working document, and what the
+  forks get.
+- TBD, discussion (asked 2026-09-09): a text-file spec for the panel's
+  keys, covering both the exhaustive one (the Keys tab: its layers,
+  which characters and special keys sit where) and the thematic
+  groupings (Act, Items, Info, Mine: which commands, in what order,
+  with what faces). Section 4.3's `panel.txt` grammar is the starting
+  point for the groupings; the Keys tab is fixed in code today
+  (`create_panel_keys`) and would need the same treatment to be
+  specified in a file. The spec would also be what step 4's seeder
+  writes and what step 7's editor edits.
 - Movable panel pieces (asked for 2026-09-09, after the rose): the rose
   and the key stack draggable, drawn above whatever they land on, moved
   with a two-finger drag as in Brogue. Feasibility, from the code as it
