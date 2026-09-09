@@ -1,0 +1,785 @@
+# Touch panel for the SDL2 frontend (iPad first)
+
+Plan written 2026-09-08 from a design session, then revised the same day after
+a review of the three repositories (sections 2.5, 2.6, 4.9, 5, 6, 7 and 8).
+It is meant to be read cold by a new session working in this repository. Line
+numbers refer to `sdl2-term-touch-keyboard` at commit `c1d4bb4c7` and are
+pinned there on purpose: read them with `git show c1d4bb4c7:src/main-sdl2.c`
+and do not update them as the branch moves. Step 0 was carried out the same
+day; its results are in sections 2.6, 4.9, 5 and 7. The same plan applies
+afterwards to `../FAangband_fork` and `../NarSil_fork`, which carry the same
+branch and the same current keyboard hack.
+
+## 1. Goal
+
+The whole screen stays SDL. Term windows are laid out from fractional
+"regions" that differ per orientation. One region is not a term: it is a
+**panel** drawn by `main-sdl2.c` with its own toolkit, containing a compass
+rose, a few fixed keys, and five tabs of buttons. The game core is patched to
+tell the panel which keys are valid at the current prompt. No UIKit views, no
+frameworks, one app per variant.
+
+This replaces the current approach, where a term subwindow displays a grid of
+characters that acts as a keyboard.
+
+## 2. What exists today
+
+### 2.1 This branch's iOS work
+
+- Build: `CMakeLists.txt` IOS block, `src/cmake/toolchain/ios.toolchain.cmake`,
+  `.github/workflows/ios.yaml`. SDL2, SDL_ttf, SDL_image come from FetchContent
+  in `src/cmake/macros/SDL2_Frontend.cmake`. `src/main-uikit-sdl2.c` provides
+  `SDL_UIKitRunApp`.
+- Paths: on `__APPLE__` the user dir is `~/Documents` (`src/main.c`), and a
+  new `ANGBAND_DIR_PLATFORM` (`src/init.c`) lets `lib/ios/` supply defaults:
+  `sdl2init.txt`, `window.prf`, `customized_interface_options.txt`.
+- Layout: `lib/ios/sdl2init.txt` holds absolute pixel rects tuned for the
+  11 inch iPad Pro in landscape at 2x (2420 by 1668). Map on the left at 36
+  point, keyboard term column on the right, two half-width subterms under the
+  map, one full-width subterm at the bottom.
+- HiDPI: `handle_last_resize_event` doubles the reported size when
+  `SDL_WINDOW_ALLOW_HIGHDPI` is set; `start_window` sets that flag on Apple
+  and calls `SDL_RenderSetLogicalSize` with the renderer output size.
+- Keyboard hack to be removed once the panel works: `PW_TOUCH_KEYBOARD` in
+  `src/ui-term.h`, `update_touch_keyboard_subwindow` in `src/ui-display.c`,
+  `display_touch_keyboard` in `src/ui-input.c`, defaults in `src/ui-init.c`,
+  `lib/help/keyboard_horiz.txt` and `keyboard_vert.txt`, and the term 1 flag in
+  `lib/ios/window.prf`. Clicks on that term become synthetic SDL events in
+  `send_sdl_keylike_event` (`src/main-sdl2.c:5861`). That function is reused
+  by the panel.
+- Font: JuliaMono, which already has glyphs for Esc, Backspace, Space, Return,
+  Tab and arrows.
+
+### 2.2 Facts about `src/main-sdl2.c`
+
+These facts hold for Angband and FAangband. NarSil's frontend predates the
+toolkit; see section 2.5.
+
+- Widget toolkit under `src/sdl2/` (`pui-ctrl.c`, `pui-dlg.c`, `pui-misc.c`,
+  about 6,400 lines). Dialogs have a `pinned` flag (`pui-dlg.h:211`) meaning
+  never auto-remove. Each control carries a function table with `render`,
+  `handle_mouseclick`, `handle_mousemove` (`pui-ctrl.h:75`). New control types
+  are registered at runtime with `sdlpui_register_code`. Built-in controls:
+  image, label, push button, menu button, menu toggle, ranged int.
+- Compositing: `render_all` (`:877`) draws subwindows, then the status bar,
+  then dialogs. Mouse events are offered to dialogs first in
+  `handle_mousebutton` (comment "Have a menu or dialog handle the event").
+- Event loop: `get_event` (`:4591`) polls `SDL_PollEvent`; only `wait_anykey`
+  uses `SDL_WaitEvent`. `TERM_XTRA_EVENT` handling is at `:4762`.
+- Finger events are disabled at init (`:7193`), so touches arrive as mouse
+  events. `SDL_StartTextInput` is called at `:7199`.
+- Resize: `resize_window` (`:6057`) recomputes the status bar and inner rect,
+  then only clamps each subwindow with `fit_subwindow_in_window` (`:6041`).
+  Nothing re-lays out. `adjust_subwindow_geometry` (`:5689`) derives cols and
+  rows from the font glyph size. Minimums: `MIN_COLS_MAIN 80`,
+  `MIN_ROWS_MAIN 24`, others 12 by 3 (`:139`).
+- Fonts: `load_font` (`:5546`), `reload_font(subwindow, ...)` (`:5516`),
+  `make_font_cache` (`:5432`).
+- Config: `parser_reg` calls near `:7999` define `window-*` and `subwindow-*`
+  keys; value types are int, uint, sym, str (no float). `dump_config_file`
+  near `:6400` writes them back on exit.
+- There is an existing shortcut editor dialog (`SHORTCUT_EDITOR_CODE`). Check
+  it before writing a new editor for panel slots.
+- Redraw timing uses `window->next_redraw` and `SDL_GetTicks` (`:1011`).
+  There is no key-repeat machinery.
+
+### 2.3 Core command tables
+
+`src/ui-game.c` defines `cmds_all` with groups `Items`, `Action commands`,
+`Manage items`, `Information`, `Utility`, `Hidden`, plus debug groups. Each
+`struct cmd_info` has a description, a key array, and a command or hook.
+
+- Angband and FAangband: `key[2]`, index `OPT(player, rogue_like_commands)`
+  (`ui-game.c:522`).
+- NarSil: `key[4]`, index built from `angband_keyset` and roguelike options
+  (`../NarSil_fork/src/ui-game.c:520`). Mirror whatever `textui_process_key`
+  does there.
+
+Where the variants differ (this is why slots reference commands, not keys):
+
+| Command | Angband, FAangband | NarSil |
+|---|---|---|
+| Options | `=` | `O` (Sil keyset), `=` (Angband keyset) |
+| Character sheet | `C` | `@` |
+| Rest | `R` | `Z` |
+| Fire at nearest | `h`, Tab in roguelike | `m` |
+| Throw | `v` | `t` |
+| Take off | `t` | `r` |
+| Stand still | space | `z` |
+| Alter | `+` | `/` |
+| Center map | Ctrl-L | `C` |
+| Tab | fire at nearest | abilities list |
+
+NarSil-only commands: change song, toggle stealth, blow horn, smith, exchange
+places, bash door. FAangband-only: change shape, move house, time of day.
+Shift-Tab is bound to nothing in all three. Tab has no menu role in any of
+them.
+
+### 2.4 Reference implementations
+
+- **angbandroid** (`../angbandroid`), the Android port. The reusable part is
+  the core patch, not the Java:
+  - `app/src/main/cpp/curses/droid.h`, `droid.c`: the `soft_kbd_*` buffer
+    (flash, linger, clear, flush, append) and `Term_control` message kinds.
+  - `app/src/main/cpp/angband/android_changes.txt`: list of patched core
+    files. `grep -n soft_kbd_ app/src/main/cpp/angband/*.c` gives the 79 hook
+    sites.
+  - `app/src/main/cpp/angband/ui-menu.c` `keys_to_ui` (about line 780):
+    collects a menu's valid tags and flashes them.
+  - `app/src/main/cpp/angband/ui-input.c:1749` `feed_keymap`: turns a string
+    into an `inkey_next` buffer so a multi-key button behaves like a keymap.
+  - `app/src/main/cpp/common/angdroid.c` `process_special_command`: how the
+    Java side sends `macro:` strings and how they reach `feed_keymap`.
+  - Java, for UI ideas only: `ButtonRibbon.java` `setCommandMode` (default
+    ribbon string `.iUmhfvngdR+ewb,azul[]C~LM=?`), `rebuildTopFixed` (Esc,
+    Enter, Backspace become Esc, n, y in yes/no mode), `AdvKeyboard.java`
+    `createPage0`/`createPage1`, `KeyBuffer.java` `addDirection`,
+    `GameActivity.java` `setFastKeys`.
+- **pocketzot** (`../pocketzot`), a DCSS touch client:
+  - `src/game/input/control-sets.ts`: fixed chrome plus three swappable
+    tabs; slot is literal text (1 to 3 chars) or a special key token;
+    human-readable export format with `{Esc}` style tokens.
+  - `src/game/input/touch.ts`: `DPAD_LAYOUT` with plain, shifted and
+    ctrl variants per direction; `REPEAT_DELAY_MS 350`,
+    `REPEAT_INTERVAL_MS 85`; sticky Shift (tap once, double tap locks, tap
+    from lock clears), one-shot Ctrl.
+- **Brogue** (`~/Downloads/brogue.png`, iBrogueCE on iPad): the compass rose
+  model. Eight petals, four long on the cardinals and four short on the
+  diagonals, faint outline, rounded-square center with a rest glyph, lifted
+  well above the bottom edge. Bottom bar uses words, not letters. Copy the
+  image into the repo if it should outlive Downloads.
+
+### 2.5 The three variants' SDL2 frontends (checked 2026-09-08)
+
+- Angband rewrote `main-sdl2.c` around the `sdlpui` toolkit in commit
+  `d68863680` (2023-12-23, "SDL2: refactor event handling and change drawing
+  for menu items"), four months after the 4.2.5 tag (2023-08-19).
+- FAangband upstream took that rewrite. `../FAangband_fork/src/main-sdl2.c`
+  differs from this repository's copy by about 155 diff lines and has the
+  same `src/sdl2/` directory, plus an extra `SDL_uikit_main.c`. Porting to
+  FAangband is a cherry-pick.
+- NarSil upstream (`NickMcConnell/NarSil`) never took the rewrite. It has no
+  `src/sdl2/` directory, and its `main-sdl2.c` is the 4.2.5-era file, within
+  about 260 diff lines of Angband 4.2.5, with small fixes cherry-picked since,
+  mostly by Eric Branlund. It uses the older `button_bank` and `menu_panel`
+  structures. Nothing in that file is NarSil-specific.
+- The `sdl2-term-touch-keyboard` branch in `../NarSil_fork` carries the same
+  kind of changes as the other two: seven commits, about 140 lines in
+  `main-sdl2.c`, the `lib/ios/` files, `main-uikit-sdl2.c`, the CMake and
+  toolchain files. The difference between the variants is the base file, not
+  that work.
+- `../NarSil_fork` `main` is 124 commits behind upstream `main` (fetched
+  2026-09-08). None of them touch `main-sdl2.c`. NarSil upstream did pick up
+  Angband's CMake modernisation (Angband #6415 and #6420, December 2025), but
+  those edit the SDL1 and GCU macros, not `SDL2_Frontend.cmake`, so they do
+  not collide with the iOS changes.
+- Static probe of Angband's toolkit frontend (`main-sdl2.c` plus
+  `src/sdl2/*.c`) against NarSil's headers: every core header it includes
+  exists in NarSil; of about 500 functions it calls, only `is_sound_inited`
+  (`src/sound.h:87`, implemented at `src/sound-core.c:423` here) is
+  undeclared in NarSil. `angband_term`, `ANGBAND_TERM_MAX`,
+  `ANGBAND_DIR_PLATFORM`, the `graphics_modes` API, `Term_keypress`,
+  `Term_mousepress`, `KTRL`, `KC_MOD_KEYPAD`, `KC_MOD_SHIFT`,
+  `KC_MOD_CONTROL`, `inkey_next`, `PW_MAX_FLAGS` and `window_flag_desc` all
+  exist in both. Struct field differences are the one thing a probe cannot
+  see; a compile settles it.
+- Conclusion: unify NarSil's frontend with Angband's before the panel reaches
+  it, rather than writing the panel to work without the toolkit. Recipe in
+  section 7. Decision 1 stands as written.
+- Core-side divergence matters for the hooks step, not for the frontend:
+  NarSil's `ui-display.c` differs from Angband's by about 1,700 diff lines,
+  `ui-game.c` by about 400, `ui-input.c` by about 140. FAangband's differ by
+  about 100, 30 and 40.
+
+### 2.6 Build and repository state (2026-09-08, after step 0)
+
+- All three variants build for macOS today, but those are Cocoa builds
+  (`main-cocoa.m`). The panel is SDL2 code. Step 0 decided against a macOS
+  SDL2 build in favour of the iPad simulator (section 4.9): the load-bearing
+  questions are touch, HiDPI and orientation, and Homebrew's SDL2 is
+  `sdl2-compat` over SDL3 rather than the SDL2 the iOS build fetches.
+- Simulator builds work for Angband and NarSil with the existing toolchain
+  using `PLATFORM=SIMULATORARM64`. `DEPLOYMENT_TARGET` must be passed on the
+  configure command line for simulator builds: when it is undefined the
+  toolchain excludes arm64 for the simulator SDK (`ios.toolchain.cmake:194`).
+  The `set(DEPLOYMENT_TARGET ... CACHE)` line in the `if(IOS)` block of
+  `CMakeLists.txt` is dead code, because the toolchain has already stored its
+  own value as an INTERNAL cache entry by the time that line runs; the device
+  build uses the toolchain default of 18.0 whatever the line says. The
+  line has been deleted in Angband and NarSil; FAangband still has it.
+- Bugs found and fixed in this repository during step 0 (committed):
+  - `src/init.c` declared and freed `ANGBAND_DIR_PLATFORM` but never built
+    it, so it was NULL and `lib/ios/sdl2init.txt`, `window.prf` and
+    `customized_interface_options.txt` were never found. FAangband and
+    NarSil have the `BUILD_DIRECTORY_PATH` line; Angband lost it in commit
+    `4ffda767b`. The `.ipa` built from `sdl2-term-touch-keyboard` has this
+    bug: the tuned layout only appears if a copy of `sdl2init.txt` already
+    sits in the app's Documents folder.
+  - `src/cmake/macros/SDL2_Frontend.cmake` had a stray
+    `PKG_SEARCH_MODULE(SDL2 sdl2)` line inside the `FetchContent_Declare`
+    for SDL_image, also from `4ffda767b`. CMake tolerated it silently.
+    Removed.
+- Bug observed, not fixed: the status bar's Menu dropdown is open when the
+  app comes up, on every launch, in both Angband and NarSil. A tap anywhere
+  closes it. Probably a spurious mouse-down at the origin during SDL's iOS
+  startup. Look at it in step 2a when mouse routing gets attention. Not yet
+  checked on a device.
+- iPadOS 26 orientation behaviour, seen on the simulator: an app that
+  restricts itself to landscape is not rotated. With landscape-only
+  `Info.plist` orientations (NarSil today) the landscape canvas is drawn
+  scaled down and letterboxed inside the portrait screen; touches are
+  transformed correctly. With the SDL orientation hint restricting to
+  landscape at runtime (tested through the `SDL_IOS_ORIENTATIONS`
+  environment variable) the app opens as a floating, resizable window. So
+  the app must accept every orientation and lay out for whatever size it is
+  given, which is what regions do. Treat the window size as arbitrary, not
+  as one of two device sizes.
+- GitHub issues are disabled on `glangmead/angband`. Work is tracked in this
+  file.
+- Step 0 is committed on `sdl2-touch-panel` in this repository and in
+  `../NarSil_fork` (2026-09-08): the fixes above, the `Info.plist` portrait
+  change (a step 6 item done early), the workflow trigger, `gregsim.sh`,
+  and this file; in NarSil the unified frontend (section 7).
+
+## 3. Decisions (locked)
+
+1. Whole screen is SDL. Panel drawn by `main-sdl2.c` with `sdlpui`.
+2. Layout is fractional rects per orientation, resolved on start and resize.
+3. Panel = fixed chrome + five tabs, four by four.
+4. Chrome: compass rose, Escape, Enter, Backspace, Space, sticky Shift,
+   sticky Ctrl, tab strip, fast-keys strip.
+5. Rose: Brogue-style petals, cardinals larger, bottom-left, lifted 140
+   points, fixed position for now.
+6. Tabs: Act, Items, Info (seeded from `cmds_all`), Mine (user macros),
+   Keys (full keyboard).
+7. Slots reference commands by description, resolved to a key at press time
+   for the active keyset. Literal text and special-key slots also exist.
+8. Faces: words on the four themed tabs, characters on the Keys tab and in
+   the fast-keys strip.
+9. Modifier rule from pocketzot: tap once, double tap locks, tap from lock
+   clears.
+10. Repeat: 350 ms then every 85 ms, for the rose, arrows and Backspace.
+    Commands fire once.
+11. Tab and Shift-Tab are not chrome. Tab is an ordinary command that
+    seeding places per variant.
+
+## 4. Design
+
+### 4.1 Layout regions
+
+Config lines, values in per-mille of the window inner rect (below the status
+bar), because the parser has no float type:
+
+```
+region:<name>:<orient>:<x>:<y>:<w>:<h>
+```
+
+`name` is `map` (subwindow 0), `sub1` to `sub7` (subwindow index), or
+`panel`. `orient` is `portrait`, `landscape`, or `any`. If any region line
+matches the current orientation, regions win over `subwindow-full-rect`.
+
+Resolver `resolve_layout(window)`:
+
+- Called from `start_window` once the inner rect is known, and from
+  `handle_last_resize_event` instead of the clamp-only path.
+- Orientation is `w > h`.
+- For each region: set `subwindow->full_rect`, then
+  `adjust_subwindow_geometry`.
+- Map font fits: try sizes from `subwindow-font-max` down to
+  `subwindow-font-min` with `reload_font` until cols >= 80 and rows >= 24.
+  Other subterms use their fixed `subwindow-font`.
+- Panel rect is stored on the window for section 4.2.
+- `dump_config_file` writes region lines back.
+- Compute `ui_scale = renderer_output_w / window_w` once in `start_window`.
+  On iOS it is 2. Point values like the 140 point lift and 44 point minimum
+  touch targets are multiplied by it.
+
+Proposed defaults for `lib/ios/sdl2init.txt`, derived from the current tuned
+landscape file (inner rect excludes the 42 px status bar):
+
+```
+region:map:landscape:0:0:760:645
+region:sub2:landscape:0:645:380:178
+region:sub3:landscape:380:645:380:178
+region:sub4:landscape:0:823:760:177
+region:panel:landscape:760:0:240:1000
+
+region:map:portrait:0:0:1000:520
+region:sub2:portrait:0:520:500:160
+region:sub3:portrait:500:520:500:160
+region:panel:portrait:0:680:1000:320
+```
+
+Portrait on the 11 inch gives a map font around 32 point at 80 columns.
+Whether `sub4` (messages) fits in portrait is a tuning question; it can take
+a slice of the map region if wanted.
+
+### 4.2 Panel structure
+
+- One pinned `sdlpui` dialog sized to the panel region, no border, alpha from
+  a `panel-alpha` config line. Rendered by the existing dialog pass in
+  `render_all`. Mouse reaches it through the existing dialog branch in
+  `handle_mousebutton`. `get_subwindow_by_xy` must not claim the panel area.
+- Chrome, always visible:
+  - Compass rose (section 4.5) at bottom-left of the panel region, its bottom
+    edge lifted 140 points.
+  - Escape, Enter, Backspace, Space.
+  - Shift, Ctrl: sticky per decision 9. Shift affects the rose (run), letters
+    on the Keys tab, and shifted symbols. Ctrl affects the rose (alter) and
+    letters (KTRL).
+  - Tab strip with five labels.
+  - Fast-keys strip fed by the core hook (section 4.6). When the core signals
+    a yes/no prompt, the Enter and Backspace slots show `y` and `n` instead,
+    as angbandroid does.
+- Tabs: Act, Items, Info, Mine are four by four grids of word-faced buttons.
+  Keys is a denser character grid: letters layer and symbols layer toggled by
+  a button, plus arrows and F1 to F12.
+- Landscape: the panel is a column. Rose at the bottom, tabs above it.
+  Portrait: the panel is a band. Rose at the left, tabs to its right.
+- A new control type `panel_key` (label, action, repeat flag, pressed state,
+  face font) and a `panel_rose` type. Register both with
+  `sdlpui_register_code`.
+- Repeat: record press time in the control's mouse-down handler; the main
+  loop calls a `panel_tick` that re-fires held repeatable controls on the
+  350/85 ms schedule using `SDL_GetTicks`. Release or focus loss cancels.
+
+### 4.3 Slot model and `panel.txt`
+
+Per variant: shipped default `lib/customize/panel.txt`, user override
+`<user dir>/panel.txt` searched first (same lookup order as the current
+`keyboard_*.txt` files).
+
+```
+panel-version:1
+tab:Act
+row:[Rest for a while]  [Look around]  [Fire at nearest target]  [Throw an item]
+row:[Dig a tunnel]  [Alter a grid]  [Disarm a trap or lock a door]  [Open a door or a chest]
+row:[Close a door]  [Go up staircase]  [Go down staircase]  [Pick up objects]
+row:[Drop an item]  [Walk into a trap]  [Stand still]  [Repeat previous command]
+tab:Mine
+row:"za."=Zap  {}  {}  {}
+```
+
+Token grammar, whitespace separated within a `row:` line:
+
+- `[Description]`: command reference. Matched against `cmd_info.desc` across
+  the non-hidden groups. Resolved to a key for the active keyset at press
+  time. Unknown descriptions render as a disabled slot rather than failing.
+- `"text"`: literal text, one to three characters, sent through
+  `feed_keymap`.
+- `{Esc}` `{Ent}` `{BS}` `{Sp}` `{Tab}` `{Up}` `{Down}` `{Left}` `{Right}`
+  `{F1}` to `{F12}` `{^A}` to `{^Z}`: special keys.
+- `{}`: empty slot.
+- Optional `=Face` suffix overrides the face on any token.
+
+Faces: the face table in section 4.4, else the `=Face` override, else the
+first word of the description. The Keys tab and the fast-keys strip always
+show characters.
+
+### 4.4 Seeding from the command table
+
+Run once when no `panel.txt` exists in either location, and on demand from
+a menu item. Output is a complete `panel.txt` the user can edit.
+
+- Walk `cmds_all`, skip `Hidden` and debug groups, skip commands whose key is
+  zero for every keyset.
+- Group to tab: `Action commands` to Act; `Items` and `Manage items` to
+  Items; `Information` and `Utility` to Info.
+- The first 16 in table order fill the grid. The rest are written as
+  commented rows so the user can swap them in.
+- Mine starts empty. Keys is not seeded; it is fixed.
+- Face table, keyed by description, shared across variants. Initial entries:
+  Rest, Look, Fire, Throw, Tunnel, Alter, Disarm, Open, Close, Up, Down,
+  Pickup, Drop, Trap, Run, Explore, Stay, Repeat, Inven, Equip, Quiver,
+  Wield, TakeOff, Quaff, Read, Eat, Fuel, Cast, Aim, Use, Zap, Activate,
+  Browse, Study, Inscribe, Uninscr, Ignore, Examine, Map, Locate, Monsters,
+  Items, Char, Know, Feeling, Msgs, Options, Help, Symbol, Notes, Retire,
+  Save. NarSil additions: Song, Stealth, Horn, Smith, Swap, Bash, Abilities.
+  Unknown descriptions fall back to the first word.
+- Because resolution happens at press time, changing keyset options never
+  requires re-seeding.
+
+### 4.5 Compass rose
+
+- Geometry, radius R from the panel's short side: cardinal petals reach 1.0 R
+  and own a 54 degree window; diagonal petals reach 0.7 R and own a 36 degree
+  window; center is a rounded square of side 0.45 R, hit within 0.3 R.
+- Rendering: `SDL_RenderGeometry` for petal fills, or a pre-rendered texture
+  per state. Ghosted outline at low alpha; the pressed petal fills solid.
+  Center shows the face of its command.
+- Behaviour: tap steps; hold repeats; sliding while held changes the active
+  petal without lifting (SDL delivers motion during a press). Shift makes it
+  run, Ctrl makes it alter. Center runs the `Stand still` command by
+  reference. Long press on center is reserved for a run-mode toggle later.
+- Emission: send what a physical keypad sends, a digit keycode with
+  `KC_MOD_KEYPAD`, plus `KC_MOD_SHIFT` for run or `KC_MOD_CONTROL` for alter.
+  Verify in `textui_process_key` that keypad digits with those modifiers map
+  to run and alter in all three variants; otherwise fall back to the
+  variant's run and alter command prefixes.
+- Position: bottom-left of the panel region, bottom edge lifted 140 points
+  times `ui_scale`. Fixed for now; a preference later.
+
+### 4.6 Core to panel hooks
+
+Port the angbandroid patch, renamed so nothing says Android:
+
+- New `src/ui-panel.h` and `src/ui-panel.c`: the `soft_kbd_*` buffer from
+  `droid.c`, and `extern void (*ui_control_hook)(int what, const char *msg)`
+  defaulting to NULL. Message kinds: `UI_CTRL_LIST_KEYS` with a key string or
+  `${clear}`, and tokens `${yes_no}`, `${quant}`, `${fkeys}`, plus a new
+  `${text}` emitted by `askfor_aux` so the panel can switch to the Keys tab
+  during string entry.
+- Hook sites: follow `grep -n soft_kbd_ ../angbandroid/app/src/main/cpp/angband/*.c`.
+  The important ones: `inkey_ex` flushes right before blocking and clears
+  after a key; `get_check` flashes `${yes_no}`; `get_char` flashes its
+  options; `get_quantity` lingers `${quant}*`; `ui-menu.c` gets
+  `keys_to_ui`; targeting lingers `t*+-rpogmkq?`; birth, knowledge, options,
+  player sheet, monster list and command menus flash their keys.
+- Frontend implementation of the hook: update the fast-keys strip (up to
+  twelve character buttons; longer lists fill the top rows of the Keys tab and
+  switch to it), relabel Enter and Backspace for `${yes_no}`, switch to Keys
+  for `${text}`, restore on `${clear}`.
+- Desktop builds without the panel leave the pointer NULL and compile
+  unchanged.
+
+### 4.7 Panel to core input path
+
+- Special keys and single characters: `send_sdl_keylike_event`, extended to
+  carry modifiers.
+- Command references: resolve, then the same path.
+- Literal multi-character text: port `feed_keymap` from angbandroid
+  `ui-input.c:1749`, then push one harmless event so the poll loop wakes.
+  This preserves the core's more-prompt handling for keymaps.
+- Rose: keypad digit events with modifiers, per section 4.5.
+
+### 4.8 iOS specifics
+
+- Call `SDL_SetHint(SDL_HINT_ENABLE_SCREEN_KEYBOARD, "0")` before
+  `SDL_StartTextInput` at `:7199` on iOS, or UIKit shows the system keyboard.
+- Remove the `PW_TOUCH_KEYBOARD` hack listed in section 2.1 once the panel
+  can play a full turn. Term 1 becomes free for messages.
+- Replace the pixel rects in `lib/ios/sdl2init.txt` with region lines.
+- `os/ios/Info.plist`: allow both orientations on iPad.
+- Minimum touch target 44 points times `ui_scale`.
+
+### 4.9 Simulator development loop
+
+Decided in step 0: no macOS SDL2 build. The panel is developed on the iPad
+simulator, where touches arrive as mouse events exactly as on the device.
+
+- Device: iPad Pro 11-inch (M5), iOS 26.5, udid
+  `1EF4F5CD-E295-4DB7-9427-00B9B0A3913C`; a 13-inch M5 on the same runtime
+  exists for the second size. Screen is 1668 by 2420 pixels, 834 by 1210
+  points, scale 2.
+- `./gregsim.sh` in each repository configures (first run), builds, installs
+  and launches; `./gregsim.sh shot out.png` screenshots. It reads the app
+  name from `CMakeLists.txt` and reuses the SDL sources already fetched into
+  `../angband/build/_deps`. Configure takes about four minutes the first
+  time (SDL's feature checks); an incremental rebuild after a one-file change
+  takes well under a minute.
+- Input from the command line: `idb ui tap X Y --udid ...` in points, and
+  `idb ui key <HID code>` for hardware keys (Return 40, Escape 41, Right 79,
+  Left 80, Down 81, Up 82). Both reach the game; a turn was played this way
+  in both variants. `idb ui text` types strings.
+- Rotation: `simctl` cannot rotate. `./gregsim.sh rotate` clicks the
+  Simulator's Device menu through System Events, which needs Accessibility
+  permission for the process running the script. claude.app has it as of
+  2026-09-08 and the click works. Once, a `simctl io screenshot` issued right
+  after a rotation hung until killed, so wait a few seconds after rotating.
+- Console: `xcrun simctl launch --console` streams stdout and stderr. The
+  frontend is silent about config loading, so add a `plog` when debugging
+  paths.
+- A `panel` config line still makes sense so the panel can be turned off;
+  the desktop-only toggle from the first draft is no longer needed.
+
+## 5. Implementation steps
+
+Rewritten 2026-09-08 (evening) as a checklist. Legend for each box:
+
+- `code`: implementation, exercised on the simulator with `idb` before
+  hand-off.
+- `you decide`: a question only you can answer; items after it that depend
+  on the answer wait for it.
+- `you test`: a check by hand, on the simulator or the device.
+- `commit`: a landing point.
+
+Tick boxes in place. When something surprising happens, add a dated line
+under the step rather than editing history. Each step still ends in a state
+that runs on the simulator. Step numbers match the rest of this file.
+
+**Status 2026-09-08:** step 0 done and committed in Angband and NarSil, except
+the optional device test; step 1 not started.
+
+### Step 0. Prerequisites
+
+- [x] code: branch `sdl2-touch-panel` in this repository and `../NarSil_fork`.
+- [x] code: simulator configure and build for Angband; `gregsim.sh`.
+- [x] code: `init.c` `ANGBAND_DIR_PLATFORM` fix; stray cmake line removed.
+- [x] code: NarSil frontend unified (section 7); simulator build.
+- [x] test: a turn played in both from `idb` taps and keys.
+- [x] you decide: delete the dead `DEPLOYMENT_TARGET` line in
+      `CMakeLists.txt`, or leave it. Deleted, in Angband and NarSil.
+- [x] you decide: grant Accessibility permission to the terminal so scripts
+      can rotate the simulator, or rotate by hand for the rest of the
+      project. Granted to claude.app; scripted rotation works (section 4.9).
+- [x] you test: run `./gregsim.sh` in both repositories from your own shell
+      once, so the loop is known to work outside this session (idb
+      companion, simulator boot). Both built and launched.
+- [x] commit (angband): `init.c` and cmake macro fixes; `gregsim.sh` and
+      this file; `Info.plist` orientations. The dead `DEPLOYMENT_TARGET`
+      line went with the cmake fixes.
+- [x] commit (NarSil): the unification as one commit.
+- [x] code: point `.github/workflows/ios.yaml` at `sdl2-touch-panel` (it
+      still triggers on `sdl2-term-touch-keyboard`), or add the branch.
+      Added in Angband and NarSil; FAangband when it gets the branch.
+- [ ] you test (device; optional now, required before step 6): install the
+      fixed Angband build on the iPad; confirm the tuned layout appears on
+      a clean install; note whether the Menu dropdown is open at launch on
+      hardware.
+
+### Step 1. Regions
+
+- [ ] code: `region:<name>:<orient>:<x>:<y>:<w>:<h>` parser line
+      (per-mille), stored on the window config as a small array; unknown
+      names rejected with a parse error like the other keys. Done when a
+      file with region lines loads without complaint and nothing else
+      changes.
+- [ ] code: `resolve_layout(window)`: pick the regions for the current
+      orientation (`w > h`), set each named subwindow's `full_rect`, call
+      `adjust_subwindow_geometry`, store the panel rect. Called from
+      `start_window` and from `handle_last_resize_event` in place of the
+      clamp-only path. Subwindows with no region keep today's behaviour.
+      While there, fix the `|` that should be `&` on the HiDPI check in
+      `handle_last_resize_event`. Done when a portrait launch shows a
+      portrait layout.
+- [ ] code: map font fit: new `subwindow-font-max` and `subwindow-font-min`
+      keys; try sizes downward with `reload_font` until cols >= 80 and rows
+      >= 24. Done when the portrait map is 80 by 24 at the largest size that
+      fits and landscape is unchanged.
+- [ ] code: `dump_config_file` writes region lines and the font range back;
+      a relaunch reproduces the layout.
+- [ ] code: `ui_scale` computed once in `start_window`.
+- [ ] code: `lib/ios/sdl2init.txt` for Angband rewritten with the section
+      4.1 region defaults, keeping the keyboard term as `sub1` for now so
+      the game stays playable by touch until step 6.
+- [ ] you decide: the portrait split. Does `sub4` (messages) get a slice of
+      the map region? What fraction goes to the panel band? Two candidate
+      files can be prepared for you to compare on the simulator.
+- [ ] you test (simulator): rotate by hand while the game runs; both
+      orientations re-lay out without a restart; the keyboard term is
+      visible in both; the map never drops below 80 by 24. Also try the
+      iPadOS 26 floating window if the simulator offers it, and resize it.
+- [ ] you test (device): the same on the iPad, plus HiDPI crispness and
+      that a hardware keyboard still works after a rotation.
+- [ ] commit (angband).
+- [ ] code: cherry-pick to `../NarSil_fork` and `../FAangband_fork`; NarSil
+      `sdl2init.txt` gets its own region file with the 54 px status bar.
+- [ ] you test: NarSil on the simulator in both orientations.
+- [ ] commit (NarSil, FAangband).
+
+### Step 2. Panel scaffold
+
+2a. Chrome keys.
+
+- [ ] code: `panel` config line (`panel:on` or `off`) and the panel region
+      reserved: `get_subwindow_by_xy` ignores it; a pinned, borderless
+      `sdlpui` dialog is created over it with `panel-alpha`. Done when a
+      translucent rectangle sits where the panel goes and taps on it do not
+      reach the term underneath.
+- [ ] code: `panel_key` control type registered with
+      `sdlpui_register_code`: label, action, pressed state, face font.
+      Chrome keys Escape, Enter, Backspace, Space and the four arrows, sent
+      through `send_sdl_keylike_event` extended with modifiers. Done when,
+      on the simulator via `idb`, Escape closes the command menu and the
+      arrows move the character.
+- [ ] you test (device): tap targets. Are 44 points times `ui_scale` big
+      enough for you? Does anything need to move away from the screen edge?
+- [ ] code: fix the Menu-open-at-launch bug (section 2.6) if it turns out
+      to live in mouse routing; otherwise record where it does live.
+- [ ] commit.
+
+2b. Tabs and modifiers.
+
+- [ ] you decide: the Keys tab layout. Reuse the rows from
+      `lib/help/keyboard_horiz.txt` as the letters and symbols layers, or a
+      fresh grid? Where do F1 to F12 go?
+- [ ] code: tab strip with five labels; only Keys populated: letters layer,
+      symbols layer, a layer toggle, arrows, F-keys.
+- [ ] code: sticky Shift and Ctrl per decision 9, with a visible state
+      (off, one-shot, locked). Shift affects letters and shifted symbols;
+      Ctrl produces KTRL codes.
+- [ ] you test (simulator): the modifier feel: tap once, double tap locks,
+      tap from lock clears. Does the one-shot state read clearly?
+- [ ] commit.
+
+2c. Repeat.
+
+- [ ] code: press time recorded in the control's mouse-down; `panel_tick`
+      from the main loop re-fires held repeatable controls at 350 ms then
+      every 85 ms; release, focus loss and app background cancel.
+- [ ] you test (device): hold an arrow; hold Backspace in a name prompt.
+      Are 350 and 85 right for you?
+- [ ] test: a full turn from the panel with `idb` taps only, then by you by
+      hand on the simulator.
+- [ ] commit.
+
+### Step 3. Core hooks
+
+- [ ] code: `src/ui-panel.h` and `.c`: the buffer from angbandroid's
+      `droid.c`, `ui_control_hook` defaulting to NULL, and a stderr
+      consumer enabled by a `-m` subopt or environment variable. Done when
+      both variants build with the hook unset and behave exactly as before.
+- [ ] code: hook sites in `ui-input.c` (`inkey_ex` flush and clear,
+      `get_check`, `get_char`, `get_quantity`, `askfor_aux` `${text}`) and
+      `ui-menu.c` `keys_to_ui`. Done when stderr shows the expected strings
+      at an inventory prompt, a yes/no prompt and a text prompt.
+- [ ] code: remaining sites: targeting, birth, knowledge, options, player
+      sheet, monster list, command menus.
+- [ ] code: frontend consumer: fast-keys strip up to twelve, overflow fills
+      the Keys tab and switches to it, Enter and Backspace relabel for
+      `${yes_no}`, `${text}` switches to Keys, `${clear}` restores.
+- [ ] you decide: when the core offers more than twelve keys, is switching
+      to the Keys tab the right behaviour, or should the strip scroll?
+- [ ] you test (simulator): inventory letters appear at an item prompt; y
+      and n at a confirmation; the Keys tab appears at the name prompt.
+- [ ] commit (angband).
+- [ ] code: hand-merge the core side into `../NarSil_fork` (its `ui-*.c`
+      differ; section 2.5). Cherry-pick into FAangband.
+- [ ] you test: the same three prompts in NarSil.
+- [ ] commit.
+
+### Step 4. Slots and seeding
+
+- [ ] code: `panel.txt` parser for the token grammar in section 4.3; user
+      dir searched before `lib/customize`; unknown descriptions become
+      disabled slots.
+- [ ] code: command references resolved at press time against `cmds_all`
+      for the active keyset (Angband `key[2]`; NarSil `key[4]` with its
+      index).
+- [ ] code: seeder from `cmds_all` with the section 4.4 group-to-tab rules,
+      the face table, commented overflow rows, and a menu item to
+      regenerate.
+- [ ] code: word faces rendered on Act, Items and Info; Mine empty.
+- [ ] you decide: review the generated Angband `panel.txt`. Which sixteen
+      go on each tab, in what order, and which face words read badly?
+      Whether to mine the Android thread (section 8) before settling this.
+- [ ] you test (simulator): toggle roguelike keys in the options and
+      confirm the same slot now sends the roguelike key without editing the
+      file.
+- [ ] commit (angband); cherry-pick to FAangband.
+- [ ] code: NarSil seeding and the four keyset combinations.
+- [ ] you test: NarSil under all four keyset combinations.
+- [ ] commit.
+
+### Step 5. Compass rose
+
+- [ ] code: check `textui_process_key` in all three variants for keypad
+      digits with Shift and Ctrl mapping to run and alter. Report; choose
+      keypad emission or command prefixes.
+- [ ] code: `panel_rose` control: geometry from section 4.5, hit test,
+      `SDL_RenderGeometry` petals with a ghost outline and a solid pressed
+      petal, center face.
+- [ ] code: behaviour: tap steps, hold repeats, slide while held changes
+      petal, Shift runs, Ctrl alters, center is `Stand still` by reference.
+- [ ] you decide: after seeing it, the rose radius, the 140 point lift, and
+      bottom-left versus a right-hand mirror. Whether center long-press
+      should do anything yet.
+- [ ] you test (device): walk, run, alter, stay; sliding; that a finger
+      resting on the rose does not fire twice.
+- [ ] commit; cherry-pick to the other two.
+
+### Step 6. iOS
+
+- [ ] code: `SDL_SetHint(SDL_HINT_ENABLE_SCREEN_KEYBOARD, "0")` before
+      `SDL_StartTextInput`.
+- [ ] you test (simulator, then device): the system keyboard never
+      appears, including at the character name prompt; a hardware keyboard
+      still types.
+- [ ] code: remove the `PW_TOUCH_KEYBOARD` hack (files in section 2.1) in
+      Angband and NarSil; term 1 becomes messages; region files updated.
+- [ ] code: NarSil `Info.plist` orientations.
+- [ ] code: the Menu-open-at-launch bug, if still open.
+- [ ] you test (device): both orientations, a session from launch to the
+      first dungeon level using only the panel, rotation mid-game.
+- [ ] you decide: publish a new `.ipa` from `sdl2-touch-panel` for
+      downloaders now, or wait for step 7.
+- [ ] commit; cherry-pick to FAangband and NarSil; workflow triggers.
+
+### Step 7. Editing and persistence
+
+- [ ] code: report on reusing the shortcut editor dialog
+      (`SHORTCUT_EDITOR_CODE`) for slots.
+- [ ] you decide: reuse it, write a small slot editor, or ship version 1
+      with `panel.txt` editing only.
+- [ ] code: long press on a slot opens the chosen editor; edits persist to
+      the user `panel.txt`.
+- [ ] you test (device): edit a slot; relaunch; the edit survives; the file
+      is readable in the Files app.
+- [ ] commit; cherry-pick to the other two.
+
+### Step 8. Port and publish
+
+- [ ] code: FAangband caught up at each milestone above (after steps 1, 6
+      and 7); NarSil at the same points, with hand-merges only for step 3.
+- [ ] you test: one device session in each of the three.
+- [ ] you decide: which of the three get published `.ipa` artifacts, and
+      whether to open an upstream conversation about the panel.
+
+## 6. Verification checklist
+
+- Regions: portrait and landscape on 11 inch and 13 inch iPad sizes, at 2x,
+  yield map >= 80 by 24 and no overlapping rects.
+- Seeding: output for each variant matches the table in section 2.3, and
+  NarSil resolves correctly under all four keyset combinations.
+- Hooks: no change in behaviour for desktop builds with the hook unset.
+- Input: `feed_keymap` text honours more-prompt skipping the same way a
+  pref-file keymap does.
+- Rose: repeat cancels on release and on focus loss; slide changes direction.
+- iOS: system keyboard never appears; hardware keyboard still works through
+  SDL; rotation re-lays out without a restart.
+- Step 0: NarSil with the unified frontend plays a turn on the simulator
+  (done 2026-09-08) and on the iPad (pending) before any panel commit
+  reaches it.
+
+## 7. Porting notes for the other two variants
+
+- FAangband: identical frontend and term code (section 2.5); three extra
+  commands.
+- NarSil, frontend unification: done in step 0 and committed in
+  `../NarSil_fork`. What was done: copied `src/main-sdl2.c` and `src/sdl2/`
+  from this repository; listed the three toolkit sources in `CMakeLists.txt`
+  and `src/Makefile.src`; added `is_sound_inited` to `sound.h` and
+  `sound-core.c` (Angband's is at `src/sound-core.c:423`). Compiled without
+  any other change. The old NarSil copy had a few cosmetic settings that were
+  not carried over and can be re-applied if missed: `TTF_HINTING_LIGHT_SUBPIXEL`,
+  default font `LiterationMonoNerdFontMono-Regular.ttf` (moot while
+  `lib/ios/sdl2init.txt` names JuliaMono), `COLOUR_SLATE` for the status
+  bar, `DEFAULT_WINDOW_MINIMUM_W/H` set to `MIN_COLS_MAIN` and
+  `MIN_ROWS_MAIN`, a relaxed `assert(y >= -2)` in the menu handler, and a
+  "button disabled" `plog`. NarSil's `Info.plist` is still landscape-only and
+  needs the same orientation change as Angband's (section 2.6).
+- NarSil, after unification: `key[4]` and the keyset index at
+  `ui-game.c:520`; `Z` rests, Tab opens abilities, extra commands listed in
+  section 2.3. `angband_keyset` is set to `no` in
+  `lib/ios/customized_interface_options.txt`. The core hooks (step 3) will
+  need hand-merging because `ui-display.c`, `ui-game.c` and `ui-input.c`
+  differ substantially from Angband's.
+
+## 8. Later and open items
+
+- Rose lift as a preference, and a right-hand mirror.
+- Hold-to-run toggle on the center petal.
+- Icons for faces via an icon font; angbandroid ships `ui-cmd.ttf` in
+  `app/src/main/assets`, licence in `ui-cmd-README.md` there.
+- Upstreaming the panel to `angband/angband`; the SDL2 frontend maintainer
+  may accept a touch panel, and FAangband and NarSil both track that file.
+- Mining the angband.live "Angband for Android" thread (18 pages) for the
+  most requested buttons before finalising tab defaults.
+- Haptics through a small Objective-C shim if wanted. VoiceOver is out of
+  scope for an SDL-drawn panel.
+- Section 5 is now a checklist. Still open: whether to copy this file into
+  the other two repositories at first port, each with its own status block.
+  This repository would stay canonical.
+- Rebasing `../NarSil_fork` `main` onto upstream, 124 commits behind as of
+  2026-09-08. Nothing there touches `main-sdl2.c`.
+- The Menu dropdown open at launch (section 2.6).
