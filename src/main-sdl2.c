@@ -626,6 +626,7 @@ static void end_panel_drag(struct my_app *a);
 static struct sdlpui_dialog *panel_piece_at(const struct sdlpui_window *window,
 		int x, int y);
 static void render_panel_home(struct sdlpui_window *window);
+static void print_error(const char *name, struct parser *parser);
 static void push_key_event(struct sdlpui_window *window, SDL_Keycode sym,
 		Uint16 mod);
 static void push_text_event(struct sdlpui_window *window, const char *utf8);
@@ -6228,7 +6229,7 @@ static void push_term_keypress(keycode_t code, uint8_t mods)
 #define PANEL_GRID_CELLS (PANEL_GRID_COLS * PANEL_GRID_ROWS)
 #define PANEL_LAYERS 3
 #define PANEL_MAX_KEYS (PANEL_CHROME_COLS * PANEL_CHROME_ROWS + PANEL_TABS \
-	+ PANEL_LAYERS * PANEL_GRID_CELLS)
+	+ (PANEL_TAB_KEYS + PANEL_LAYERS) * PANEL_GRID_CELLS)
 /* a second tap on a modifier within this many ms locks it */
 #define PANEL_DOUBLE_TAP_MS 400
 /* a held key re-fires after this delay, then at this interval (ms) */
@@ -6279,11 +6280,16 @@ enum panel_key_kind {
 	PANEL_KEY_LAYER		/* selects a Keys layer; value is the layer */
 };
 
-/* Where a key lives; a layer group is PANEL_GROUP_LAYER0 + the layer. */
+/*
+ * Where a key lives: the chrome, the tab strip, a slot tab's grid
+ * (PANEL_GROUP_TAB0 + the tab) or a Keys layer (PANEL_GROUP_LAYER0 + the
+ * layer).
+ */
 enum panel_group {
 	PANEL_GROUP_CHROME,
 	PANEL_GROUP_TABS,
-	PANEL_GROUP_LAYER0
+	PANEL_GROUP_TAB0,
+	PANEL_GROUP_LAYER0 = PANEL_GROUP_TAB0 + PANEL_TAB_KEYS
 };
 
 enum panel_modifier {
@@ -6296,6 +6302,35 @@ enum panel_mod_state {
 	PANEL_MOD_OFF,
 	PANEL_MOD_ONESHOT,
 	PANEL_MOD_LOCKED
+};
+
+/*
+ * One cell of a slot tab, as panel.txt gives it (section 4.3 of
+ * TOUCH_PANEL_PLAN.md): a command named by its description, literal text,
+ * a special key, or nothing.
+ */
+enum panel_slot_kind {
+	PANEL_SLOT_EMPTY,
+	PANEL_SLOT_COMMAND,
+	PANEL_SLOT_TEXT,
+	PANEL_SLOT_KEY
+};
+
+struct panel_slot {
+	enum panel_slot_kind kind;
+	/* the description a command reference names; NULL otherwise */
+	char *desc;
+	/*
+	 * The face to show.  A command's is left NULL so that it can come
+	 * from the shared table at build time; an "=Face" suffix fills this
+	 * in for any kind and wins.
+	 */
+	char *face;
+	/* what the slot sends: text, or sym with mod */
+	char text[8];
+	SDL_Keycode sym;
+	Uint16 mod;
+	bool repeat;
 };
 
 struct panel_key {
@@ -6312,6 +6347,11 @@ struct panel_key {
 	SDL_Keycode sym;
 	Uint16 mod;
 	char text[8];
+	/*
+	 * The command a slot refers to, whose key is looked up for the
+	 * active keyset when the slot is pressed; NULL for every other key.
+	 */
+	const struct cmd_info *cmd;
 	/* re-fires while held */
 	bool repeat;
 	bool armed;
@@ -6341,6 +6381,8 @@ struct panel_shared {
 	struct sdlpui_dialog *pieces[PANEL_PIECE_COUNT];
 	int cur_tab;
 	int cur_layer;
+	/* the slot tabs' grids, from panel.txt; see load_panel_slots() */
+	struct panel_slot slots[PANEL_TAB_KEYS][PANEL_GRID_CELLS];
 	enum panel_mod_state mod_state[PANEL_MOD_COUNT];
 	Uint32 mod_tap_time[PANEL_MOD_COUNT];
 	/* the repeating control being held, if any, its piece, and when it next fires */
@@ -6386,8 +6428,10 @@ static bool panel_key_visible(const struct panel_shared *ps,
 	if (pk->group == PANEL_GROUP_CHROME || pk->group == PANEL_GROUP_TABS) {
 		return true;
 	}
-	return ps->cur_tab == PANEL_TAB_KEYS
-		&& pk->group == PANEL_GROUP_LAYER0 + ps->cur_layer;
+	if (ps->cur_tab < PANEL_TAB_KEYS) {
+		return pk->group == PANEL_GROUP_TAB0 + ps->cur_tab;
+	}
+	return pk->group == PANEL_GROUP_LAYER0 + ps->cur_layer;
 }
 
 /* A single ASCII letter, which Shift and Ctrl act on */
@@ -6891,11 +6935,392 @@ static int add_panel_chars(struct panel_piece *pp, int layer, int cell,
 	return cell;
 }
 
+/* --- panel.txt, the slot tabs' contents --- */
+
+/*
+ * The slot tabs are filled from panel.txt, read with the same parser the
+ * frontend's own config file uses.  Section 4.3 of TOUCH_PANEL_PLAN.md
+ * has the grammar: "tab:Name" starts a tab and each "row:" line after it
+ * fills that tab's next row of cells from whitespace separated tokens.  A
+ * token is [a command's description], "literal text", {a special key}, or
+ * {} for an empty cell, and any of them may carry an "=Face" suffix
+ * naming the word to show.
+ *
+ * The user's copy is read if there is one, else the shipped one, the
+ * order the game's own customizable files use.
+ */
+#define PANEL_SLOT_FILE "panel.txt"
+#define PANEL_SLOT_VERSION 1
+
+/* The slot tabs, in tab-strip order; the Keys tab is fixed and not one */
+static const char *panel_tab_names[PANEL_TAB_KEYS] = {
+	"Act", "Items", "Info", "Mine"
+};
+
+/* The keys a {Name} token can name, besides {F1}..{F12} and {^A}..{^Z} */
+static const struct {
+	const char *name;
+	SDL_Keycode sym;
+	const char *face;
+	bool repeat;
+} panel_slot_keys[] = {
+	{ "Esc",   SDLK_ESCAPE,    "Esc",   false },
+	{ "Ent",   SDLK_RETURN,    "Enter", false },
+	{ "BS",    SDLK_BACKSPACE, "⌫", true  },
+	{ "Tab",   SDLK_TAB,       "⇥", false },
+	{ "Up",    SDLK_UP,        "↑", true  },
+	{ "Down",  SDLK_DOWN,      "↓", true  },
+	{ "Left",  SDLK_LEFT,      "←", true  },
+	{ "Right", SDLK_RIGHT,     "→", true  }
+};
+
+/* Is this one of the debug groups of cmds_all, which slots never name? */
+static bool panel_group_is_debug(const char *name)
+{
+	return streq(name, "Debug") || prefix(name, "Dbg");
+}
+
+/*
+ * The command a [Description] token names, or NULL.  Every group but the
+ * debug ones is searched, "Hidden" included: the seeder skips that group
+ * (section 4.4), but a hand-written slot may well name Stand still or
+ * Alter a grid, which live there.
+ */
+static const struct cmd_info *find_panel_command(const char *desc)
+{
+	int i;
+
+	for (i = 0; cmds_all[i].name; i++) {
+		size_t j;
+
+		if (panel_group_is_debug(cmds_all[i].name)) {
+			continue;
+		}
+		for (j = 0; j < cmds_all[i].len; j++) {
+			if (streq(cmds_all[i].list[j].desc, desc)) {
+				return &cmds_all[i].list[j];
+			}
+		}
+	}
+	return NULL;
+}
+
+/* Fill a slot from a {Name} token's body; false if the name is not one. */
+static bool set_panel_slot_key(struct panel_slot *slot, const char *name)
+{
+	char face[8];
+	size_t i;
+	int n;
+
+	for (i = 0; i < N_ELEMENTS(panel_slot_keys); i++) {
+		if (my_stricmp(name, panel_slot_keys[i].name)) {
+			continue;
+		}
+		slot->kind = PANEL_SLOT_KEY;
+		slot->sym = panel_slot_keys[i].sym;
+		slot->face = string_make(panel_slot_keys[i].face);
+		slot->repeat = panel_slot_keys[i].repeat;
+		return true;
+	}
+	/* Space is text, so that it reaches the core as a typed space. */
+	if (!my_stricmp(name, "Sp")) {
+		slot->kind = PANEL_SLOT_TEXT;
+		my_strcpy(slot->text, " ", sizeof(slot->text));
+		slot->face = string_make("Space");
+		return true;
+	}
+	if ((name[0] == 'F' || name[0] == 'f') && sscanf(name + 1, "%d", &n) == 1
+			&& n >= 1 && n <= 12) {
+		slot->kind = PANEL_SLOT_KEY;
+		slot->sym = SDLK_F1 + (n - 1);
+		strnfmt(face, sizeof(face), "F%d", n);
+		slot->face = string_make(face);
+		return true;
+	}
+	if (name[0] == '^' && isalpha((unsigned char) name[1]) && !name[2]) {
+		slot->kind = PANEL_SLOT_KEY;
+		slot->sym = SDLK_a + (tolower((unsigned char) name[1]) - 'a');
+		slot->mod = KMOD_LCTRL;
+		strnfmt(face, sizeof(face), "^%c",
+			toupper((unsigned char) name[1]));
+		slot->face = string_make(face);
+		return true;
+	}
+	return false;
+}
+
+/* What the parser needs between lines: where the next row goes */
+struct panel_slot_parser {
+	struct panel_shared *ps;
+	/* the tab the last tab: line named, or -1 before any of them */
+	int tab;
+	int row;
+};
+
+/*
+ * Read one token of a row: line into slot, leaving *pp on the rest of the
+ * line.  An unknown {Name} costs its cell, not the file, because the set
+ * of special keys may grow; an unclosed token is an error, because there
+ * is then no telling where the next one begins.
+ */
+static enum parser_error parse_panel_token(const char **pp,
+		struct panel_slot *slot)
+{
+	const char *p = *pp;
+	const char *end;
+	char body[128];
+	char open = *p;
+	size_t n;
+
+	switch (open) {
+		case '[': end = strchr(p + 1, ']'); break;
+		case '"': end = strchr(p + 1, '"'); break;
+		case '{': end = strchr(p + 1, '}'); break;
+		default: return PARSE_ERROR_UNRECOGNISED_PARAMETER;
+	}
+	if (!end) {
+		return PARSE_ERROR_MISSING_FIELD;
+	}
+	n = (size_t)(end - p - 1);
+	if (n >= sizeof(body)) {
+		return PARSE_ERROR_FIELD_TOO_LONG;
+	}
+	my_strcpy(body, p + 1, n + 1);
+
+	if (open == '[') {
+		slot->kind = PANEL_SLOT_COMMAND;
+		slot->desc = string_make(body);
+	} else if (open == '"') {
+		if (body[0]) {
+			slot->kind = PANEL_SLOT_TEXT;
+			my_strcpy(slot->text, body, sizeof(slot->text));
+		}
+	} else if (body[0] && !set_panel_slot_key(slot, body)) {
+		SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+			"%s: no such key as {%s}; the slot is left empty",
+			PANEL_SLOT_FILE, body);
+	}
+
+	/* An =Face suffix, running to the next space, overrides the face. */
+	p = end + 1;
+	if (*p == '=') {
+		const char *face = ++p;
+
+		while (*p && !isspace((unsigned char) *p)) {
+			p++;
+		}
+		if (p > face) {
+			string_free(slot->face);
+			slot->face = string_make(format("%.*s",
+				(int)(p - face), face));
+		}
+	}
+	*pp = p;
+	return PARSE_ERROR_NONE;
+}
+
+static enum parser_error config_panel_version(struct parser *parser)
+{
+	return (parser_getuint(parser, "version") == PANEL_SLOT_VERSION) ?
+		PARSE_ERROR_NONE : PARSE_ERROR_OBSOLETE_FILE;
+}
+
+static enum parser_error config_panel_tab(struct parser *parser)
+{
+	struct panel_slot_parser *sp = parser_priv(parser);
+	const char *name = parser_getstr(parser, "name");
+	int i;
+
+	for (i = 0; i < PANEL_TAB_KEYS; i++) {
+		if (!my_stricmp(name, panel_tab_names[i])) {
+			sp->tab = i;
+			sp->row = 0;
+			return PARSE_ERROR_NONE;
+		}
+	}
+
+	return PARSE_ERROR_INVALID_VALUE;
+}
+
+static enum parser_error config_panel_row(struct parser *parser)
+{
+	struct panel_slot_parser *sp = parser_priv(parser);
+	const char *p = parser_getstr(parser, "slots");
+	int col = 0;
+
+	if (sp->tab < 0) {
+		return PARSE_ERROR_MISSING_RECORD_HEADER;
+	}
+	if (sp->row >= PANEL_GRID_ROWS) {
+		return PARSE_ERROR_TOO_MANY_ENTRIES;
+	}
+	while (true) {
+		enum parser_error error;
+
+		while (*p && isspace((unsigned char) *p)) {
+			p++;
+		}
+		if (!*p) {
+			break;
+		}
+		if (col >= PANEL_GRID_COLS) {
+			return PARSE_ERROR_TOO_MANY_ENTRIES;
+		}
+		error = parse_panel_token(&p, &sp->ps->slots[sp->tab][
+			sp->row * PANEL_GRID_COLS + col]);
+		if (error != PARSE_ERROR_NONE) {
+			return error;
+		}
+		col++;
+	}
+	sp->row++;
+
+	return PARSE_ERROR_NONE;
+}
+
+static struct parser *init_parse_panel(struct panel_shared *ps)
+{
+	struct parser *parser = parser_new();
+	struct panel_slot_parser *sp = mem_zalloc(sizeof(*sp));
+
+	sp->ps = ps;
+	sp->tab = -1;
+	parser_setpriv(parser, sp);
+
+	parser_reg(parser, "panel-version uint version", config_panel_version);
+	parser_reg(parser, "tab str name", config_panel_tab);
+	parser_reg(parser, "row str slots", config_panel_row);
+
+	return parser;
+}
+
+/*
+ * Read the slots.  With no panel.txt in either place the slot tabs are
+ * simply empty; the seeder (section 4.4) is what puts one there.
+ */
+static void load_panel_slots(struct panel_shared *ps)
+{
+	char path[1024];
+	char line[1024];
+	ang_file *f;
+	struct parser *parser;
+
+	path_build(path, sizeof(path), ANGBAND_DIR_USER, PANEL_SLOT_FILE);
+	if (!file_exists(path)) {
+		path_build(path, sizeof(path), ANGBAND_DIR_CUSTOMIZE,
+			PANEL_SLOT_FILE);
+	}
+	f = file_open(path, MODE_READ, FTYPE_TEXT);
+	if (!f) {
+		SDL_Log("no %s to read; the slot tabs are empty",
+			PANEL_SLOT_FILE);
+		return;
+	}
+	SDL_Log("reading panel slots from %s", path);
+
+	parser = init_parse_panel(ps);
+	while (file_getl(f, line, sizeof(line))) {
+		if (parser_parse(parser, line) != PARSE_ERROR_NONE) {
+			print_error(path, parser);
+			break;
+		}
+	}
+	mem_free(parser_priv(parser));
+	parser_destroy(parser);
+	file_close(f);
+}
+
+static void free_panel_slots(struct panel_shared *ps)
+{
+	int tab, cell;
+
+	for (tab = 0; tab < PANEL_TAB_KEYS; tab++) {
+		for (cell = 0; cell < PANEL_GRID_CELLS; cell++) {
+			struct panel_slot *slot = &ps->slots[tab][cell];
+
+			string_free(slot->desc);
+			string_free(slot->face);
+			slot->desc = NULL;
+			slot->face = NULL;
+		}
+	}
+}
+
+/*
+ * The face a slot shows: its =Face override, else, for a command, the
+ * first word of its description.
+ */
+static void get_panel_slot_face(const struct panel_slot *slot, char *buf,
+		size_t len)
+{
+	const char *p;
+
+	if (slot->face) {
+		my_strcpy(buf, slot->face, len);
+		return;
+	}
+	if (slot->kind != PANEL_SLOT_COMMAND) {
+		my_strcpy(buf, slot->text, len);
+		return;
+	}
+	for (p = slot->desc; *p && !isspace((unsigned char) *p); p++) {
+		/* the first word of the description */
+	}
+	my_strcpy(buf, slot->desc, MIN(len, (size_t)(p - slot->desc) + 1));
+}
+
+/* Add the key a slot asks for; an empty slot leaves its cell bare. */
+static void add_panel_slot(struct panel_piece *pp, int tab, int cell,
+		const struct panel_slot *slot)
+{
+	int group = PANEL_GROUP_TAB0 + tab;
+	struct sdlpui_control *c;
+	struct panel_key *pk;
+	char face[64];
+
+	if (slot->kind == PANEL_SLOT_EMPTY) {
+		return;
+	}
+	get_panel_slot_face(slot, face, sizeof(face));
+
+	switch (slot->kind) {
+		case PANEL_SLOT_COMMAND:
+			c = add_panel_key(pp, PANEL_KEY_SEND, group, cell,
+				face, SDLK_UNKNOWN, NULL, 0, false);
+			pk = c->priv;
+			pk->cmd = find_panel_command(slot->desc);
+			if (!pk->cmd) {
+				/*
+				 * A description no group has is still shown,
+				 * so that the slot can be found and fixed,
+				 * but it does nothing.
+				 */
+				SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+					"%s: no command is described as "
+					"\"%s\"", PANEL_SLOT_FILE, slot->desc);
+				pk->disabled = true;
+			}
+			break;
+
+		case PANEL_SLOT_TEXT:
+			add_panel_key(pp, PANEL_KEY_SEND, group, cell, face,
+				SDLK_UNKNOWN, slot->text, 0, false);
+			break;
+
+		case PANEL_SLOT_KEY:
+			c = add_panel_key(pp, PANEL_KEY_SEND, group, cell,
+				face, slot->sym, NULL, 0, slot->repeat);
+			pk = c->priv;
+			pk->mod = slot->mod;
+			break;
+
+		case PANEL_SLOT_EMPTY:
+			break;
+	}
+}
+
 static void create_panel_keys(struct panel_piece *pp)
 {
-	static const char *tab_names[PANEL_TABS] = {
-		"Act", "Items", "Info", "Mine", "Keys"
-	};
 	int i, cell;
 
 	/* Chrome, two rows of five */
@@ -6915,7 +7340,16 @@ static void create_panel_keys(struct panel_piece *pp)
 	/* Tab strip */
 	for (i = 0; i < PANEL_TABS; i++) {
 		add_panel_key(pp, PANEL_KEY_TAB, PANEL_GROUP_TABS, i,
-			tab_names[i], SDLK_UNKNOWN, NULL, i, false);
+			(i < PANEL_TAB_KEYS) ? panel_tab_names[i] : "Keys",
+			SDLK_UNKNOWN, NULL, i, false);
+	}
+
+	/* The slot tabs' grids, as panel.txt left them */
+	for (i = 0; i < PANEL_TAB_KEYS; i++) {
+		for (cell = 0; cell < PANEL_GRID_CELLS; cell++) {
+			add_panel_slot(pp, i, cell,
+				&pp->shared->slots[i][cell]);
+		}
 	}
 
 	/* Keys tab, letters layer: a to z, Tab, then the layer key */
@@ -8063,8 +8497,9 @@ static void load_panel(struct sdlpui_window *window)
 		}
 		if (!window->panel) {
 			window->panel = SDL_calloc(1, sizeof(*window->panel));
-			window->panel->cur_tab = PANEL_TAB_KEYS;
+			window->panel->cur_tab = 0;
 			window->panel->cur_layer = 0;
+			load_panel_slots(window->panel);
 		}
 		create_panel_piece(window, kind, &rect);
 	}
@@ -8085,6 +8520,7 @@ static void unload_panel(struct sdlpui_window *window)
 				false);
 		}
 	}
+	free_panel_slots(window->panel);
 	SDL_free(window->panel);
 	window->panel = NULL;
 }

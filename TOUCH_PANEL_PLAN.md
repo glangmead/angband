@@ -1255,9 +1255,21 @@ theirs. Nothing in those steps waits on it; see section 4.6.
 
 ### Step 4. Slots and seeding
 
-- [ ] code: `panel.txt` parser for the token grammar in section 4.3; user
+- [x] code: `panel.txt` parser for the token grammar in section 4.3; user
       dir searched before `lib/customize`; unknown descriptions become
-      disabled slots.
+      disabled slots. 2026-09-09: done, with the game's own parser
+      (`parser_new`, `parser_reg`, `print_error`), the way this file
+      already reads `sdl2init.txt`: directives `panel-version`, `tab` and
+      `row`, the row's tokens taken as one `str` field and split by hand.
+      A slot tab's grid is the seven by four the Keys tab already uses,
+      not the four by four of section 4.3, so a row holds up to seven
+      tokens. `{}` leaves the cell bare rather than drawing an empty
+      button; an unknown `{Name}` costs its cell and is logged; an
+      unclosed token stops the file, as a parse error does everywhere
+      else. Descriptions are looked up across every group *including*
+      `Hidden`, which section 4.3 excluded but its own example needs
+      (`Stand still`, `Alter a grid`); only the debug groups are skipped.
+      The panel now opens on Act rather than Keys.
 - [ ] code: command references resolved at press time against `cmds_all`
       for the active keyset (Angband `key[2]`; NarSil `key[4]` with its
       index).
