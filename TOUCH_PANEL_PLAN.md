@@ -389,12 +389,19 @@ Token grammar, whitespace separated within a `row:` line:
 - `[Description]`: command reference. Matched against `cmd_info.desc` across
   the non-hidden groups. Resolved to a key for the active keyset at press
   time. Unknown descriptions render as a disabled slot rather than failing.
-- `"text"`: literal text, one to three characters, sent through
-  `feed_keymap`.
-- `{Esc}` `{Ent}` `{BS}` `{Sp}` `{Tab}` `{Up}` `{Down}` `{Left}` `{Right}`
-  `{F1}` to `{F12}` `{^A}` to `{^Z}`: special keys.
-- `{}`: empty slot.
-- Optional `=Face` suffix overrides the face on any token.
+- `"action"`: a keymap's action, in the game's own encoding, read by the
+  same `keypress_from_text` that reads a pref file's `keymap-act:` line.
+  `"za."` is three keypresses, `"[Escape]"` is one named key, `"{^}f"` is
+  control-F, `"\x41"` is A. 2026-09-10: this replaces the first draft's
+  `"text"` plus a bespoke `{Esc}`/`{^A}` table, which reinvented
+  `keypress_from_text` badly and, worse, used `[...]` and `{...}` to mean
+  the opposite of what they mean everywhere else in the game's files.
+- `-`: empty slot. Was `{}`; braces are gone from this grammar, so the only
+  ones left are the game's own modifier braces inside an action.
+- Optional `=Face` suffix overrides the face on any token. Where the file
+  gives none, an action shows the game's name for a single named key
+  (`Escape`, `PageUp`), `^X` for a control character, and otherwise the
+  token as written.
 
 Faces: the face table in section 4.4, else the `=Face` override, else the
 first word of the description. The Keys tab and the fast-keys strip always
@@ -1263,13 +1270,30 @@ theirs. Nothing in those steps waits on it; see section 4.6.
       `row`, the row's tokens taken as one `str` field and split by hand.
       A slot tab's grid is the seven by four the Keys tab already uses,
       not the four by four of section 4.3, so a row holds up to seven
-      tokens. `{}` leaves the cell bare rather than drawing an empty
-      button; an unknown `{Name}` costs its cell and is logged; an
-      unclosed token stops the file, as a parse error does everywhere
-      else. Descriptions are looked up across every group *including*
-      `Hidden`, which section 4.3 excluded but its own example needs
-      (`Stand still`, `Alter a grid`); only the debug groups are skipped.
-      The panel now opens on Act rather than Keys.
+      tokens. `-` leaves the cell bare rather than drawing an empty
+      button; an unclosed token stops the file, as a parse error does
+      everywhere else. Descriptions are looked up across every group
+      *including* `Hidden`, which section 4.3 excluded but its own
+      example needs (`Stand still`, `Alter a grid`); only the debug
+      groups are skipped. The panel now opens on Act rather than Keys.
+      2026-09-10, after your question about idiom: two follow-ups.
+      First, the hooks were named `config_panel_*`, which in this file
+      means a directive of `sdl2init.txt` -- `config_panel` and
+      `config_panel_alpha` are two of those -- so they are now
+      `parse_panel_*` after `parse_prefs_*`, with the private state a
+      `struct panel_slot_data` after `ui-prefs.c`'s `struct prefs_data`.
+      Second and larger, the bespoke `{Esc}`/`{^A}` table went: a slot's
+      non-command token is now a keymap action read by
+      `keypress_from_text` (`ui-event.c:118`), which this file already
+      calls for `menu-shortcut`. That deleted about sixty lines, gained
+      every key and modifier the game names, and fixed a grammar that
+      had `[...]` and `{...}` meaning the reverse of what `pref.prf`
+      means by them. One trap found doing it: `keypress_from_text` sets
+      `buf[cur].type = EVT_KBRD` at the top of its loop, before it knows
+      the text is good, so a malformed action comes back with a keypress
+      that has no keycode; the slot parser ends the action at the first
+      of those. `main-sdl2.c`'s own `config_menu_shortcut` has the same
+      blind spot, untouched here.
 - [x] code: command references resolved at press time against `cmds_all`
       for the active keyset (Angband `key[2]`; NarSil `key[4]` with its
       index). 2026-09-09: done for Angband. A slot keeps the
@@ -1278,15 +1302,19 @@ theirs. Nothing in those steps waits on it; see section 4.6.
       `textui_process_key` does, falling back to `key[0]` because
       `cmd_init()` only fills the roguelike column later. The key goes
       through `push_term_keypress`, so the player's own keymaps still
-      apply to it. Literal text of more than one character needed the
+      apply to it. Sending a slot's action needed the
       `feed_keymap` of section 4.7: it is now in `ui-input.c`, but
       returning the first keypress rather than returning void, because
       `inkey_ex` reads `inkey_next` only on entry and the front end is
       already inside it -- the caller delivers the first key and the rest
       follow through `inkey_next`, which is what angbandroid's caller
-      open-codes. Verified on the simulator: `[Rest for a while]` raised
-      the rest prompt, and `"za."` gave "no rods to zap", "no wands to
-      aim" and then the run prompt, in that order.
+      open-codes. 2026-09-10: it also takes a `struct keypress` array
+      rather than angbandroid's `char *`, so that a slot can send named
+      keys and modifiers and not just characters, which is what a keymap
+      action is anyway. Verified on the simulator: `[Rest for a while]`
+      raised the rest prompt, `"za."` gave "no rods to zap", "no wands to
+      aim" and then the run prompt in that order, and `"{^}p"` opened the
+      message recall.
 - [x] code: seeder from `cmds_all` with the section 4.4 group-to-tab rules,
       the face table, commented overflow rows, and a menu item to
       regenerate. 2026-09-09: done for Angband. It runs when there is no
@@ -1299,7 +1327,9 @@ theirs. Nothing in those steps waits on it; see section 4.6.
       are written commented, but Angband has none: a slot tab's grid is
       seven by four, so 28 cells against 13 Act commands, 21 Items and 22
       Info. Everything fits, which makes the decision below about order
-      and wording only.
+      and wording only. 2026-09-10: the menu item was exercised on the
+      simulator; it kept the old file as `panel.old.txt` and the panel
+      picked the new one up without a relaunch.
 - [x] code: word faces rendered on Act, Items and Info; Mine empty.
       2026-09-09: done. The face table is in `main-sdl2.c`, keyed by
       description and shared across the variants; NarSil's additions wait

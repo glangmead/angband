@@ -10,10 +10,11 @@
 #   [Description]  a command, named as the command menu names
 #                  it; its key is looked up for whichever
 #                  keyset is in force when it is pressed.
-#   "text"         literal text, sent as a keymap's action is.
-#   {Esc} {Ent} {BS} {Sp} {Tab} {Up} {Down} {Left} {Right}
-#   {F1} to {F12}, {^A} to {^Z}
-#   {}             nothing.
+#   "action"       a keymap's action, written exactly as a
+#                  pref file's keymap-act: line writes one:
+#                  "za." is three keypresses, "[Escape]" is
+#                  the escape key, "{^}f" is control-F.
+#   -              nothing.
 # Any of them may end in =Face to change the word shown on it.
 
 panel-version:1

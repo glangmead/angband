@@ -6325,8 +6325,7 @@ enum panel_mod_state {
 enum panel_slot_kind {
 	PANEL_SLOT_EMPTY,
 	PANEL_SLOT_COMMAND,
-	PANEL_SLOT_TEXT,
-	PANEL_SLOT_KEY
+	PANEL_SLOT_ACTION
 };
 
 struct panel_slot {
@@ -6339,11 +6338,8 @@ struct panel_slot {
 	 * in for any kind and wins.
 	 */
 	char *face;
-	/* what the slot sends: text, or sym with mod */
-	char text[8];
-	SDL_Keycode sym;
-	Uint16 mod;
-	bool repeat;
+	/* a keymap's action, as struct prefs_data holds one */
+	struct keypress act[KEYMAP_ACTION_MAX];
 };
 
 struct panel_key {
@@ -6356,15 +6352,16 @@ struct panel_key {
 	int cell;
 	/* modifier, tab or layer for the kinds that select one */
 	int value;
-	/* what a send key sends: sym with mod, or text if sym is SDLK_UNKNOWN */
+	/* what a send key sends: sym, or text if sym is SDLK_UNKNOWN */
 	SDL_Keycode sym;
-	Uint16 mod;
 	char text[8];
 	/*
-	 * The command a slot refers to, whose key is looked up for the
-	 * active keyset when the slot is pressed; NULL for every other key.
+	 * What a slot from panel.txt sends: the command whose key is looked
+	 * up for the active keyset when the slot is pressed, or a keymap
+	 * action.  Both NULL for every other key.
 	 */
 	const struct cmd_info *cmd;
+	struct keypress *act;
 	/* re-fires while held */
 	bool repeat;
 	bool armed;
@@ -6575,8 +6572,19 @@ static void fire_panel_key(struct sdlpui_control *c, struct sdlpui_dialog *d,
 		if (key) {
 			push_term_keypress(key, 0);
 		}
+	} else if (pk->act) {
+		/*
+		 * A slot's action is a keymap's action: install it and send
+		 * its first keypress, as textui_get_command() does with the
+		 * keymap it matched.
+		 */
+		struct keypress first = feed_keymap(pk->act);
+
+		if (first.type == EVT_KBRD) {
+			push_term_keypress(first.code, first.mods);
+		}
 	} else if (pk->sym != SDLK_UNKNOWN) {
-		Uint16 mod = pk->mod;
+		Uint16 mod = 0;
 
 		if (shift) {
 			mod |= KMOD_LSHIFT;
@@ -6599,13 +6607,6 @@ static void fire_panel_key(struct sdlpui_control *c, struct sdlpui_dialog *d,
 			'\0' };
 
 		push_text_event(w, text);
-	} else if (pk->text[0] && pk->text[1]) {
-		/*
-		 * More than one character goes as a keymap's action does,
-		 * which is what makes a slot like "za." behave the way the
-		 * same keymap in a pref file would.
-		 */
-		push_term_keypress(feed_keymap(pk->text), 0);
 	} else if (pk->text[0]) {
 		push_text_event(w, pk->text);
 	}
@@ -6882,6 +6883,7 @@ static void cleanup_panel_key(struct sdlpui_control *c)
 	SDL_assert(c->type_code == PANEL_KEY_CODE && c->priv);
 	pk = c->priv;
 	string_free(pk->caption);
+	mem_free(pk->act);
 	SDL_free(pk);
 	c->priv = NULL;
 }
@@ -6926,7 +6928,6 @@ static struct sdlpui_control *add_panel_key(struct panel_piece *pp,
 	pk->cell = cell;
 	pk->value = value;
 	pk->sym = sym;
-	pk->mod = 0;
 	if (text) {
 		(void) my_strcpy(pk->text, text, sizeof(pk->text));
 	}
@@ -6980,9 +6981,14 @@ static int add_panel_chars(struct panel_piece *pp, int layer, int cell,
  * frontend's own config file uses.  Section 4.3 of TOUCH_PANEL_PLAN.md
  * has the grammar: "tab:Name" starts a tab and each "row:" line after it
  * fills that tab's next row of cells from whitespace separated tokens.  A
- * token is [a command's description], "literal text", {a special key}, or
- * {} for an empty cell, and any of them may carry an "=Face" suffix
- * naming the word to show.
+ * token is [a command's description], "a keymap's action", or - for an
+ * empty cell, and any of them may carry an "=Face" suffix naming the word
+ * to show.
+ *
+ * The quoted form is exactly what a pref file's "keymap-act:" line takes,
+ * read by the same keypress_from_text(): "za." is three keypresses,
+ * "[Escape]" is one named key, "{^}f" is control-F.  Naming keys is the
+ * game's job, not this file's.
  *
  * The user's copy is read if there is one, else the shipped one, the
  * order the game's own customizable files use.
@@ -6995,23 +7001,6 @@ static int add_panel_chars(struct panel_piece *pp, int layer, int cell,
 /* The slot tabs, in tab-strip order; the Keys tab is fixed and not one */
 static const char *panel_tab_names[PANEL_TAB_KEYS] = {
 	"Act", "Items", "Info", "Mine"
-};
-
-/* The keys a {Name} token can name, besides {F1}..{F12} and {^A}..{^Z} */
-static const struct {
-	const char *name;
-	SDL_Keycode sym;
-	const char *face;
-	bool repeat;
-} panel_slot_keys[] = {
-	{ "Esc",   SDLK_ESCAPE,    "Esc",   false },
-	{ "Ent",   SDLK_RETURN,    "Enter", false },
-	{ "BS",    SDLK_BACKSPACE, "⌫", true  },
-	{ "Tab",   SDLK_TAB,       "⇥", false },
-	{ "Up",    SDLK_UP,        "↑", true  },
-	{ "Down",  SDLK_DOWN,      "↓", true  },
-	{ "Left",  SDLK_LEFT,      "←", true  },
-	{ "Right", SDLK_RIGHT,     "→", true  }
 };
 
 /* Is this one of the debug groups of cmds_all, which slots never name? */
@@ -7045,48 +7034,60 @@ static const struct cmd_info *find_panel_command(const char *desc)
 	return NULL;
 }
 
-/* Fill a slot from a {Name} token's body; false if the name is not one. */
-static bool set_panel_slot_key(struct panel_slot *slot, const char *name)
+/*
+ * Fill a slot from the body of a "..." token: a keymap's action in the
+ * game's own encoding, so that a slot holds precisely what a pref file's
+ * "keymap-act:" line holds.  An empty action leaves the cell bare.
+ */
+static void set_panel_slot_action(struct panel_slot *slot, const char *body)
 {
-	char face[8];
-	size_t i;
-	int n;
+	size_t n;
 
-	for (i = 0; i < N_ELEMENTS(panel_slot_keys); i++) {
-		if (my_stricmp(name, panel_slot_keys[i].name)) {
-			continue;
+	keypress_from_text(slot->act, N_ELEMENTS(slot->act), body);
+
+	/*
+	 * keypress_from_text() marks the entry it is about to fill before
+	 * it knows the text is good, and gives up where the text goes bad,
+	 * so a malformed action can end in a keypress with no keycode.  End
+	 * the action at the first of those.
+	 */
+	for (n = 0; slot->act[n].type == EVT_KBRD && slot->act[n].code; n++) {
+		/* the keypresses that came out whole */
+	}
+	slot->act[n] = KEYPRESS_NULL;
+	if (n == 0) {
+		if (body[0]) {
+			SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+				"%s: \"%s\" is not a keymap action; the slot "
+				"is left empty", PANEL_SLOT_FILE, body);
 		}
-		slot->kind = PANEL_SLOT_KEY;
-		slot->sym = panel_slot_keys[i].sym;
-		slot->face = string_make(panel_slot_keys[i].face);
-		slot->repeat = panel_slot_keys[i].repeat;
-		return true;
+		return;
 	}
-	/* Space is text, so that it reaches the core as a typed space. */
-	if (!my_stricmp(name, "Sp")) {
-		slot->kind = PANEL_SLOT_TEXT;
-		my_strcpy(slot->text, " ", sizeof(slot->text));
-		slot->face = string_make("Space");
-		return true;
+	slot->kind = PANEL_SLOT_ACTION;
+
+	/*
+	 * The face, until an =Face overrides it: for one keypress, the
+	 * game's own name for it (Escape, PageUp) or ^X for a control
+	 * character, so that "^p" and "{^}p" read alike; otherwise the
+	 * token as written, which for ordinary text is the text itself.
+	 */
+	if (n == 1 && !slot->act[0].mods) {
+		keycode_t code = slot->act[0].code;
+		const char *named = keycode_find_desc(code);
+		char ctrl[4];
+
+		if (named) {
+			slot->face = string_make(named);
+			return;
+		}
+		if (code < 0x20) {
+			strnfmt(ctrl, sizeof(ctrl), "^%c",
+				(char) UN_KTRL_CAP(code));
+			slot->face = string_make(ctrl);
+			return;
+		}
 	}
-	if ((name[0] == 'F' || name[0] == 'f') && sscanf(name + 1, "%d", &n) == 1
-			&& n >= 1 && n <= 12) {
-		slot->kind = PANEL_SLOT_KEY;
-		slot->sym = SDLK_F1 + (n - 1);
-		strnfmt(face, sizeof(face), "F%d", n);
-		slot->face = string_make(face);
-		return true;
-	}
-	if (name[0] == '^' && isalpha((unsigned char) name[1]) && !name[2]) {
-		slot->kind = PANEL_SLOT_KEY;
-		slot->sym = SDLK_a + (tolower((unsigned char) name[1]) - 'a');
-		slot->mod = KMOD_LCTRL;
-		strnfmt(face, sizeof(face), "^%c",
-			toupper((unsigned char) name[1]));
-		slot->face = string_make(face);
-		return true;
-	}
-	return false;
+	slot->face = string_make(body);
 }
 
 /* What the parser needs between lines: where the next row goes */
@@ -7099,9 +7100,8 @@ struct panel_slot_data {
 
 /*
  * Read one token of a row: line into slot, leaving *pp on the rest of the
- * line.  An unknown {Name} costs its cell, not the file, because the set
- * of special keys may grow; an unclosed token is an error, because there
- * is then no telling where the next one begins.
+ * line.  A token with no closing delimiter is an error, because there is
+ * then no telling where the next one begins.
  */
 static enum parser_error parse_panel_token(const char **pp,
 		struct panel_slot *slot)
@@ -7112,33 +7112,30 @@ static enum parser_error parse_panel_token(const char **pp,
 	char open = *p;
 	size_t n;
 
-	switch (open) {
-		case '[': end = strchr(p + 1, ']'); break;
-		case '"': end = strchr(p + 1, '"'); break;
-		case '{': end = strchr(p + 1, '}'); break;
-		default: return PARSE_ERROR_UNRECOGNISED_PARAMETER;
-	}
-	if (!end) {
-		return PARSE_ERROR_MISSING_FIELD;
-	}
-	n = (size_t)(end - p - 1);
-	if (n >= sizeof(body)) {
-		return PARSE_ERROR_FIELD_TOO_LONG;
-	}
-	my_strcpy(body, p + 1, n + 1);
-
-	if (open == '[') {
-		slot->kind = PANEL_SLOT_COMMAND;
-		slot->desc = string_make(body);
-	} else if (open == '"') {
-		if (body[0]) {
-			slot->kind = PANEL_SLOT_TEXT;
-			my_strcpy(slot->text, body, sizeof(slot->text));
+	if (open == '-') {
+		/* An empty cell; there is nothing to read but its face. */
+		end = p;
+	} else {
+		switch (open) {
+			case '[': end = strchr(p + 1, ']'); break;
+			case '"': end = strchr(p + 1, '"'); break;
+			default: return PARSE_ERROR_UNRECOGNISED_PARAMETER;
 		}
-	} else if (body[0] && !set_panel_slot_key(slot, body)) {
-		SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
-			"%s: no such key as {%s}; the slot is left empty",
-			PANEL_SLOT_FILE, body);
+		if (!end) {
+			return PARSE_ERROR_MISSING_FIELD;
+		}
+		n = (size_t)(end - p - 1);
+		if (n >= sizeof(body)) {
+			return PARSE_ERROR_FIELD_TOO_LONG;
+		}
+		my_strcpy(body, p + 1, n + 1);
+
+		if (open == '[') {
+			slot->kind = PANEL_SLOT_COMMAND;
+			slot->desc = string_make(body);
+		} else {
+			set_panel_slot_action(slot, body);
+		}
 	}
 
 	/* An =Face suffix, running to the next space, overrides the face. */
@@ -7318,10 +7315,11 @@ static bool seed_panel_file(const char *path)
 		"#   [Description]  a command, named as the command menu names\n"
 		"#                  it; its key is looked up for whichever\n"
 		"#                  keyset is in force when it is pressed.\n"
-		"#   \"text\"         literal text, sent as a keymap's action is.\n"
-		"#   {Esc} {Ent} {BS} {Sp} {Tab} {Up} {Down} {Left} {Right}\n"
-		"#   {F1} to {F12}, {^A} to {^Z}\n"
-		"#   {}             nothing.\n"
+		"#   \"action\"       a keymap's action, written exactly as a\n"
+		"#                  pref file's keymap-act: line writes one:\n"
+		"#                  \"za.\" is three keypresses, \"[Escape]\" is\n"
+		"#                  the escape key, \"{^}f\" is control-F.\n"
+		"#   -              nothing.\n"
 		"# Any of them may end in =Face to change the word shown on it.\n"
 		"\n"
 		"panel-version:%d\n",
@@ -7503,12 +7501,13 @@ static void get_panel_slot_face(const struct panel_slot *slot, char *buf,
 	const char *p;
 	size_t i;
 
+	buf[0] = '\0';
 	if (slot->face) {
 		my_strcpy(buf, slot->face, len);
 		return;
 	}
 	if (slot->kind != PANEL_SLOT_COMMAND) {
-		my_strcpy(buf, slot->text, len);
+		/* set_panel_slot_action() always leaves an action a face. */
 		return;
 	}
 	for (i = 0; i < N_ELEMENTS(panel_faces); i++) {
@@ -7556,17 +7555,19 @@ static void add_panel_slot(struct panel_piece *pp, int tab, int cell,
 			}
 			break;
 
-		case PANEL_SLOT_TEXT:
-			add_panel_key(pp, PANEL_KEY_SEND, group, cell, face,
-				SDLK_UNKNOWN, slot->text, 0, false);
-			break;
+		case PANEL_SLOT_ACTION: {
+			size_t n = 0;
 
-		case PANEL_SLOT_KEY:
+			while (slot->act[n].type != EVT_NONE) {
+				n++;
+			}
 			c = add_panel_key(pp, PANEL_KEY_SEND, group, cell,
-				face, slot->sym, NULL, 0, slot->repeat);
+				face, SDLK_UNKNOWN, NULL, 0, false);
 			pk = c->priv;
-			pk->mod = slot->mod;
+			pk->act = mem_alloc((n + 1) * sizeof(*pk->act));
+			memcpy(pk->act, slot->act, (n + 1) * sizeof(*pk->act));
 			break;
+		}
 
 		case PANEL_SLOT_EMPTY:
 			break;

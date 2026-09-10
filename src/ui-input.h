@@ -85,7 +85,7 @@ extern uint8_t lazymove_delay;
 extern bool msg_flag;
 
 void flush(game_event_type unused, game_event_data *data, void *user);
-keycode_t feed_keymap(const char *buf);
+struct keypress feed_keymap(const struct keypress *act);
 ui_event inkey_ex(void);
 void anykey(void);
 struct keypress inkey(void);
