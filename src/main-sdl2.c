@@ -7090,7 +7090,7 @@ static bool set_panel_slot_key(struct panel_slot *slot, const char *name)
 }
 
 /* What the parser needs between lines: where the next row goes */
-struct panel_slot_parser {
+struct panel_slot_data {
 	struct panel_shared *ps;
 	/* the tab the last tab: line named, or -1 before any of them */
 	int tab;
@@ -7159,22 +7159,22 @@ static enum parser_error parse_panel_token(const char **pp,
 	return PARSE_ERROR_NONE;
 }
 
-static enum parser_error config_panel_version(struct parser *parser)
+static enum parser_error parse_panel_version(struct parser *parser)
 {
 	return (parser_getuint(parser, "version") == PANEL_SLOT_VERSION) ?
 		PARSE_ERROR_NONE : PARSE_ERROR_OBSOLETE_FILE;
 }
 
-static enum parser_error config_panel_tab(struct parser *parser)
+static enum parser_error parse_panel_tab(struct parser *parser)
 {
-	struct panel_slot_parser *sp = parser_priv(parser);
+	struct panel_slot_data *d = parser_priv(parser);
 	const char *name = parser_getstr(parser, "name");
 	int i;
 
 	for (i = 0; i < PANEL_TAB_KEYS; i++) {
 		if (!my_stricmp(name, panel_tab_names[i])) {
-			sp->tab = i;
-			sp->row = 0;
+			d->tab = i;
+			d->row = 0;
 			return PARSE_ERROR_NONE;
 		}
 	}
@@ -7182,16 +7182,16 @@ static enum parser_error config_panel_tab(struct parser *parser)
 	return PARSE_ERROR_INVALID_VALUE;
 }
 
-static enum parser_error config_panel_row(struct parser *parser)
+static enum parser_error parse_panel_row(struct parser *parser)
 {
-	struct panel_slot_parser *sp = parser_priv(parser);
+	struct panel_slot_data *d = parser_priv(parser);
 	const char *p = parser_getstr(parser, "slots");
 	int col = 0;
 
-	if (sp->tab < 0) {
+	if (d->tab < 0) {
 		return PARSE_ERROR_MISSING_RECORD_HEADER;
 	}
-	if (sp->row >= PANEL_GRID_ROWS) {
+	if (d->row >= PANEL_GRID_ROWS) {
 		return PARSE_ERROR_TOO_MANY_ENTRIES;
 	}
 	while (true) {
@@ -7206,14 +7206,14 @@ static enum parser_error config_panel_row(struct parser *parser)
 		if (col >= PANEL_GRID_COLS) {
 			return PARSE_ERROR_TOO_MANY_ENTRIES;
 		}
-		error = parse_panel_token(&p, &sp->ps->slots[sp->tab][
-			sp->row * PANEL_GRID_COLS + col]);
+		error = parse_panel_token(&p, &d->ps->slots[d->tab][
+			d->row * PANEL_GRID_COLS + col]);
 		if (error != PARSE_ERROR_NONE) {
 			return error;
 		}
 		col++;
 	}
-	sp->row++;
+	d->row++;
 
 	return PARSE_ERROR_NONE;
 }
@@ -7221,15 +7221,15 @@ static enum parser_error config_panel_row(struct parser *parser)
 static struct parser *init_parse_panel(struct panel_shared *ps)
 {
 	struct parser *parser = parser_new();
-	struct panel_slot_parser *sp = mem_zalloc(sizeof(*sp));
+	struct panel_slot_data *d = mem_zalloc(sizeof(*d));
 
-	sp->ps = ps;
-	sp->tab = -1;
-	parser_setpriv(parser, sp);
+	d->ps = ps;
+	d->tab = -1;
+	parser_setpriv(parser, d);
 
-	parser_reg(parser, "panel-version uint version", config_panel_version);
-	parser_reg(parser, "tab str name", config_panel_tab);
-	parser_reg(parser, "row str slots", config_panel_row);
+	parser_reg(parser, "panel-version uint version", parse_panel_version);
+	parser_reg(parser, "tab str name", parse_panel_tab);
+	parser_reg(parser, "row str slots", parse_panel_row);
 
 	return parser;
 }
