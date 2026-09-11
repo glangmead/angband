@@ -1588,8 +1588,11 @@ static void lose_child_mb(struct sdlpui_control *c, struct sdlpui_dialog *child)
 	mbp = c->priv;
 	SDL_assert(mbp->subtype_code == SDLPUI_MB_SUBMENU);
 
-	if (mbp->v.submenu.child) {
-		SDL_assert(mbp->v.submenu.child == child);
+	/*
+	 * Only forget the child if it is the one going away: this button may
+	 * already hold a newer one.
+	 */
+	if (mbp->v.submenu.child == child) {
 		mbp->v.submenu.child = NULL;
 	}
 }
