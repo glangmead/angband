@@ -95,6 +95,7 @@ char *ANGBAND_DIR_TILES;
 char *ANGBAND_DIR_SOUNDS;
 char *ANGBAND_DIR_ICONS;
 char *ANGBAND_DIR_USER;
+char *ANGBAND_DIR_PLATFORM;
 char *ANGBAND_DIR_SAVE;
 char *ANGBAND_DIR_PANIC;
 char *ANGBAND_DIR_SCORES;
@@ -325,6 +326,7 @@ void init_file_paths(const char *configpath, const char *libpath, const char *da
 	string_free(ANGBAND_DIR_SOUNDS);
 	string_free(ANGBAND_DIR_ICONS);
 	string_free(ANGBAND_DIR_USER);
+	string_free(ANGBAND_DIR_PLATFORM);
 	string_free(ANGBAND_DIR_SAVE);
 	string_free(ANGBAND_DIR_PANIC);
 	string_free(ANGBAND_DIR_SCORES);
@@ -340,13 +342,15 @@ void init_file_paths(const char *configpath, const char *libpath, const char *da
 	/* Paths generally containing configuration data for Angband. */
 #ifdef GAMEDATA_IN_LIB
 	BUILD_DIRECTORY_PATH(ANGBAND_DIR_GAMEDATA, libpath, "gamedata");
+	BUILD_DIRECTORY_PATH(ANGBAND_DIR_CUSTOMIZE, libpath, "customize");
 #else
 	BUILD_DIRECTORY_PATH(ANGBAND_DIR_GAMEDATA, configpath, "gamedata");
-#endif
 	BUILD_DIRECTORY_PATH(ANGBAND_DIR_CUSTOMIZE, configpath, "customize");
+#endif
 	BUILD_DIRECTORY_PATH(ANGBAND_DIR_HELP, libpath, "help");
 	BUILD_DIRECTORY_PATH(ANGBAND_DIR_SCREENS, libpath, "screens");
 	BUILD_DIRECTORY_PATH(ANGBAND_DIR_FONTS, libpath, "fonts");
+	BUILD_DIRECTORY_PATH(ANGBAND_DIR_PLATFORM, libpath, "ios");
 	BUILD_DIRECTORY_PATH(ANGBAND_DIR_TILES, libpath, "tiles");
 	BUILD_DIRECTORY_PATH(ANGBAND_DIR_SOUNDS, libpath, "sounds");
 	BUILD_DIRECTORY_PATH(ANGBAND_DIR_ICONS, libpath, "icons");
@@ -356,8 +360,13 @@ void init_file_paths(const char *configpath, const char *libpath, const char *da
 	/* Build the path to the user specific directory */
 	if (strncmp(ANGBAND_SYS, "test", 4) == 0)
 		path_build(buf, sizeof(buf), PRIVATE_USER_PATH, "Test");
-	else
+	else {
+#ifdef ON_IOS
+		path_build(buf, sizeof(buf), configpath, VERSION_NAME);
+#else
 		path_build(buf, sizeof(buf), PRIVATE_USER_PATH, VERSION_NAME);
+#endif /* ON_IOS */
+	}
 	ANGBAND_DIR_USER = string_make(buf);
 
 #else /* !PRIVATE_USER_PATH */

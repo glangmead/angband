@@ -235,6 +235,7 @@ extern char *ANGBAND_DIR_TILES;
 extern char *ANGBAND_DIR_SOUNDS;
 extern char *ANGBAND_DIR_ICONS;
 extern char *ANGBAND_DIR_USER;
+extern char *ANGBAND_DIR_PLATFORM;
 extern char *ANGBAND_DIR_SAVE;
 extern char *ANGBAND_DIR_PANIC;
 extern char *ANGBAND_DIR_SCORES;
