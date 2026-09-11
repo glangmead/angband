@@ -106,6 +106,61 @@ If you had already built everything without statistics enabled, you would need
 to run either "rm wiz-stats.o" or "make -f Makefile.osx clean" immediately
 after running "cd src".
 
+iOS
+---
+
+The iOS app is the SDL2 front end in an app bundle, built with CMake and the
+Xcode generator.  Everything it needs beyond Xcode is fetched during the
+first configure: SDL2, SDL2_ttf and SDL2_image are built from source and
+linked statically, since there are no system packages to find on iOS.
+
+Two scripts in ``scripts/`` wrap the CMake invocations.  Run both from the
+top of the source tree.
+
+To build the app and pack it into an .ipa, the way the iOS workflow in
+``.github/workflows/ios.yaml`` does::
+
+    ./scripts/build-ios.sh
+
+That leaves ``build/Angband.ipa``.  The app is not code signed, so putting it
+on a device needs a tool that signs as it installs, such as Sideloadly or
+AltStore, or an Xcode project of your own.
+
+The simulator needs no signing, so it is the quicker way to see a change::
+
+    ./scripts/run-ios-simulator.sh
+
+That builds for the simulator in ``build-sim/``, installs the app and
+launches it.  It uses a booted simulator if there is one and otherwise picks
+an available iPad; set ``SIM`` to choose::
+
+    SIM="iPad Pro 11-inch (M4)" ./scripts/run-ios-simulator.sh
+
+The script also takes ``shot`` to capture a screenshot, ``rotate`` to turn
+the simulator, and ``idb`` to start the companion process that ``idb ui tap``
+needs.
+
+Note on Xcode versions: iOS 27 refuses to launch an app that is linked
+against the iOS 27 SDK and has not adopted the UIScene lifecycle, and SDL2
+has not adopted it.  ``build-ios.sh`` therefore picks the newest installed
+Xcode whose iOS SDK is below 27; set ``DEVELOPER_DIR`` to override that
+choice.
+
+The build defines ``ON_IOS``, which marks the parts of the source that only
+the iOS app wants: the touch panel in ``src/main-sdl2.c``, and the paths that
+put the player's files in the app's Documents directory so that the Files app
+can reach them.  The touch panel is compiled only for iOS; the other front
+ends get the no-op stubs next to it.
+
+The app's layout comes from ``sdl2init.txt``, which divides the screen into
+per-orientation regions, and the touch panel's keys from ``panel.txt``.  Both
+are looked for in the player's own directory first and fall back to the copy
+shipped in the bundle -- ``lib/ios/sdl2init.txt`` and
+``lib/customize/panel.txt`` respectively.  On iOS the player's directory is
+inside the app's Documents directory, so the Files app can reach it; the
+front end writes its configuration there when it exits, and the Menu's
+"Reset Panel Slots" puts a fresh ``panel.txt`` there.
+
 Linux / other UNIX
 ------------------
 
