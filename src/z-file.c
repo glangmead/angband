@@ -1207,6 +1207,8 @@ bool file_getl(ang_file *f, char *buf, size_t len)
  */
 bool file_put(ang_file *f, const char *buf)
 {
+	if (!f) return false;
+
 	return file_write(f, buf, strlen(buf));
 }
 

@@ -550,6 +550,14 @@ struct my_app {
 	 * so we need to save the path to the config file.
 	 */
 	char config_file[4096];
+	/*
+	 * Where the config may be written back.  Kept apart from config_file
+	 * because that may name the copy shipped in lib/, which on iOS is
+	 * inside the read-only app bundle, and because it is captured while
+	 * ANGBAND_DIR_USER is still alive: the dump runs after
+	 * cleanup_angband() has freed it.
+	 */
+	char config_file_out[4096];
 	/** the game's color table translated into what SDL expects */
 	SDL_Color colors[MAX_COLORS];
 	/**
@@ -11077,9 +11085,11 @@ static void init_globals(struct my_app *a)
 
 	path_build(a->config_file, sizeof(a->config_file),
 			DEFAULT_CONFIG_FILE_DIR, DEFAULT_CONFIG_FILE);
-	if(!file_exists(a->config_file)) {
+	my_strcpy(a->config_file_out, a->config_file,
+			sizeof(a->config_file_out));
+	if (!file_exists(a->config_file)) {
 		path_build(a->config_file, sizeof(a->config_file),
-										   ANGBAND_DIR_PLATFORM, DEFAULT_CONFIG_FILE);
+				ANGBAND_DIR_PLATFORM, DEFAULT_CONFIG_FILE);
 	}
 
 	for (size_t i = 0; i < N_ELEMENTS(a->subwindows); i++) {
@@ -11247,24 +11257,23 @@ static void load_terms(struct my_app *a)
 
 static void dump_config_file(const struct my_app *a)
 {
-	ang_file *config = file_open(a->config_file, MODE_WRITE, FTYPE_TEXT);
+	ang_file *config = file_open(a->config_file_out, MODE_WRITE, FTYPE_TEXT);
 
 	if (config == NULL) {
 		/*
-		 * Compare to the two attempts to open the config file in
-		 * init_globals().  When the DEFAULT_CONFIG_FILE_DIR version is
-		 * missing on launch we read the one inside lib/, and so arrive
-		 * here on exit with a path that cannot be written; write the
-		 * per-user copy instead.  Later exits will not come this way.
+		 * Losing the layout is a nuisance; carrying on without a file
+		 * is not survivable.  file_put() does not check its argument,
+		 * so the first one faults, and the game's own SIGSEGV handler
+		 * then tries to paint a message and panic save with everything
+		 * cleanup_angband() freed -- having first set the signal to
+		 * SIG_IGN, so the faulting instruction retries for ever and the
+		 * app hangs instead of dying.
 		 */
-		char fallback[sizeof(a->config_file)];
-
-		path_build(fallback, sizeof(fallback), DEFAULT_CONFIG_FILE_DIR,
-			DEFAULT_CONFIG_FILE);
-		config = file_open(fallback, MODE_WRITE, FTYPE_TEXT);
+		SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+			"could not write %s; the layout is not saved",
+			a->config_file_out);
+		return;
 	}
-
-	assert(config != NULL);
 
 	for (size_t i = 0; i < N_ELEMENTS(a->windows); i++) {
 		if (a->windows[i].loaded) {
