@@ -25,10 +25,14 @@
 #include "sdl2/pui-misc.h"
 #include "sdl2/pui-win.h"
 #include "SDL_image.h"
+#include "SDL_keyboard.h"
 #ifdef SOUND_SDL2
 #include "SDL_mixer.h"
 #endif
 #include "SDL_revision.h"
+
+#include <ctype.h>
+#include <math.h>
 
 #include "main.h"
 #include "init.h"
@@ -40,6 +44,7 @@
 #include "ui-output.h"
 #include "game-world.h"
 #include "ui-input.h"
+#include "ui-keymap.h"
 #include "ui-prefs.h"
 #include "grafmode.h"
 #include "ui-game.h"
@@ -81,6 +86,8 @@
 /* for "Alpha" button; in percents */
 #define DEFAULT_ALPHA_STEP 10
 #define DEFAULT_ALPHA_LOWEST 0
+/* opacity of the touch panel's background when the config has no panel-alpha */
+#define DEFAULT_PANEL_ALPHA 160
 
 #define DEFAULT_WALLPAPER "att-128.png"
 #define DEFAULT_WALLPAPER_DIR \
@@ -103,9 +110,9 @@
 /* XXX hack: the widest character present in a font
  * for determining font advance (width) */
 #define GLYPH_FOR_ADVANCE 'W'
-#define DEFAULT_VECTOR_FONT_SIZE 12
+#define DEFAULT_VECTOR_FONT_SIZE 15
 
-#define DEFAULT_FONT "10x20x.fon"
+#define DEFAULT_FONT "JuliaMono-Regular.ttf"
 
 #define DEFAULT_DIALOG_FONT "8x13x.fon"
 
@@ -223,6 +230,58 @@ struct subwindow_border {
 struct subwindow_config {
 	char *font_name;
 	int font_size;
+	/*
+	 * If font_size_max is positive, the font size is chosen at layout
+	 * time: the largest size in [font_size_min, font_size_max] at which
+	 * the subwindow's minimum columns and rows fit its rect.
+	 */
+	int font_size_max;
+	int font_size_min;
+};
+
+/*
+ * Layout regions: fractional rectangles, in per-mille of the window's inner
+ * rect (the part below the status bar), for a subwindow or the touch panel
+ * in one orientation.  They come from "region:" lines in the configuration
+ * file and are resolved to pixel rects when the window starts and whenever
+ * it is resized.
+ */
+enum region_orient {
+	REGION_ORIENT_ANY = 0,
+	REGION_ORIENT_PORTRAIT,
+	REGION_ORIENT_LANDSCAPE
+};
+
+/*
+ * Region targets that are not subwindows: the touch panel's home area and
+ * its movable pieces (see struct panel_shared).
+ */
+#define REGION_TARGET_PANEL MAX_SUBWINDOWS
+#define REGION_TARGET_ROSE (MAX_SUBWINDOWS + 1)
+#define REGION_TARGET_KEYS (MAX_SUBWINDOWS + 2)
+#define REGION_TARGET_COUNT (MAX_SUBWINDOWS + 3)
+/* Enough for every target in both orientations plus "any" */
+#define MAX_REGIONS (3 * REGION_TARGET_COUNT)
+#define REGION_PER_MILLE 1000
+
+/*
+ * The touch panel's pieces.  Each is a pinned dialog of its own that can be
+ * moved with a two-finger drag; they share one state, struct panel_shared,
+ * defined with the rest of the panel.
+ */
+enum panel_piece_kind {
+	PANEL_PIECE_ROSE,
+	PANEL_PIECE_KEYS,
+	PANEL_PIECE_COUNT
+};
+struct panel_shared;
+
+struct layout_region {
+	/* MAIN_SUBWINDOW to MAX_SUBWINDOWS - 1, or REGION_TARGET_PANEL */
+	int target;
+	enum region_orient orient;
+	/* per-mille of the window's inner rect */
+	int x, y, w, h;
 };
 
 struct window_config {
@@ -233,6 +292,16 @@ struct window_config {
 	char *wallpaper_path;
 	char *font_name;
 	int font_size;
+
+	struct layout_region regions[MAX_REGIONS];
+	int num_regions;
+
+	/*
+	 * The touch panel is drawn over the "panel" region when enabled;
+	 * panel_alpha is the opacity of its background, 0 to 255.
+	 */
+	bool panel_enabled;
+	int panel_alpha;
 };
 
 /** struct subwindow is representation of angband's term */
@@ -388,6 +457,11 @@ struct sdlpui_window {
 	struct sdlpui_dialog *shorte;
 	/** The SDL details dialog; NULL if not currently displayed */
 	struct sdlpui_dialog *detaild;
+	/*
+	 * The touch panel's shared state, which holds its pieces; NULL if
+	 * there is no panel (see load_panel())
+	 */
+	struct panel_shared *panel;
 
 	int pixelformat;
 
@@ -398,6 +472,15 @@ struct sdlpui_window {
 	struct graphics graphics;
 
 	struct subwindow *subwindows[MAX_SUBWINDOWS];
+
+	/*
+	 * The touch panel's rect, from the "panel" region for the current
+	 * orientation; has_panel is false when there is no such region.
+	 */
+	SDL_Rect panel_rect;
+	bool has_panel;
+	/** renderer output pixels per window unit; 2 on HiDPI displays */
+	float ui_scale;
 
 	/** Point back to the containing application */
 	struct my_app *app;
@@ -433,6 +516,32 @@ struct shortcut_editor_data {
 	struct sdlpui_control close_button;
 	struct sdlpui_control reset_button;
 	int changing_shortcut;
+};
+
+/*
+ * A two-finger drag of a touch panel piece (see handle_finger()): a second
+ * finger picks up the piece under the first, which then follows the first
+ * finger's mouse motion.
+ */
+struct touch_drag {
+	/*
+	 * The finger SDL is turning into the mouse, mirrored from the finger
+	 * events: the first finger down while none is tracked, until it lifts.
+	 */
+	bool has_mouse_finger;
+	SDL_TouchID mouse_touch_id;
+	SDL_FingerID mouse_finger_id;
+	/* NULL when no drag is in progress */
+	struct sdlpui_dialog *piece;
+	struct sdlpui_window *window;
+	/* where the piece and the mouse were when the drag began */
+	SDL_Point origin, start;
+	/*
+	 * Testing aid (ANGBAND_PANEL_DRAG_TEST in the environment): the first
+	 * finger's own touch starts a drag, so one finger, and so idb on the
+	 * simulator, can exercise the drag.
+	 */
+	bool test_one_finger;
 };
 
 struct my_app {
@@ -472,6 +581,9 @@ struct my_app {
 	bool print_sdl_details;
 
 	SDL_GameController *controller;
+
+	/* the touch panel piece being dragged, if any */
+	struct touch_drag touch;
 };
 
 /* Forward declarations */
@@ -501,6 +613,34 @@ static struct sdlpui_window *get_window_by_id(struct my_app *a, Uint32 id);
 static struct sdlpui_window *get_window_direct(struct my_app *a,
 		unsigned index);
 static void resize_window(struct sdlpui_window *window, int w, int h);
+static const struct layout_region *find_region(
+		const struct sdlpui_window *window, int target);
+static void region_to_rect(const struct sdlpui_window *window,
+		const struct layout_region *r, SDL_Rect *rect);
+static void resolve_panel_rect(struct sdlpui_window *window);
+static void load_panel(struct sdlpui_window *window);
+static void relayout_panel(struct sdlpui_window *window);
+#ifdef ON_IOS
+static void reset_panel_slots(struct sdlpui_window *window);
+#endif
+static void panel_tick(struct my_app *a);
+static void panel_cancel_repeat(struct my_app *a);
+static bool handle_finger(struct my_app *a, const SDL_TouchFingerEvent *e);
+static void move_panel_drag(struct my_app *a, int x, int y);
+static void end_panel_drag(struct my_app *a);
+static struct sdlpui_dialog *panel_piece_at(const struct sdlpui_window *window,
+		int x, int y);
+static void render_panel_home(struct sdlpui_window *window);
+static void print_error(const char *name, struct parser *parser);
+#ifdef ON_IOS
+static void push_key_event(struct sdlpui_window *window, SDL_Keycode sym,
+		Uint16 mod);
+static void push_text_event(struct sdlpui_window *window, const char *utf8);
+#endif
+static bool give_dialog_focus_at(struct my_app *a,
+		const SDL_MouseMotionEvent *mouse);
+static void ensure_minimum_rect(const struct subwindow *subwindow,
+		SDL_Rect *rect);
 static void resize_subwindow(struct subwindow *subwindow);
 static struct subwindow *get_new_subwindow(struct my_app *a, unsigned index);
 static void load_subwindow(struct sdlpui_window *window,
@@ -553,6 +693,10 @@ static void recreate_textures(struct my_app *a, bool all);
 const char help_sdl2[] = "SDL2 frontend, subopts -v";
 static struct my_app g_app;
 static Uint32 SHORTCUT_EDITOR_CODE;
+/* type codes for the touch panel dialog and its key controls */
+static Uint32 PANEL_CODE;
+static Uint32 PANEL_KEY_CODE;
+static Uint32 PANEL_ROSE_CODE;
 
 /*
  * Provide the hooks needed by primitive UI toolkit for SDL2.
@@ -881,6 +1025,9 @@ static void render_all(struct sdlpui_window *window)
 	render_background(window);
 
 	for (d = window->d_tail; d; d = d->prev) {
+		if (d->type_code == PANEL_CODE) {
+			continue;
+		}
 		if (d->texture) {
 			SDL_RenderCopy(window->renderer, d->texture, NULL,
 				&d->rect);
@@ -898,6 +1045,25 @@ static void render_all(struct sdlpui_window *window)
 					NULL, &subwindow->full_rect);
 		}
 	}
+
+	/*
+	 * The touch panel overlaps the terms: draw its home area and then its
+	 * pieces, back to front, over them.
+	 */
+	render_panel_home(window);
+	for (d = window->d_tail; d; d = d->prev) {
+		if (d->type_code != PANEL_CODE) {
+			continue;
+		}
+		if ((d->dirty || !d->texture) && d->ftb->render) {
+			(*d->ftb->render)(d, window);
+		}
+		if (d->texture) {
+			SDL_SetRenderTarget(window->renderer, NULL);
+			SDL_RenderCopy(window->renderer, d->texture, NULL,
+				&d->rect);
+		}
+	}
 }
 
 static void render_status_bar(struct sdlpui_window *window)
@@ -905,6 +1071,10 @@ static void render_status_bar(struct sdlpui_window *window)
 	struct sdlpui_dialog *d;
 
 	for (d = window->d_tail; d; d = d->prev) {
+		/* The touch panel's pieces are drawn with the terms. */
+		if (d->type_code == PANEL_CODE) {
+			continue;
+		}
 		if (d->dirty) {
 			if (d->ftb->render) {
 				(*d->ftb->render)(d, window);
@@ -966,6 +1136,9 @@ static void render_window_while_menu_active(struct sdlpui_window *window)
 			}
 		}
 	}
+
+	/* The touch panel's home area lies under its pieces, which are dialogs. */
+	render_panel_home(window);
 
 	/*
 	 * Render any dialogs or menus last, back to front, so they can draw
@@ -2589,6 +2762,15 @@ static void handle_menu_kp_mod(struct sdlpui_control *ctrl,
 	window->app->kp_as_mod = !window->app->kp_as_mod;
 }
 
+#ifdef ON_IOS
+static void handle_menu_reset_slots(struct sdlpui_control *ctrl,
+		struct sdlpui_dialog *dlg, struct sdlpui_window *window)
+{
+	sdlpui_popdown_dialog(dlg, window, true);
+	reset_panel_slots(window);
+}
+#endif
+
 static void handle_menu_about(struct sdlpui_control *ctrl,
 		struct sdlpui_dialog *dlg, struct sdlpui_window *window)
 {
@@ -3317,6 +3499,13 @@ static struct sdlpui_dialog *handle_menu_button(struct sdlpui_control *ctrl,
 			SDLPUI_MFLG_NONE);
 		sdlpui_create_submenu_button(c, "Windows", SDLPUI_HOR_LEFT,
 			handle_menu_windows, SDLPUI_CHILD_MENU_RIGHT, 0, false);
+#ifdef ON_IOS
+		/* Only the touch panel has slots to reset. */
+		c = sdlpui_get_simple_menu_next_unused(result,
+			SDLPUI_MFLG_NONE);
+		sdlpui_create_menu_button(c, "Reset Panel Slots",
+			SDLPUI_HOR_LEFT, handle_menu_reset_slots, 0, false);
+#endif
 	}
 	c = sdlpui_get_simple_menu_next_unused(result, SDLPUI_MFLG_NONE);
 	sdlpui_create_menu_button(c, "About...", SDLPUI_HOR_LEFT,
@@ -3663,9 +3852,22 @@ static void handle_last_resize_event(struct my_app *a, int num_events,
 
 			struct sdlpui_window *window =
 				get_window_by_id(a, event.windowID);
-			assert(window != NULL);
-			resize_window(window, event.data1, event.data2);
+			int rw, rh;
 
+			assert(window != NULL);
+			/*
+			 * The event carries window units; render in the
+			 * renderer's output pixels (more on a HiDPI display)
+			 * and refresh the logical size, or SDL scales the old
+			 * one into the new window.
+			 */
+			if (SDL_GetRendererOutputSize(window->renderer,
+					&rw, &rh) != 0) {
+				rw = event.data1;
+				rh = event.data2;
+			}
+			SDL_RenderSetLogicalSize(window->renderer, rw, rh);
+			resize_window(window, rw, rh);
 			return;
 		}
 	}
@@ -3795,61 +3997,14 @@ static void do_moving(struct sdlpui_window *window, int x, int y)
 	move_state->originy = y;
 }
 
-static bool handle_mousemotion(struct my_app *a,
+/*
+ * Give the dialog or menu under the pointer, if any, mouse and key focus
+ * and let it handle the motion.  Return true if a dialog handled the event.
+ */
+static bool give_dialog_focus_at(struct my_app *a,
 		const SDL_MouseMotionEvent *mouse)
 {
 	struct sdlpui_dialog *d;
-	SDL_Event pendm[4];
-
-	if (!a->w_mouse) {
-		return false;
-	}
-
-	/*
-	 * If more than one consecutive motion event is queued, only process
-	 * the last one.
-	 */
-	while (1) {
-		int npend = SDL_PeepEvents(pendm,
-			(int)(sizeof(pendm) / sizeof(pendm[0])),
-			SDL_GETEVENT, SDL_MOUSEMOTION, SDL_MOUSEMOTION);
-
-		if (npend <= 0) {
-			if (npend < 0) {
-				SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
-					"SDL_PeepEvents() for pending motion "
-					"events failed: %s", SDL_GetError());
-			}
-			break;
-		}
-		SDL_assert(npend <= (int)(sizeof(pendm) / sizeof(pendm[0]))
-			&& pendm[npend - 1].type == SDL_MOUSEMOTION);
-		mouse = &pendm[npend - 1].motion;
-	}
-
-	if (a->w_mouse->move_state.moving) {
-		do_moving(a->w_mouse, mouse->x, mouse->y);
-		return true;
-	}
-	if (a->w_mouse->size_state.sizing) {
-		do_sizing(a->w_mouse, mouse->x, mouse->y);
-		return true;
-	}
-	/* Have a menu or dialog handle the event if appropriate. */
-	if (a->w_mouse->d_mouse
-			&& a->w_mouse->d_mouse->ftb->handle_mousemove
-			&& (*a->w_mouse->d_mouse->ftb->handle_mousemove)(
-				a->w_mouse->d_mouse, a->w_mouse, mouse)) {
-		return true;
-	}
-
-	/*
-	 * Ignore motion events while a mouse button is pressed (at
-	 * least up to the point that the mouse leaves the window).
-	 */
-	if (mouse->state != 0) {
-		return true;
-	}
 
 	/*
 	 * Has the motion entered any of the active dialogs/menus?
@@ -3916,6 +4071,81 @@ static bool handle_mousemotion(struct my_app *a,
 	return false;
 }
 
+static bool handle_mousemotion(struct my_app *a,
+		const SDL_MouseMotionEvent *mouse)
+{
+	SDL_Event pendm[4];
+
+	if (!a->w_mouse) {
+		return false;
+	}
+
+	/*
+	 * If more than one consecutive motion event is queued, only process
+	 * the last one.
+	 */
+	while (1) {
+		int npend = SDL_PeepEvents(pendm,
+			(int)(sizeof(pendm) / sizeof(pendm[0])),
+			SDL_GETEVENT, SDL_MOUSEMOTION, SDL_MOUSEMOTION);
+
+		if (npend <= 0) {
+			if (npend < 0) {
+				SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
+					"SDL_PeepEvents() for pending motion "
+					"events failed: %s", SDL_GetError());
+			}
+			break;
+		}
+		SDL_assert(npend <= (int)(sizeof(pendm) / sizeof(pendm[0]))
+			&& pendm[npend - 1].type == SDL_MOUSEMOTION);
+		mouse = &pendm[npend - 1].motion;
+	}
+
+	/*
+	 * SDL's UIKit backend reports a pointer at the window's origin when
+	 * the view is set up, before any pointer has moved.  That landed on
+	 * the status bar's Menu button, which opens on hover, so the menu was
+	 * open at every launch.  A pointer resting on that one pixel has no
+	 * use, so ignore it.
+	 */
+	if (mouse->x == 0 && mouse->y == 0 && mouse->state == 0) {
+		return false;
+	}
+
+	/* A dragged touch panel piece follows the first finger. */
+	if (a->touch.piece) {
+		move_panel_drag(a, mouse->x, mouse->y);
+		return true;
+	}
+
+	if (a->w_mouse->move_state.moving) {
+		do_moving(a->w_mouse, mouse->x, mouse->y);
+		return true;
+	}
+	if (a->w_mouse->size_state.sizing) {
+		do_sizing(a->w_mouse, mouse->x, mouse->y);
+		return true;
+	}
+	/* Have a menu or dialog handle the event if appropriate. */
+	if (a->w_mouse->d_mouse
+			&& a->w_mouse->d_mouse->ftb->handle_mousemove
+			&& (*a->w_mouse->d_mouse->ftb->handle_mousemove)(
+				a->w_mouse->d_mouse, a->w_mouse, mouse)) {
+		return true;
+	}
+
+	/*
+	 * Ignore motion events while a mouse button is pressed (at
+	 * least up to the point that the mouse leaves the window).
+	 */
+	if (mouse->state != 0) {
+		return true;
+	}
+
+	return give_dialog_focus_at(a, mouse);
+}
+
 /** x and y are relative to window */
 static bool get_colrow_from_xy(const struct subwindow *subwindow,
 		int x, int y, int *col, int *row)
@@ -3962,6 +4192,11 @@ static bool handle_mousebutton(struct my_app *a,
 		return false;
 	}
 
+	/* The first finger lifting puts down a dragged touch panel piece. */
+	if (mouse->state == SDL_RELEASED && a->touch.piece) {
+		end_panel_drag(a);
+	}
+
 	/* Terminate moving/sizing on a mouse release. */
 	if (mouse->state == SDL_RELEASED
 			&& (a->w_mouse->move_state.moving
@@ -3977,6 +4212,28 @@ static bool handle_mousebutton(struct my_app *a,
 			}
 		}
 		return true;
+	}
+
+	/*
+	 * Touch input has no hover, so a press can arrive without the motion
+	 * that would have given the dialog under it focus (SDL also drops a
+	 * motion that does not change the position).  Give focus now, as if
+	 * the pointer had just moved there.
+	 */
+	if (mouse->state == SDL_PRESSED && (!a->w_mouse->d_mouse
+			|| !sdlpui_is_in_dialog(a->w_mouse->d_mouse,
+			mouse->x, mouse->y))) {
+		SDL_MouseMotionEvent motion;
+
+		memset(&motion, 0, sizeof(motion));
+		motion.type = SDL_MOUSEMOTION;
+		motion.timestamp = mouse->timestamp;
+		motion.windowID = mouse->windowID;
+		motion.which = mouse->which;
+		motion.state = 0;
+		motion.x = mouse->x;
+		motion.y = mouse->y;
+		(void) give_dialog_focus_at(a, &motion);
 	}
 
 	/* Have a menu or dialog handle the event if appropriate. */
@@ -4619,13 +4876,51 @@ static bool get_event(struct my_app *a)
 		case SDL_QUIT:
 			handle_quit();
 			return false;
+		case SDL_FINGERDOWN:
+		case SDL_FINGERMOTION:
+		case SDL_FINGERUP:
+			return handle_finger(a, &event.tfinger);
+		case SDL_USEREVENT:
+			/* A wake-up pushed by the touch panel after queuing a key */
+			return true;
+		case SDL_APP_WILLENTERBACKGROUND:
+		case SDL_APP_DIDENTERBACKGROUND:
+			panel_cancel_repeat(a);
+			return false;
 		default:
 			return false;
 	}
 }
 
+/*
+ * Handle queued events until one is handled or the queue is empty; return
+ * true if one was handled.  Draining before the caller sleeps matters: a
+ * touch screen delivers finger events at its refresh rate, and sleeping
+ * after each unhandled one (as term_xtra_event() once did) let the queue
+ * grow faster than it drained while a panel piece was being dragged.
+ */
+static bool get_events(struct my_app *a)
+{
+	do {
+		if (get_event(a)) {
+			return true;
+		}
+	} while (SDL_HasEvents(SDL_FIRSTEVENT, SDL_LASTEVENT));
+	return false;
+}
+
 static void refresh_angband_terms(struct my_app *a)
 {
+	/*
+	 * A term the frontend resized keeps its old contents until the core
+	 * draws it again.  The redraw flags below cover the map and the usual
+	 * subwindows once a level exists; EVENT_REFRESH freshens the main term
+	 * at any time after the game's init, before a level exists.
+	 */
+	if (player) {
+		event_signal(EVENT_REFRESH);
+	}
+
 	if (!character_dungeon) {
 		return;
 	}
@@ -4671,7 +4966,8 @@ static errr term_xtra_event(int v)
 	if (v) {
 		while (true) {
 			for (int i = 0; i < DEFAULT_IDLE_UPDATE_PERIOD; i++) {
-				if (get_event(subwindow->app)) {
+				panel_tick(subwindow->app);
+				if (get_events(subwindow->app)) {
 					return 0;
 				}
 				SDL_Delay(subwindow->window->delay);
@@ -4679,7 +4975,8 @@ static errr term_xtra_event(int v)
 			idle_update();
 		}
 	} else {
-		(void) get_event(subwindow->app);
+		panel_tick(subwindow->app);
+		(void) get_events(subwindow->app);
 	}
 
 	return 0;
@@ -4693,6 +4990,20 @@ static errr term_xtra_flush(void)
 		switch (event.type) {
 			case SDL_WINDOWEVENT:
 				handle_windowevent(&g_app, &event.window);
+				break;
+			case SDL_MOUSEBUTTONUP:
+				/*
+				 * A release is not input to discard: the touch
+				 * panel arms a key on the press and must see the
+				 * release to disarm it and give up focus.
+				 */
+				(void) handle_mousebutton(&g_app, &event.button);
+				break;
+			case SDL_FINGERDOWN:
+			case SDL_FINGERMOTION:
+			case SDL_FINGERUP:
+				/* Likewise the fingers of a two-finger drag. */
+				(void) handle_finger(&g_app, &event.tfinger);
 				break;
 		}
 	}
@@ -5834,6 +6145,16 @@ static struct subwindow *get_subwindow_by_index(
 static struct subwindow *get_subwindow_by_xy(
 		const struct sdlpui_window *window, int x, int y)
 {
+	/*
+	 * The touch panel owns its home area and its pieces, whatever terms
+	 * lie under them.
+	 */
+	if (window->panel && ((window->has_panel
+			&& is_point_in_rect(x, y, &window->panel_rect))
+			|| panel_piece_at(window, x, y))) {
+		return NULL;
+	}
+
 	/* checking subwindows in z order */
 	for (size_t i = N_ELEMENTS(window->subwindows); i > 0; i--) {
 		struct subwindow *subwindow = window->subwindows[i - 1];
@@ -5847,6 +6168,3182 @@ static struct subwindow *get_subwindow_by_xy(
 
 	return NULL;
 }
+
+/*
+ * The touch panel is the iOS build's only means of typing: it is compiled
+ * for that platform alone, and the stubs below stand in for it elsewhere,
+ * so the handful of shared call sites need no guards of their own.
+ */
+#ifdef ON_IOS
+
+/* Queue a key press as if it came from a keyboard. */
+static void push_key_event(struct sdlpui_window *window, SDL_Keycode sym,
+		Uint16 mod)
+{
+	SDL_Event ev;
+
+	memset(&ev, 0, sizeof(ev));
+	ev.type = SDL_KEYDOWN;
+	ev.key.timestamp = SDL_GetTicks();
+	ev.key.windowID = window->id;
+	ev.key.state = SDL_PRESSED;
+	ev.key.repeat = 0;
+	ev.key.keysym.scancode = SDL_GetScancodeFromKey(sym);
+	ev.key.keysym.sym = sym;
+	ev.key.keysym.mod = mod;
+	SDL_PushEvent(&ev);
+}
+
+/* Queue text as if it had been typed. */
+static void push_text_event(struct sdlpui_window *window, const char *utf8)
+{
+	SDL_Event ev;
+
+	memset(&ev, 0, sizeof(ev));
+	ev.type = SDL_TEXTINPUT;
+	ev.text.timestamp = SDL_GetTicks();
+	ev.text.windowID = window->id;
+	(void) my_strcpy(ev.text.text, utf8, sizeof(ev.text.text));
+	SDL_PushEvent(&ev);
+}
+
+/*
+ * Queue a keypress for the game's core directly, then wake the event loop
+ * (get_event() treats SDL_USEREVENT as handled) so that Term_inkey()
+ * looks at its queue.  Used for keypad digits, which only reach the core
+ * through SDL key events when the keypad modifier option is on.
+ */
+static void push_term_keypress(keycode_t code, uint8_t mods)
+{
+	SDL_Event ev;
+
+	Term_keypress(code, mods);
+	memset(&ev, 0, sizeof(ev));
+	ev.type = SDL_USEREVENT;
+	ev.user.timestamp = SDL_GetTicks();
+	SDL_PushEvent(&ev);
+}
+
+/*
+ * Touch panel: two pieces, each a pinned,
+ * borderless dialog, sharing one state: the compass rose, and the key
+ * stack of panel_key controls.  A key sends what a keyboard would, a
+ * keycode with modifiers or text, when it is pressed.  Between taps the
+ * panel holds no focus, so the game owns the redraws.
+ *
+ * The key stack is one frame of PANEL_COLS by PANEL_ROWS cells, the same
+ * on every tab:
+ *
+ *   Act  Items Info  Mine  Keys  .  .  .  .  .  .   ^   v
+ *   .    .     .     .     .     .  .  .  .  .  .   <   >
+ *   .    .     .     .     .     .  .  .  .  .  .   BS  Ctrl
+ *   .    .     .     .     .     .  .  .  .  .  .   Sh  Space
+ *   .    .     .     .     .     .  .  .  .  .  .   Esc Enter
+ *
+ * The chrome is the two right-hand columns, beside the right thumb, with
+ * the most pressed keys (Escape and Enter) in the bottom corner and the
+ * least (the arrows, which the rose supersedes except in text prompts and
+ * the recall viewers) at the top.  The tab strip is the top left.  The
+ * rest -- the strip of cells beside the tabs and the block under them --
+ * is the current tab's: a slot tab lays its PANEL_GRID_COLS by
+ * PANEL_GRID_ROWS grid of word-faced keys over the block, in cells wide
+ * enough for a word, and leaves the strip for the fast keys
+ * the fast keys; the Keys tab fills strip and block with a
+ * keyboard's characters.  Shift and Ctrl are sticky: one tap applies to
+ * the next key, a quick second tap locks, a tap when locked (or a slow
+ * second tap) clears.  Keys with repeat set, and the rose, re-fire while
+ * held.
+ *
+ * Placement: the "panel" region is the home area, drawn dimmed and taking
+ * no taps for the terms under it.  By default the rose sits at its bottom
+ * left, lifted off the bottom edge, and the key stack above the rose in a
+ * column or to its right in a band (an area wider than tall).  A piece
+ * with a region of its own ("rose" or "keys") goes there instead, and a
+ * two-finger drag (handle_finger()) moves a piece anywhere, storing its
+ * new place as such a region for the current orientation.
+ */
+/* minimum touch target, in points; scaled by the window's ui_scale */
+#define PANEL_MIN_TOUCH_POINTS 44
+/* keys are no wider than this, in points, however wide the panel is */
+#define PANEL_MAX_KEY_POINTS 64
+/* space between keys, in points */
+#define PANEL_GAP_POINTS 4
+/* the key stack's frame; see the comment above */
+#define PANEL_COLS 13
+#define PANEL_ROWS 5
+#define PANEL_CHROME_COLS 2
+#define PANEL_CHROME_KEYS (PANEL_CHROME_COLS * PANEL_ROWS)
+#define PANEL_TABS 5
+#define PANEL_TAB_KEYS 4
+/* the current tab's area: the strip beside the tabs, the block below */
+#define PANEL_BLOCK_COLS (PANEL_COLS - PANEL_CHROME_COLS)
+#define PANEL_BLOCK_ROWS (PANEL_ROWS - 1)
+#define PANEL_STRIP_COLS (PANEL_BLOCK_COLS - PANEL_TABS)
+#define PANEL_KEYS_CELLS (PANEL_STRIP_COLS + PANEL_BLOCK_COLS * PANEL_BLOCK_ROWS)
+/* a slot tab's grid, laid over the block */
+#define PANEL_GRID_COLS 7
+#define PANEL_GRID_ROWS PANEL_BLOCK_ROWS
+#define PANEL_GRID_CELLS (PANEL_GRID_COLS * PANEL_GRID_ROWS)
+#define PANEL_MAX_KEYS (PANEL_CHROME_KEYS + PANEL_TABS \
+	+ PANEL_TAB_KEYS * PANEL_GRID_CELLS + PANEL_KEYS_CELLS)
+/* a second tap on a modifier within this many ms locks it */
+#define PANEL_DOUBLE_TAP_MS 400
+/* a held key re-fires after this delay, then at this interval (ms) */
+#define PANEL_REPEAT_DELAY_MS 450
+#define PANEL_REPEAT_INTERVAL_MS 120
+/* in a column, the rose's bottom edge is this far above the panel's */
+#define PANEL_ROSE_LIFT_POINTS 140
+/* the rose's default diameter, in points */
+#define PANEL_ROSE_SIZE_POINTS 156
+/* the petals' outline thickness, in points */
+#define PANEL_ROSE_LINE_POINTS 4.5f
+/*
+ * Rose geometry, as fractions of the radius, measured along the petal's
+ * bearing from the rose's centre.  A petal is a teardrop: a sharp apex,
+ * two sides running as tangents to a circular lobe, and the lobe's major
+ * arc.  Because the sides are true tangents the joins are smooth, which
+ * is most of what makes the shape read as Brogue's.
+ *
+ * The cardinals point their apex at the centre and their lobe outward.
+ * The diagonals are mirrored -- apex outward, towards the corner of the
+ * square, lobe inward -- and sit far enough out that each falls in the
+ * corner cell of the rose's three-by-three division (see rose_hit).
+ */
+#define PANEL_ROSE_CARD_APEX 0.30f
+#define PANEL_ROSE_CARD_LOBE 0.74f
+#define PANEL_ROSE_CARD_RADIUS 0.26f
+#define PANEL_ROSE_DIAG_APEX 1.20f
+#define PANEL_ROSE_DIAG_LOBE 0.72f
+#define PANEL_ROSE_DIAG_RADIUS 0.20f
+/* how far a side bows outward from the straight tangent, in degrees */
+#define PANEL_ROSE_BOW_DEG 7.0f
+#define PANEL_ROSE_CENTER_SIDE 0.36f
+#define PANEL_ROSE_PETALS 8
+#define PANEL_ROSE_CENTER 8
+/* interior points per bowed side, and points along the lobe's arc */
+#define PANEL_ROSE_SIDE_POINTS 10
+#define PANEL_ROSE_ARC_POINTS 15
+#define PANEL_ROSE_POINTS \
+	(1 + 2 * PANEL_ROSE_SIDE_POINTS + PANEL_ROSE_ARC_POINTS)
+enum panel_key_kind {
+	PANEL_KEY_SEND,		/* sends a key or text */
+	PANEL_KEY_MODIFIER,	/* sticky Shift or Ctrl; value is the modifier */
+	PANEL_KEY_TAB		/* selects a tab; value is the tab */
+};
+
+/*
+ * Where a key lives: the chrome, the tab strip, a slot tab's grid
+ * (PANEL_GROUP_TAB0 + the tab) or the Keys tab.
+ */
+enum panel_group {
+	PANEL_GROUP_CHROME,
+	PANEL_GROUP_TABS,
+	PANEL_GROUP_TAB0,
+	PANEL_GROUP_KEYS = PANEL_GROUP_TAB0 + PANEL_TAB_KEYS
+};
+
+enum panel_modifier {
+	PANEL_MOD_SHIFT,
+	PANEL_MOD_CTRL,
+	PANEL_MOD_COUNT
+};
+
+enum panel_mod_state {
+	PANEL_MOD_OFF,
+	PANEL_MOD_ONESHOT,
+	PANEL_MOD_LOCKED
+};
+
+/*
+ * One cell of a slot tab, as panel.txt gives it: a command named by its
+ * description, literal text, a special key, or nothing.
+ */
+enum panel_slot_kind {
+	PANEL_SLOT_EMPTY,
+	PANEL_SLOT_COMMAND,
+	PANEL_SLOT_ACTION
+};
+
+struct panel_slot {
+	enum panel_slot_kind kind;
+	/* the description a command reference names; NULL otherwise */
+	char *desc;
+	/*
+	 * The face to show.  A command's is left NULL so that it can come
+	 * from the shared table at build time; an "=Face" suffix fills this
+	 * in for any kind and wins.
+	 */
+	char *face;
+	/* a keymap's action, as struct prefs_data holds one */
+	struct keypress act[KEYMAP_ACTION_MAX];
+};
+
+struct panel_key {
+	char *caption;
+	/* relative to the control's rect */
+	SDL_Rect caption_rect;
+	enum panel_key_kind kind;
+	int group;
+	/* cell within the group's grid */
+	int cell;
+	/* modifier, tab or layer for the kinds that select one */
+	int value;
+	/* what a send key sends: sym, or text if sym is SDLK_UNKNOWN */
+	SDL_Keycode sym;
+	char text[8];
+	/* what a text key sends, and shows, while Shift is active; or empty */
+	char shift_text[8];
+	/*
+	 * What a slot from panel.txt sends: the command whose key is looked
+	 * up for the active keyset when the slot is pressed, or a keymap
+	 * action.  Both NULL for every other key.
+	 */
+	const struct cmd_info *cmd;
+	struct keypress *act;
+	/*
+	 * A slot's word (its face from panel.txt or the face table), shown
+	 * beneath what the slot sends; NULL for every other key.
+	 */
+	char *word;
+	/* re-fires while held */
+	bool repeat;
+	bool armed;
+	bool has_mouse;
+	bool disabled;
+};
+
+/*
+ * The compass rose: eight petals, the cardinals longer, and a centre
+ * square.  Petal i points at bearing 45 * i degrees clockwise from north.
+ * It sends what a keypad does: the direction's digit with the keypad
+ * modifier, plus Shift to run or Ctrl to alter.
+ */
+struct panel_rose {
+	/* centre and radius, relative to the control's rect */
+	int cx, cy, radius;
+	/* petal under the finger, PANEL_ROSE_CENTER, or -1 */
+	int active;
+	bool armed;
+	bool has_mouse;
+	char face[8];
+};
+
+/* The state the pieces share; window->panel points to it. */
+struct panel_shared {
+	/* the pieces' dialogs; NULL where a piece has no place */
+	struct sdlpui_dialog *pieces[PANEL_PIECE_COUNT];
+	int cur_tab;
+	/* the slot tabs' grids, from panel.txt; see load_panel_slots() */
+	struct panel_slot slots[PANEL_TAB_KEYS][PANEL_GRID_CELLS];
+	enum panel_mod_state mod_state[PANEL_MOD_COUNT];
+	Uint32 mod_tap_time[PANEL_MOD_COUNT];
+	/* the repeating control being held, if any, its piece, and when it next fires */
+	struct sdlpui_control *held;
+	struct sdlpui_dialog *held_d;
+	Uint32 next_repeat;
+};
+
+/* A piece's private data: which piece it is, and its controls */
+struct panel_piece {
+	enum panel_piece_kind kind;
+	struct panel_shared *shared;
+	/* the key stack's controls; empty in the rose piece */
+	struct sdlpui_control keys[PANEL_MAX_KEYS];
+	int nkeys;
+	/* the rose control; unset in the key stack */
+	struct sdlpui_control rose;
+};
+
+static struct panel_shared *panel_shared_of(const struct sdlpui_dialog *d)
+{
+	SDL_assert(d->type_code == PANEL_CODE && d->priv);
+	return ((const struct panel_piece *) d->priv)->shared;
+}
+
+/* Every piece shows some of the shared state; redraw them all. */
+static void panel_redraw(struct panel_shared *ps, struct sdlpui_window *w)
+{
+	int i;
+
+	for (i = 0; i < PANEL_PIECE_COUNT; i++) {
+		if (ps->pieces[i]) {
+			ps->pieces[i]->dirty = true;
+		}
+	}
+	sdlpui_signal_redraw(w);
+}
+
+/* Is the key shown for the panel's current tab? */
+static bool panel_key_visible(const struct panel_shared *ps,
+		const struct panel_key *pk)
+{
+	if (pk->group == PANEL_GROUP_CHROME || pk->group == PANEL_GROUP_TABS) {
+		return true;
+	}
+	if (ps->cur_tab < PANEL_TAB_KEYS) {
+		return pk->group == PANEL_GROUP_TAB0 + ps->cur_tab;
+	}
+	return pk->group == PANEL_GROUP_KEYS;
+}
+
+/* A single ASCII letter, which Shift and Ctrl act on */
+static bool panel_key_is_letter(const struct panel_key *pk)
+{
+	return pk->sym == SDLK_UNKNOWN && pk->text[0] && !pk->text[1]
+		&& isalpha((unsigned char) pk->text[0]);
+}
+
+/* Which modifiers apply to the next key */
+static void panel_active_mods(const struct panel_shared *ps, bool *shift,
+		bool *ctrl)
+{
+	*shift = ps->mod_state[PANEL_MOD_SHIFT] != PANEL_MOD_OFF;
+	*ctrl = ps->mod_state[PANEL_MOD_CTRL] != PANEL_MOD_OFF;
+}
+
+/* A one-shot modifier is spent by the key it applied to. */
+static void panel_spend_oneshots(struct sdlpui_dialog *d,
+		struct sdlpui_window *w)
+{
+	struct panel_shared *ps = panel_shared_of(d);
+	int i;
+
+	for (i = 0; i < PANEL_MOD_COUNT; i++) {
+		if (ps->mod_state[i] == PANEL_MOD_ONESHOT) {
+			ps->mod_state[i] = PANEL_MOD_OFF;
+			panel_redraw(ps, w);
+		}
+	}
+}
+
+/* Start or stop repeating a held control. */
+static void panel_hold(struct sdlpui_dialog *d, struct sdlpui_control *c)
+{
+	struct panel_shared *ps = panel_shared_of(d);
+
+	ps->held = c;
+	ps->held_d = d;
+	ps->next_repeat = SDL_GetTicks() + PANEL_REPEAT_DELAY_MS;
+}
+
+/* Stop repeating c, or whatever is held if c is NULL. */
+static void panel_release(struct sdlpui_dialog *d, struct sdlpui_control *c)
+{
+	struct panel_shared *ps = panel_shared_of(d);
+
+	if (!c || ps->held == c) {
+		ps->held = NULL;
+		ps->held_d = NULL;
+	}
+}
+
+/*
+ * The key a command slot sends now: looked up at the press, and at each
+ * redraw, for the keyset in force, so that turning the roguelike option
+ * on or off never means editing or re-seeding panel.txt.
+ */
+static keycode_t panel_command_key(const struct cmd_info *cmd)
+{
+	int mode = (player && OPT(player, rogue_like_commands)) ?
+		KEYMAP_MODE_ROGUE : KEYMAP_MODE_ORIG;
+	keycode_t key = cmd->key[mode];
+
+	/* Before cmd_init() the roguelike keys are still unfilled. */
+	if (!key) {
+		key = cmd->key[0];
+	}
+	return key;
+}
+
+/*
+ * Append one keypress to a face the way a keycap would show it: ^X for
+ * a control character, a glyph for the named keys the panel's font has,
+ * [Name] for the other named keys, and the character itself otherwise.
+ * Follows keypress_to_text() but without that function's escapes, which
+ * are for a file, not a face.
+ */
+static void cat_keypress_face(char *buf, size_t len, struct keypress k)
+{
+	static const struct { keycode_t code; const char *glyph; } glyphs[] = {
+		{ ESCAPE, "⎋" }, { KC_ENTER, "⏎" }, { KC_TAB, "⇥" },
+		{ KC_BACKSPACE, "⌫" }, { ARROW_UP, "↑" }, { ARROW_DOWN, "↓" },
+		{ ARROW_LEFT, "←" }, { ARROW_RIGHT, "→" }, { ' ', "␣" }
+	};
+	keycode_t code = k.code;
+	int mods = k.mods;
+	const char *desc = keycode_find_desc(code);
+	char tmp[32];
+	size_t i;
+
+	if (code < 0x20 && !desc) {
+		mods |= KC_MOD_CONTROL;
+		code = UN_KTRL(code);
+	}
+	if (mods & KC_MOD_CONTROL && !(mods & ~KC_MOD_CONTROL)) {
+		my_strcat(buf, "^", len);
+	} else if (mods) {
+		my_strcat(buf, "{", len);
+		if (mods & KC_MOD_CONTROL) my_strcat(buf, "^", len);
+		if (mods & KC_MOD_SHIFT) my_strcat(buf, "S", len);
+		if (mods & KC_MOD_ALT) my_strcat(buf, "A", len);
+		if (mods & KC_MOD_META) my_strcat(buf, "M", len);
+		if (mods & KC_MOD_KEYPAD) my_strcat(buf, "K", len);
+		my_strcat(buf, "}", len);
+	}
+	for (i = 0; i < N_ELEMENTS(glyphs); i++) {
+		if (glyphs[i].code == code) {
+			my_strcat(buf, glyphs[i].glyph, len);
+			return;
+		}
+	}
+	if (desc) {
+		strnfmt(tmp, sizeof(tmp), "[%s]", desc);
+	} else if (code < 127) {
+		strnfmt(tmp, sizeof(tmp), "%c", (int) code);
+	} else {
+		my_strcpy(tmp, "?", sizeof(tmp));
+	}
+	my_strcat(buf, tmp, len);
+}
+
+/* What a slot sends, as a face: the command's key now, or the action. */
+static void get_panel_key_keys(const struct panel_key *pk, char *buf,
+		size_t len)
+{
+	buf[0] = '\0';
+	if (pk->cmd) {
+		keycode_t key = panel_command_key(pk->cmd);
+
+		if (key) {
+			struct keypress k = { EVT_KBRD, key, 0 };
+
+			cat_keypress_face(buf, len, k);
+		}
+	} else if (pk->act) {
+		const struct keypress *k;
+
+		for (k = pk->act; k->type == EVT_KBRD; k++) {
+			cat_keypress_face(buf, len, *k);
+		}
+	}
+}
+
+static void fire_panel_key(struct sdlpui_control *c, struct sdlpui_dialog *d,
+		struct sdlpui_window *w)
+{
+	struct panel_key *pk;
+	struct panel_shared *ps;
+	bool shift, ctrl;
+
+	SDL_assert(c->type_code == PANEL_KEY_CODE && c->priv);
+	SDL_assert(d->type_code == PANEL_CODE && d->priv);
+	pk = c->priv;
+	ps = panel_shared_of(d);
+	if (pk->disabled) {
+		return;
+	}
+
+	switch (pk->kind) {
+		case PANEL_KEY_MODIFIER: {
+			Uint32 now = SDL_GetTicks();
+			enum panel_mod_state next;
+
+			/*
+			 * One tap arms the modifier for the next key; a quick
+			 * second tap locks it; a slow second tap, or a tap when
+			 * locked, clears it.
+			 */
+			switch (ps->mod_state[pk->value]) {
+				case PANEL_MOD_OFF:
+					next = PANEL_MOD_ONESHOT;
+					break;
+				case PANEL_MOD_ONESHOT:
+					next = (now - ps->mod_tap_time[pk->value]
+						<= PANEL_DOUBLE_TAP_MS) ?
+						PANEL_MOD_LOCKED : PANEL_MOD_OFF;
+					break;
+				default:
+					next = PANEL_MOD_OFF;
+					break;
+			}
+			ps->mod_state[pk->value] = next;
+			ps->mod_tap_time[pk->value] = now;
+			panel_redraw(ps, w);
+			return;
+		}
+
+		case PANEL_KEY_TAB:
+			ps->cur_tab = pk->value;
+			panel_redraw(ps, w);
+			return;
+
+		case PANEL_KEY_SEND:
+			break;
+	}
+
+	panel_active_mods(ps, &shift, &ctrl);
+	if (pk->cmd) {
+		/* A slot names a command, not a key; see panel_command_key(). */
+		keycode_t key = panel_command_key(pk->cmd);
+
+		if (key) {
+			push_term_keypress(key, 0);
+		}
+	} else if (pk->act) {
+		/*
+		 * A slot's action is a keymap's action: install it and send
+		 * its first keypress, as textui_get_command() does with the
+		 * keymap it matched.
+		 */
+		struct keypress first = feed_keymap(pk->act);
+
+		if (first.type == EVT_KBRD) {
+			push_term_keypress(first.code, first.mods);
+		}
+	} else if (pk->sym != SDLK_UNKNOWN) {
+		Uint16 mod = 0;
+
+		if (shift) {
+			mod |= KMOD_LSHIFT;
+		}
+		if (ctrl) {
+			mod |= KMOD_LCTRL;
+		}
+		push_key_event(w, pk->sym, mod);
+	} else if (panel_key_is_letter(pk) && ctrl) {
+		/*
+		 * Control characters come from key events, as they do from
+		 * a keyboard; the frontend turns them into KTRL codes.
+		 */
+		SDL_Keycode sym = SDLK_a
+			+ (tolower((unsigned char) pk->text[0]) - 'a');
+
+		push_key_event(w, sym, KMOD_LCTRL | (shift ? KMOD_LSHIFT : 0));
+	} else if (pk->shift_text[0] && shift) {
+		/* A keyboard's Shift: the capital, or the upper symbol. */
+		push_text_event(w, pk->shift_text);
+	} else if (pk->text[0]) {
+		push_text_event(w, pk->text);
+	}
+	panel_spend_oneshots(d, w);
+}
+
+static bool handle_panel_key_mouseclick(struct sdlpui_control *c,
+		struct sdlpui_dialog *d, struct sdlpui_window *w,
+		const SDL_MouseButtonEvent *e)
+{
+	struct panel_key *pk;
+
+	SDL_assert(c->type_code == PANEL_KEY_CODE && c->priv);
+	pk = c->priv;
+	if (e->button == SDL_BUTTON_LEFT) {
+		if (e->state == SDL_PRESSED) {
+			/* Fire on the press so a held key can repeat. */
+			(*c->ftb->arm)(c, d, w, SDLPUI_ACTION_HINT_MOUSE);
+			fire_panel_key(c, d, w);
+			if (pk->repeat && pk->kind == PANEL_KEY_SEND) {
+				panel_hold(d, c);
+			}
+		} else {
+			(*c->ftb->disarm)(c, d, w, SDLPUI_ACTION_HINT_MOUSE);
+			panel_release(d, c);
+		}
+	}
+	/* Swallow the event, even if nothing was done. */
+	return true;
+}
+
+/* Centre a caption in the control's rect. */
+static void place_caption(struct sdlpui_control *c, struct sdlpui_window *w,
+		const char *caption, SDL_Rect *out)
+{
+	int tw = 0, th = 0;
+
+	if (caption && caption[0]) {
+		sdlpui_get_utf8_metrics(sdlpui_get_ttf(w), caption, &tw, &th);
+	}
+	if (tw > c->rect.w) {
+		tw = c->rect.w;
+	}
+	if (th > c->rect.h) {
+		th = c->rect.h;
+	}
+	out->x = (c->rect.w - tw) / 2;
+	out->y = (c->rect.h - th) / 2;
+	out->w = tw;
+	out->h = th;
+}
+
+static void change_panel_key_caption(struct sdlpui_control *c,
+		struct sdlpui_dialog *d, struct sdlpui_window *w,
+		const char *new_caption)
+{
+	struct panel_key *pk;
+
+	SDL_assert(c->type_code == PANEL_KEY_CODE && c->priv);
+	pk = c->priv;
+	string_free(pk->caption);
+	pk->caption = string_make(new_caption);
+	place_caption(c, w, pk->caption, &pk->caption_rect);
+	d->dirty = true;
+	sdlpui_signal_redraw(w);
+}
+
+static void render_panel_key(struct sdlpui_control *c,
+		struct sdlpui_dialog *d, struct sdlpui_window *w,
+		SDL_Renderer *r)
+{
+	const SDL_Color *fg = &w->app->colors[COLOUR_WHITE];
+	const SDL_Color *bg = &w->app->colors[COLOUR_L_DARK];
+	const SDL_Color *border = &w->app->colors[COLOUR_SLATE];
+	struct panel_key *pk;
+	struct panel_shared *ps;
+	const char *caption;
+	SDL_Rect dst_r, cap_r;
+
+	SDL_assert(c->type_code == PANEL_KEY_CODE && c->priv);
+	SDL_assert(d->type_code == PANEL_CODE && d->priv);
+	pk = c->priv;
+	ps = panel_shared_of(d);
+
+	/* Selected tabs and locked modifiers are inverted; one-shot is lit. */
+	if ((pk->kind == PANEL_KEY_TAB && pk->value == ps->cur_tab)
+			|| (pk->kind == PANEL_KEY_MODIFIER
+			&& ps->mod_state[pk->value] == PANEL_MOD_LOCKED)) {
+		fg = &w->app->colors[COLOUR_DARK];
+		bg = &w->app->colors[COLOUR_WHITE];
+		border = bg;
+	} else if (pk->kind == PANEL_KEY_MODIFIER
+			&& ps->mod_state[pk->value] == PANEL_MOD_ONESHOT) {
+		bg = &w->app->colors[COLOUR_SLATE];
+		border = &w->app->colors[COLOUR_WHITE];
+	}
+	if (pk->armed) {
+		bg = &w->app->colors[COLOUR_SLATE];
+	}
+	if (pk->armed || pk->has_mouse) {
+		border = &w->app->colors[COLOUR_WHITE];
+	}
+
+	dst_r = c->rect;
+	if (!d->texture) {
+		/* Drawing directly to the window; use its coordinates. */
+		dst_r.x += d->rect.x;
+		dst_r.y += d->rect.y;
+	}
+	SDL_SetRenderDrawColor(r, bg->r, bg->g, bg->b, bg->a);
+	SDL_RenderFillRect(r, &dst_r);
+	SDL_SetRenderDrawColor(r, border->r, border->g, border->b, border->a);
+	SDL_RenderDrawRect(r, &dst_r);
+
+	if (pk->word) {
+		/*
+		 * A slot is two lines: what it sends, as keycaps, in the text
+		 * colour, and its word beneath in a lighter grey.  Too short
+		 * a cell for both shows the word alone.
+		 */
+		const SDL_Color *dim = &w->app->colors[COLOUR_L_WHITE];
+		char keys[32];
+		int kw = 0, kh = 0, ww = 0, wh = 0;
+		SDL_Rect line;
+
+		get_panel_key_keys(pk, keys, sizeof(keys));
+		if (keys[0]) {
+			sdlpui_get_utf8_metrics(sdlpui_get_ttf(w), keys, &kw, &kh);
+		}
+		sdlpui_get_utf8_metrics(sdlpui_get_ttf(w), pk->word, &ww, &wh);
+		if (kh + wh > c->rect.h) {
+			kw = 0;
+			kh = 0;
+		}
+		line.y = dst_r.y + (c->rect.h - kh - wh) / 2;
+		if (kh > 0) {
+			line.w = MIN(kw, c->rect.w);
+			line.h = kh;
+			line.x = dst_r.x + (c->rect.w - line.w) / 2;
+			sdlpui_render_utf8_line(r, sdlpui_get_ttf(w), fg, &line,
+				keys);
+			line.y += kh;
+		}
+		line.w = MIN(ww, c->rect.w);
+		line.h = wh;
+		line.x = dst_r.x + (c->rect.w - line.w) / 2;
+		sdlpui_render_utf8_line(r, sdlpui_get_ttf(w), dim, &line,
+			pk->word);
+	} else {
+		/* A key shows what Shift makes of it while Shift is active. */
+		caption = pk->caption;
+		cap_r = pk->caption_rect;
+		if (pk->shift_text[0]
+				&& ps->mod_state[PANEL_MOD_SHIFT] != PANEL_MOD_OFF) {
+			caption = pk->shift_text;
+			place_caption(c, w, caption, &cap_r);
+		}
+		if (cap_r.w > 0 && cap_r.h > 0) {
+			cap_r.x += dst_r.x;
+			cap_r.y += dst_r.y;
+			sdlpui_render_utf8_line(r, sdlpui_get_ttf(w), fg, &cap_r,
+				caption);
+		}
+	}
+
+	if (pk->disabled) {
+		sdlpui_stipple_rect(r, sdlpui_get_stipple(w), &dst_r);
+	}
+}
+
+static void respond_default_panel_key(struct sdlpui_control *c,
+		struct sdlpui_dialog *d, struct sdlpui_window *w,
+		enum sdlpui_action_hint hint)
+{
+	fire_panel_key(c, d, w);
+}
+
+static void gain_mouse_panel_key(struct sdlpui_control *c,
+		struct sdlpui_dialog *d, struct sdlpui_window *w, int comp_ind)
+{
+	struct panel_key *pk;
+
+	SDL_assert(c->type_code == PANEL_KEY_CODE && c->priv);
+	pk = c->priv;
+	if (!pk->has_mouse) {
+		pk->has_mouse = true;
+		d->dirty = true;
+		sdlpui_signal_redraw(w);
+	}
+}
+
+static void lose_mouse_panel_key(struct sdlpui_control *c,
+		struct sdlpui_dialog *d, struct sdlpui_window *w,
+		struct sdlpui_control *new_c, struct sdlpui_dialog *new_d)
+{
+	struct panel_key *pk;
+
+	SDL_assert(c->type_code == PANEL_KEY_CODE && c->priv);
+	pk = c->priv;
+	if (pk->has_mouse) {
+		pk->has_mouse = false;
+		d->dirty = true;
+		sdlpui_signal_redraw(w);
+	}
+}
+
+static void arm_panel_key(struct sdlpui_control *c, struct sdlpui_dialog *d,
+		struct sdlpui_window *w, enum sdlpui_action_hint hint)
+{
+	struct panel_key *pk;
+
+	SDL_assert(c->type_code == PANEL_KEY_CODE && c->priv);
+	pk = c->priv;
+	if (!pk->armed) {
+		pk->armed = true;
+		d->dirty = true;
+		sdlpui_signal_redraw(w);
+	}
+}
+
+static void disarm_panel_key(struct sdlpui_control *c,
+		struct sdlpui_dialog *d, struct sdlpui_window *w,
+		enum sdlpui_action_hint hint)
+{
+	struct panel_key *pk;
+
+	SDL_assert(c->type_code == PANEL_KEY_CODE && c->priv);
+	pk = c->priv;
+	if (pk->armed) {
+		pk->armed = false;
+		d->dirty = true;
+		sdlpui_signal_redraw(w);
+	}
+}
+
+static int get_panel_key_interactable_component(struct sdlpui_control *c,
+		bool first)
+{
+	struct panel_key *pk;
+
+	SDL_assert(c->type_code == PANEL_KEY_CODE && c->priv);
+	pk = c->priv;
+	return (pk->disabled) ? 0 : 1;
+}
+
+static void resize_panel_key(struct sdlpui_control *c,
+		struct sdlpui_dialog *d, struct sdlpui_window *w, int width,
+		int height)
+{
+	struct panel_key *pk;
+
+	SDL_assert(c->type_code == PANEL_KEY_CODE && c->priv);
+	pk = c->priv;
+	c->rect.w = width;
+	c->rect.h = height;
+	place_caption(c, w, pk->caption, &pk->caption_rect);
+}
+
+static void query_panel_key_natural_size(struct sdlpui_control *c,
+		struct sdlpui_dialog *d, struct sdlpui_window *w, int *width,
+		int *height)
+{
+	struct panel_key *pk;
+	int tw = 0, th = 0;
+	int min_touch = (int)(PANEL_MIN_TOUCH_POINTS * w->ui_scale + 0.5f);
+
+	SDL_assert(c->type_code == PANEL_KEY_CODE && c->priv);
+	pk = c->priv;
+	if (pk->caption && pk->caption[0]) {
+		sdlpui_get_utf8_metrics(sdlpui_get_ttf(w), pk->caption,
+			&tw, &th);
+	}
+	*width = MAX(tw + 2 * SDLPUI_DEFAULT_CTRL_BORDER, min_touch);
+	*height = MAX(th + 2 * SDLPUI_DEFAULT_CTRL_BORDER, min_touch);
+}
+
+static bool is_panel_key_disabled(const struct sdlpui_control *c)
+{
+	const struct panel_key *pk;
+
+	SDL_assert(c->type_code == PANEL_KEY_CODE && c->priv);
+	pk = c->priv;
+	return pk->disabled;
+}
+
+static bool set_panel_key_disabled(struct sdlpui_control *c,
+		struct sdlpui_dialog *d, struct sdlpui_window *w, bool disabled)
+{
+	struct panel_key *pk;
+	bool old;
+
+	SDL_assert(c->type_code == PANEL_KEY_CODE && c->priv);
+	pk = c->priv;
+	old = pk->disabled;
+	if (old != disabled) {
+		pk->disabled = disabled;
+		d->dirty = true;
+		sdlpui_signal_redraw(w);
+	}
+	return old;
+}
+
+static void cleanup_panel_key(struct sdlpui_control *c)
+{
+	struct panel_key *pk;
+
+	SDL_assert(c->type_code == PANEL_KEY_CODE && c->priv);
+	pk = c->priv;
+	string_free(pk->caption);
+	if (pk->word) {
+		string_free(pk->word);
+	}
+	mem_free(pk->act);
+	SDL_free(pk);
+	c->priv = NULL;
+}
+
+/*
+ * Initialize the panel's next control as a key in the given group and
+ * cell.  A send key sends sym with mod, or text if sym is SDLK_UNKNOWN;
+ * the other kinds use value.
+ */
+static struct sdlpui_control *add_panel_key(struct panel_piece *pp,
+		enum panel_key_kind kind, int group, int cell,
+		const char *caption, SDL_Keycode sym, const char *text,
+		int value, bool repeat)
+{
+	static const struct sdlpui_control_funcs panel_key_funcs = {
+		.handle_mouseclick = handle_panel_key_mouseclick,
+		.handle_mousemove = sdlpui_control_handle_mousemove,
+		.change_caption = change_panel_key_caption,
+		.render = render_panel_key,
+		.respond_default = respond_default_panel_key,
+		.gain_mouse = gain_mouse_panel_key,
+		.lose_mouse = lose_mouse_panel_key,
+		.arm = arm_panel_key,
+		.disarm = disarm_panel_key,
+		.get_interactable_component =
+			get_panel_key_interactable_component,
+		.resize = resize_panel_key,
+		.query_natural_size = query_panel_key_natural_size,
+		.is_disabled = is_panel_key_disabled,
+		.set_disabled = set_panel_key_disabled,
+		.cleanup = cleanup_panel_key
+	};
+	struct sdlpui_control *c;
+	struct panel_key *pk;
+
+	SDL_assert(pp->nkeys < PANEL_MAX_KEYS);
+	c = &pp->keys[pp->nkeys++];
+	pk = SDL_calloc(1, sizeof(*pk));
+	pk->caption = string_make(caption ? caption : "");
+	pk->kind = kind;
+	pk->group = group;
+	pk->cell = cell;
+	pk->value = value;
+	pk->sym = sym;
+	if (text) {
+		(void) my_strcpy(pk->text, text, sizeof(pk->text));
+	}
+	pk->repeat = repeat;
+
+	c->ftb = &panel_key_funcs;
+	c->priv = pk;
+	c->type_code = PANEL_KEY_CODE;
+	c->rect.x = 0;
+	c->rect.y = 0;
+	c->rect.w = 0;
+	c->rect.h = 0;
+	return c;
+}
+
+/* A key that sends a keycode */
+static void add_panel_sym(struct panel_piece *pp, int group, int cell,
+		const char *caption, SDL_Keycode sym, bool repeat)
+{
+	add_panel_key(pp, PANEL_KEY_SEND, group, cell, caption, sym, NULL, 0,
+		repeat);
+}
+
+/* A key that sends text; its caption is the text unless given */
+static void add_panel_text(struct panel_piece *pp, int group, int cell,
+		const char *text, const char *caption)
+{
+	add_panel_key(pp, PANEL_KEY_SEND, group, cell, caption ? caption : text,
+		SDLK_UNKNOWN, text, 0, false);
+}
+
+/*
+ * Fill the Keys tab's cells from parallel strings of what each key sends
+ * plain and with Shift, as a keyboard's rows go: "1" and "!", "a" and "A".
+ */
+static int add_panel_chars(struct panel_piece *pp, int cell,
+		const char *chars, const char *shifted)
+{
+	const char *p, *s;
+
+	for (p = chars, s = shifted; *p; p++, s++) {
+		char text[2] = { *p, '\0' };
+		struct sdlpui_control *c = add_panel_key(pp, PANEL_KEY_SEND,
+			PANEL_GROUP_KEYS, cell++, text, SDLK_UNKNOWN, text, 0,
+			false);
+		struct panel_key *pk = c->priv;
+
+		SDL_assert(*s);
+		pk->shift_text[0] = *s;
+		pk->shift_text[1] = '\0';
+	}
+	return cell;
+}
+
+/* --- panel.txt, the slot tabs' contents --- */
+
+/*
+ * The slot tabs are filled from panel.txt, read with the same parser the
+ * frontend's own config file uses.  The grammar: "tab:Name" starts a tab
+ * and each "row:" line after it
+ * fills that tab's next row of cells from whitespace separated tokens.  A
+ * token is [a command's description], "a keymap's action", or - for an
+ * empty cell, and any of them may carry an "=Face" suffix naming the word
+ * to show.
+ *
+ * The quoted form is exactly what a pref file's "keymap-act:" line takes,
+ * read by the same keypress_from_text(): "za." is three keypresses,
+ * "[Escape]" is one named key, "{^}f" is control-F.  Naming keys is the
+ * game's job, not this file's.
+ *
+ * The user's copy is read if there is one, else the shipped one, the
+ * order the game's own customizable files use.
+ */
+#define PANEL_SLOT_FILE "panel.txt"
+/* where reset_panel_slots() keeps the file it replaces */
+#define PANEL_OLD_SLOT_FILE "panel.old.txt"
+#define PANEL_SLOT_VERSION 1
+
+/* The slot tabs, in tab-strip order; the Keys tab is fixed and not one */
+static const char *panel_tab_names[PANEL_TAB_KEYS] = {
+	"Act", "Items", "Info", "Mine"
+};
+
+/* Is this one of the debug groups of cmds_all, which slots never name? */
+static bool panel_group_is_debug(const char *name)
+{
+	return streq(name, "Debug") || prefix(name, "Dbg");
+}
+
+/*
+ * The command a [Description] token names, or NULL.  Every group but the
+ * debug ones is searched, "Hidden" included: the seeder skips that group
+ * (section 4.4), but a hand-written slot may well name Stand still or
+ * Alter a grid, which live there.
+ */
+static const struct cmd_info *find_panel_command(const char *desc)
+{
+	int i;
+
+	for (i = 0; cmds_all[i].name; i++) {
+		size_t j;
+
+		if (panel_group_is_debug(cmds_all[i].name)) {
+			continue;
+		}
+		for (j = 0; j < cmds_all[i].len; j++) {
+			if (streq(cmds_all[i].list[j].desc, desc)) {
+				return &cmds_all[i].list[j];
+			}
+		}
+	}
+	return NULL;
+}
+
+/*
+ * Fill a slot from the body of a "..." token: a keymap's action in the
+ * game's own encoding, so that a slot holds precisely what a pref file's
+ * "keymap-act:" line holds.  An empty action leaves the cell bare.
+ */
+static void set_panel_slot_action(struct panel_slot *slot, const char *body)
+{
+	size_t n;
+
+	keypress_from_text(slot->act, N_ELEMENTS(slot->act), body);
+
+	/*
+	 * keypress_from_text() marks the entry it is about to fill before
+	 * it knows the text is good, and gives up where the text goes bad,
+	 * so a malformed action can end in a keypress with no keycode.  End
+	 * the action at the first of those.
+	 */
+	for (n = 0; slot->act[n].type == EVT_KBRD && slot->act[n].code; n++) {
+		/* the keypresses that came out whole */
+	}
+	slot->act[n] = KEYPRESS_NULL;
+	if (n == 0) {
+		if (body[0]) {
+			SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+				"%s: \"%s\" is not a keymap action; the slot "
+				"is left empty", PANEL_SLOT_FILE, body);
+		}
+		return;
+	}
+	slot->kind = PANEL_SLOT_ACTION;
+
+	/*
+	 * The face, until an =Face overrides it: for one keypress, the
+	 * game's own name for it (Escape, PageUp) or ^X for a control
+	 * character, so that "^p" and "{^}p" read alike; otherwise the
+	 * token as written, which for ordinary text is the text itself.
+	 */
+	if (n == 1 && !slot->act[0].mods) {
+		keycode_t code = slot->act[0].code;
+		const char *named = keycode_find_desc(code);
+		char ctrl[4];
+
+		if (named) {
+			slot->face = string_make(named);
+			return;
+		}
+		if (code < 0x20) {
+			strnfmt(ctrl, sizeof(ctrl), "^%c",
+				(char) UN_KTRL_CAP(code));
+			slot->face = string_make(ctrl);
+			return;
+		}
+	}
+	slot->face = string_make(body);
+}
+
+/* What the parser needs between lines: where the next row goes */
+struct panel_slot_data {
+	struct panel_shared *ps;
+	/* the tab the last tab: line named, or -1 before any of them */
+	int tab;
+	int row;
+};
+
+/*
+ * Read one token of a row: line into slot, leaving *pp on the rest of the
+ * line.  A token with no closing delimiter is an error, because there is
+ * then no telling where the next one begins.
+ */
+static enum parser_error parse_panel_token(const char **pp,
+		struct panel_slot *slot)
+{
+	const char *p = *pp;
+	const char *end;
+	char body[128];
+	char open = *p;
+	size_t n;
+
+	if (open == '-') {
+		/* An empty cell; there is nothing to read but its face. */
+		end = p;
+	} else {
+		switch (open) {
+			case '[': end = strchr(p + 1, ']'); break;
+			case '"': end = strchr(p + 1, '"'); break;
+			default: return PARSE_ERROR_UNRECOGNISED_PARAMETER;
+		}
+		if (!end) {
+			return PARSE_ERROR_MISSING_FIELD;
+		}
+		n = (size_t)(end - p - 1);
+		if (n >= sizeof(body)) {
+			return PARSE_ERROR_FIELD_TOO_LONG;
+		}
+		my_strcpy(body, p + 1, n + 1);
+
+		if (open == '[') {
+			slot->kind = PANEL_SLOT_COMMAND;
+			slot->desc = string_make(body);
+		} else {
+			set_panel_slot_action(slot, body);
+		}
+	}
+
+	/* An =Face suffix, running to the next space, overrides the face. */
+	p = end + 1;
+	if (*p == '=') {
+		const char *face = ++p;
+
+		while (*p && !isspace((unsigned char) *p)) {
+			p++;
+		}
+		if (p > face) {
+			string_free(slot->face);
+			slot->face = string_make(format("%.*s",
+				(int)(p - face), face));
+		}
+	}
+	*pp = p;
+	return PARSE_ERROR_NONE;
+}
+
+static enum parser_error parse_panel_version(struct parser *parser)
+{
+	return (parser_getuint(parser, "version") == PANEL_SLOT_VERSION) ?
+		PARSE_ERROR_NONE : PARSE_ERROR_OBSOLETE_FILE;
+}
+
+static enum parser_error parse_panel_tab(struct parser *parser)
+{
+	struct panel_slot_data *d = parser_priv(parser);
+	const char *name = parser_getstr(parser, "name");
+	int i;
+
+	for (i = 0; i < PANEL_TAB_KEYS; i++) {
+		if (!my_stricmp(name, panel_tab_names[i])) {
+			d->tab = i;
+			d->row = 0;
+			return PARSE_ERROR_NONE;
+		}
+	}
+
+	return PARSE_ERROR_INVALID_VALUE;
+}
+
+static enum parser_error parse_panel_row(struct parser *parser)
+{
+	struct panel_slot_data *d = parser_priv(parser);
+	const char *p = parser_getstr(parser, "slots");
+	int col = 0;
+
+	if (d->tab < 0) {
+		return PARSE_ERROR_MISSING_RECORD_HEADER;
+	}
+	if (d->row >= PANEL_GRID_ROWS) {
+		return PARSE_ERROR_TOO_MANY_ENTRIES;
+	}
+	while (true) {
+		enum parser_error error;
+
+		while (*p && isspace((unsigned char) *p)) {
+			p++;
+		}
+		if (!*p) {
+			break;
+		}
+		if (col >= PANEL_GRID_COLS) {
+			return PARSE_ERROR_TOO_MANY_ENTRIES;
+		}
+		error = parse_panel_token(&p, &d->ps->slots[d->tab][
+			d->row * PANEL_GRID_COLS + col]);
+		if (error != PARSE_ERROR_NONE) {
+			return error;
+		}
+		col++;
+	}
+	d->row++;
+
+	return PARSE_ERROR_NONE;
+}
+
+static struct parser *init_parse_panel(struct panel_shared *ps)
+{
+	struct parser *parser = parser_new();
+	struct panel_slot_data *d = mem_zalloc(sizeof(*d));
+
+	d->ps = ps;
+	d->tab = -1;
+	parser_setpriv(parser, d);
+
+	parser_reg(parser, "panel-version uint version", parse_panel_version);
+	parser_reg(parser, "tab str name", parse_panel_tab);
+	parser_reg(parser, "row str slots", parse_panel_row);
+
+	return parser;
+}
+
+/*
+ * The seeder (section 4.4): writes a panel.txt from the game's own
+ * command tables, so that there is always something on the tabs and the
+ * player has a complete file to edit rather than a blank one.  It runs
+ * when there is no panel.txt in either place, and from the Menu.
+ */
+
+/* Which slot tab a group of cmds_all seeds, or -1 for one that seeds none */
+static int panel_seed_tab(const char *group)
+{
+	if (streq(group, "Action commands")) {
+		return 0;
+	}
+	if (streq(group, "Items") || streq(group, "Manage items")) {
+		return 1;
+	}
+	if (streq(group, "Information") || streq(group, "Utility")) {
+		return 2;
+	}
+
+	/* "Hidden" and the debug groups seed nothing; Mine starts empty. */
+	return -1;
+}
+
+/* Write one tab's rows; what will not fit in the grid is commented out. */
+static void seed_panel_tab(ang_file *f, int tab)
+{
+	int row = 0, col = 0, g;
+
+	file_putf(f, "\ntab:%s\n", panel_tab_names[tab]);
+	for (g = 0; cmds_all[g].name; g++) {
+		size_t j;
+
+		if (panel_seed_tab(cmds_all[g].name) != tab) {
+			continue;
+		}
+		for (j = 0; j < cmds_all[g].len; j++) {
+			const struct cmd_info *cmd = &cmds_all[g].list[j];
+
+			/* A command no keyset has a key for cannot be sent. */
+			if (!cmd->key[0] && !cmd->key[1]) {
+				continue;
+			}
+			if (col == 0) {
+				file_putf(f, "%srow:", (row < PANEL_GRID_ROWS) ?
+					"" : "#");
+			}
+			file_putf(f, "%s[%s]", (col) ? "  " : "", cmd->desc);
+			col++;
+			if (col == PANEL_GRID_COLS) {
+				file_put(f, "\n");
+				col = 0;
+				row++;
+			}
+		}
+	}
+	if (col) {
+		file_put(f, "\n");
+	}
+}
+
+static bool seed_panel_file(const char *path)
+{
+	ang_file *f = file_open(path, MODE_WRITE, FTYPE_TEXT);
+	int tab;
+
+	if (!f) {
+		SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+			"could not write %s", path);
+		return false;
+	}
+	file_putf(f,
+		"# The touch panel's slot tabs, written from the game's own\n"
+		"# command tables.  Edit it freely.\n"
+		"#\n"
+		"# tab:Name  starts one of the tabs Act, Items, Info and Mine.\n"
+		"# row:...   fills that tab's next row of cells; a tab holds\n"
+		"#           %d rows of %d.  Rows past that are commented out\n"
+		"#           here, ready to be swapped in.\n"
+		"#\n"
+		"# A cell is one of\n"
+		"#   [Description]  a command, named as the command menu names\n"
+		"#                  it; its key is looked up for whichever\n"
+		"#                  keyset is in force when it is pressed.\n"
+		"#   \"action\"       a keymap's action, written exactly as a\n"
+		"#                  pref file's keymap-act: line writes one:\n"
+		"#                  \"za.\" is three keypresses, \"[Escape]\" is\n"
+		"#                  the escape key, \"{^}f\" is control-F.\n"
+		"#   -              nothing.\n"
+		"# Any of them may end in =Face to change the word shown on it.\n"
+		"\n"
+		"panel-version:%d\n",
+		PANEL_GRID_ROWS, PANEL_GRID_COLS, PANEL_SLOT_VERSION);
+	for (tab = 0; tab < PANEL_TAB_KEYS; tab++) {
+		seed_panel_tab(f, tab);
+	}
+	file_close(f);
+	SDL_Log("wrote panel slots to %s", path);
+
+	return true;
+}
+
+/*
+ * Read the slots: the player's panel.txt if there is one, else the
+ * shipped one, else one seeded from the command tables and written to the
+ * player's directory.
+ */
+static void load_panel_slots(struct panel_shared *ps)
+{
+	char path[1024];
+	char line[1024];
+	ang_file *f;
+	struct parser *parser;
+
+	path_build(path, sizeof(path), ANGBAND_DIR_USER, PANEL_SLOT_FILE);
+	if (!file_exists(path)) {
+		char shipped[1024];
+
+		path_build(shipped, sizeof(shipped), ANGBAND_DIR_CUSTOMIZE,
+			PANEL_SLOT_FILE);
+		if (file_exists(shipped)) {
+			my_strcpy(path, shipped, sizeof(path));
+		} else if (!seed_panel_file(path)) {
+			return;
+		}
+	}
+	f = file_open(path, MODE_READ, FTYPE_TEXT);
+	if (!f) {
+		SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION, "could not read %s",
+			path);
+		return;
+	}
+	SDL_Log("reading panel slots from %s", path);
+
+	parser = init_parse_panel(ps);
+	while (file_getl(f, line, sizeof(line))) {
+		if (parser_parse(parser, line) != PARSE_ERROR_NONE) {
+			print_error(path, parser);
+			break;
+		}
+	}
+	mem_free(parser_priv(parser));
+	parser_destroy(parser);
+	file_close(f);
+}
+
+static void free_panel_slots(struct panel_shared *ps)
+{
+	int tab, cell;
+
+	for (tab = 0; tab < PANEL_TAB_KEYS; tab++) {
+		for (cell = 0; cell < PANEL_GRID_CELLS; cell++) {
+			struct panel_slot *slot = &ps->slots[tab][cell];
+
+			string_free(slot->desc);
+			string_free(slot->face);
+			slot->desc = NULL;
+			slot->face = NULL;
+		}
+	}
+}
+
+/*
+ * The faces (section 4.4), keyed by a command's description and shared
+ * across the three variants, so a description only has to appear here
+ * once however many of them have the command.  The first word of the
+ * description is the fallback, but it is often the wrong word ("Display
+ * inventory listing", "Go down staircase") or the same word as another
+ * command's, so most commands are named here instead.  No two faces are
+ * alike, so that a slot can be spoken about without saying which tab it
+ * is on.
+ *
+ * A slot's own "=Face" beats this, which is the place to tune one
+ * without rebuilding.
+ */
+static const struct {
+	const char *desc;
+	const char *face;
+} panel_faces[] = {
+	/* Action commands */
+	{ "Disarm a trap or chest",		"Disarm" },
+	{ "Rest for a while",			"Rest" },
+	{ "Look around",			"Look" },
+	{ "Target monster or location",		"Target" },
+	{ "Target closest monster",		"Closest" },
+	{ "Dig a tunnel",			"Tunnel" },
+	{ "Go up staircase",			"Up" },
+	{ "Go down staircase",			"Down" },
+	{ "Open a door or a chest",		"Open" },
+	{ "Close a door",			"Close" },
+	{ "Fire at nearest target",		"Fire" },
+	{ "Throw an item",			"Throw" },
+	{ "Walk into a trap",			"Trap" },
+
+	/* Items and Manage items */
+	{ "Inscribe an object",			"Inscribe" },
+	{ "Uninscribe an object",		"Uninscr" },
+	{ "Wear/wield an item",			"Wield" },
+	{ "Take off/unwield an item",		"TakeOff" },
+	{ "Examine an item",			"Examine" },
+	{ "Drop an item",			"Drop" },
+	{ "Fire your missile weapon",		"Shoot" },
+	{ "Use a staff",			"Staff" },
+	{ "Aim a wand",				"Aim" },
+	{ "Zap a rod",				"Zap" },
+	{ "Activate an object",			"Activate" },
+	{ "Eat some food",			"Eat" },
+	{ "Quaff a potion",			"Quaff" },
+	{ "Read a scroll",			"Read" },
+	{ "Fuel your light source",		"Fuel" },
+	{ "Use an item",			"Use" },
+	{ "Display equipment listing",		"Equip" },
+	{ "Display inventory listing",		"Inven" },
+	{ "Display quiver listing",		"Quiver" },
+	{ "Pick up objects",			"Pickup" },
+	{ "Ignore an item",			"Ignore" },
+
+	/* Information and Utility */
+	{ "Browse a book",			"Browse" },
+	{ "Gain new spells",			"Study" },
+	{ "View abilities",			"Ability" },
+	{ "Cast a spell",			"Cast" },
+	{ "Full dungeon map",			"Map" },
+	{ "Toggle ignoring of items",		"Ignoring" },
+	{ "Display visible item list",		"Objects" },
+	{ "Display visible monster list",	"Monsters" },
+	{ "Locate player on map",		"Locate" },
+	{ "Help",				"Help" },
+	{ "Identify symbol",			"Symbol" },
+	{ "Character description",		"Char" },
+	{ "Check knowledge",			"Know" },
+	{ "Repeat level feeling",		"Feeling" },
+	{ "Show previous message",		"Msg" },
+	{ "Show previous messages",		"Msgs" },
+	{ "Interact with options",		"Options" },
+	{ "Save and don't quit",		"Save" },
+	{ "Save and quit",			"Quit" },
+	{ "Retire character and quit",		"Retire" },
+	{ "Redraw the screen",			"Redraw" },
+	{ "Save \"screen dump\"",		"Dump" },
+
+	/*
+	 * Hidden, which the seeder skips but a hand-written slot may name;
+	 * the compass rose's centre is Stay.
+	 */
+	{ "Alter a grid",			"Alter" },
+	{ "Stand still",			"Stay" },
+	{ "Walk",				"Walk" },
+	{ "Start running",			"Run" },
+	{ "Start exploring",			"Explore" },
+	{ "Repeat previous command",		"Repeat" },
+	{ "Do autopickup",			"Autopick" },
+	{ "Center map",				"Center" },
+	{ "Steal from a monster",		"Steal" },
+	{ "Take notes",				"Notes" },
+	{ "Version info",			"Version" },
+	{ "Load a single pref line",		"Pref" },
+	{ "Toggle windows",			"Windows" },
+
+	/*
+	 * The variants' own commands, so that this stays the one table the
+	 * three of them share.  "Abilities list" is NarSil's name for what
+	 * Angband calls "View abilities", so it takes that face; no build
+	 * has both.
+	 */
+	{ "Destroy an item",			"Destroy" },
+	{ "Fire from quiver 1",			"Shoot1" },
+	{ "Fire from quiver 2",			"Shoot2" },
+	{ "Blow a horn",			"Horn" },
+	{ "Smith an item",			"Smith" },
+	{ "Bash a door",			"Bash" },
+	{ "Throw automatically",		"Hurl" },
+	{ "Change song",			"Song" },
+	{ "Toggle stealth mode",		"Stealth" },
+	{ "Exchange places",			"Swap" },
+	{ "Abilities list",			"Ability" },
+	{ "Change shape",			"Shape" },
+	{ "Move house",				"House" },
+	{ "Show the time of day",		"Time" }
+};
+
+/*
+ * The face a slot shows: its =Face override, else, for a command, the
+ * table above, else the first word of the description.
+ */
+static void get_panel_slot_face(const struct panel_slot *slot, char *buf,
+		size_t len)
+{
+	const char *p;
+	size_t i;
+
+	buf[0] = '\0';
+	if (slot->face) {
+		my_strcpy(buf, slot->face, len);
+		return;
+	}
+	if (slot->kind != PANEL_SLOT_COMMAND) {
+		/* set_panel_slot_action() always leaves an action a face. */
+		return;
+	}
+	for (i = 0; i < N_ELEMENTS(panel_faces); i++) {
+		if (streq(slot->desc, panel_faces[i].desc)) {
+			my_strcpy(buf, panel_faces[i].face, len);
+			return;
+		}
+	}
+	for (p = slot->desc; *p && !isspace((unsigned char) *p); p++) {
+		/* the first word of the description */
+	}
+	my_strcpy(buf, slot->desc, MIN(len, (size_t)(p - slot->desc) + 1));
+}
+
+/* Add the key a slot asks for; an empty slot leaves its cell bare. */
+static void add_panel_slot(struct panel_piece *pp, int tab, int cell,
+		const struct panel_slot *slot)
+{
+	int group = PANEL_GROUP_TAB0 + tab;
+	struct sdlpui_control *c;
+	struct panel_key *pk;
+	char face[64];
+
+	if (slot->kind == PANEL_SLOT_EMPTY) {
+		return;
+	}
+	get_panel_slot_face(slot, face, sizeof(face));
+
+	switch (slot->kind) {
+		case PANEL_SLOT_COMMAND:
+			c = add_panel_key(pp, PANEL_KEY_SEND, group, cell,
+				"", SDLK_UNKNOWN, NULL, 0, false);
+			pk = c->priv;
+			pk->word = string_make(face);
+			pk->cmd = find_panel_command(slot->desc);
+			if (!pk->cmd) {
+				/*
+				 * A description no group has is still shown,
+				 * so that the slot can be found and fixed,
+				 * but it does nothing.
+				 */
+				SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+					"%s: no command is described as "
+					"\"%s\"", PANEL_SLOT_FILE, slot->desc);
+				pk->disabled = true;
+			}
+			break;
+
+		case PANEL_SLOT_ACTION: {
+			size_t n = 0;
+
+			while (slot->act[n].type != EVT_NONE) {
+				n++;
+			}
+			c = add_panel_key(pp, PANEL_KEY_SEND, group, cell,
+				"", SDLK_UNKNOWN, NULL, 0, false);
+			pk = c->priv;
+			pk->word = string_make(face);
+			pk->act = mem_alloc((n + 1) * sizeof(*pk->act));
+			memcpy(pk->act, slot->act, (n + 1) * sizeof(*pk->act));
+			break;
+		}
+
+		case PANEL_SLOT_EMPTY:
+			break;
+	}
+}
+
+static void create_panel_keys(struct panel_piece *pp)
+{
+	int i, cell;
+
+	/*
+	 * Chrome: two columns at the right edge, cell 2 * row + column, the
+	 * most pressed keys in the bottom corner where the thumb rests.
+	 */
+	add_panel_sym(pp, PANEL_GROUP_CHROME, 0, "↑", SDLK_UP, true);
+	add_panel_sym(pp, PANEL_GROUP_CHROME, 1, "↓", SDLK_DOWN, true);
+	add_panel_sym(pp, PANEL_GROUP_CHROME, 2, "←", SDLK_LEFT, true);
+	add_panel_sym(pp, PANEL_GROUP_CHROME, 3, "→", SDLK_RIGHT, true);
+	add_panel_sym(pp, PANEL_GROUP_CHROME, 4, "⌫", SDLK_BACKSPACE, true);
+	add_panel_key(pp, PANEL_KEY_MODIFIER, PANEL_GROUP_CHROME, 5, "Ctrl",
+		SDLK_UNKNOWN, NULL, PANEL_MOD_CTRL, false);
+	add_panel_key(pp, PANEL_KEY_MODIFIER, PANEL_GROUP_CHROME, 6, "Shift",
+		SDLK_UNKNOWN, NULL, PANEL_MOD_SHIFT, false);
+	add_panel_text(pp, PANEL_GROUP_CHROME, 7, " ", "Space");
+	add_panel_sym(pp, PANEL_GROUP_CHROME, 8, "Esc", SDLK_ESCAPE, false);
+	add_panel_sym(pp, PANEL_GROUP_CHROME, 9, "Enter", SDLK_RETURN, false);
+
+	/* Tab strip */
+	for (i = 0; i < PANEL_TABS; i++) {
+		add_panel_key(pp, PANEL_KEY_TAB, PANEL_GROUP_TABS, i,
+			(i < PANEL_TAB_KEYS) ? panel_tab_names[i] : "Keys",
+			SDLK_UNKNOWN, NULL, i, false);
+	}
+
+	/* The slot tabs' grids, as panel.txt left them */
+	for (i = 0; i < PANEL_TAB_KEYS; i++) {
+		for (cell = 0; cell < PANEL_GRID_CELLS; cell++) {
+			add_panel_slot(pp, i, cell,
+				&pp->shared->slots[i][cell]);
+		}
+	}
+
+	/*
+	 * Keys tab: a keyboard's keys, alphabetical, with Shift giving what
+	 * a keyboard's Shift gives, so every character is one or two taps
+	 * and there are no layers.  The strip beside the tabs takes the
+	 * least used; the block under them the letters, the remaining
+	 * symbols, and the digits, Tab at the end of the digits' row.
+	 */
+	cell = add_panel_chars(pp, 0, "`\\[]", "~|{}");
+	add_panel_sym(pp, PANEL_GROUP_KEYS, cell++, "PgUp", SDLK_PAGEUP, true);
+	add_panel_sym(pp, PANEL_GROUP_KEYS, cell++, "PgDn", SDLK_PAGEDOWN,
+		true);
+	SDL_assert(cell == PANEL_STRIP_COLS);
+	cell = add_panel_chars(pp, cell, "abcdefghijklmnopqrstuvwxyz",
+		"ABCDEFGHIJKLMNOPQRSTUVWXYZ");
+	cell = add_panel_chars(pp, cell, "-=;',./", "_+:\"<>?");
+	cell = add_panel_chars(pp, cell, "1234567890", "!@#$%^&*()");
+	add_panel_sym(pp, PANEL_GROUP_KEYS, cell++, "⇥", SDLK_TAB, false);
+	SDL_assert(cell == PANEL_KEYS_CELLS);
+}
+
+/* --- the compass rose --- */
+
+/* Keypad digit for a petal (bearing 45 * petal from north) or the centre */
+static int rose_digit(int petal)
+{
+	static const int digits[PANEL_ROSE_PETALS + 1] = {
+		8, 9, 6, 3, 2, 1, 4, 7, 5
+	};
+
+	return (petal >= 0 && petal <= PANEL_ROSE_CENTER) ? digits[petal] : 0;
+}
+
+/*
+ * What lies at (x, y), relative to the control: a petal, the centre, or
+ * -1 when the point is outside the rose's square.
+ *
+ * The square is divided in three each way and the nine cells are the
+ * eight directions around the stay in the middle, as on a keypad.  The
+ * petals are drawn inside their cells but do not define them: a tap
+ * between two petals still walks, which is what a thumb wants.  The
+ * drawn shape is a hint, not the target.
+ */
+static int rose_hit(const struct panel_rose *pr, int x, int y)
+{
+	/* cell (row, col) to petal, row 0 at the top; 8 is the centre */
+	static const int cells[3][3] = {
+		{ 7, 0, 1 },
+		{ 6, 8, 2 },
+		{ 5, 4, 3 }
+	};
+	float fx, fy;
+	int col, row;
+
+	if (pr->radius <= 0) {
+		return -1;
+	}
+	fx = (float)(x - pr->cx) / pr->radius;
+	fy = (float)(y - pr->cy) / pr->radius;
+	if (fx < -1.0f || fx > 1.0f || fy < -1.0f || fy > 1.0f) {
+		return -1;
+	}
+	col = (fx < -1.0f / 3.0f) ? 0 : ((fx > 1.0f / 3.0f) ? 2 : 1);
+	row = (fy < -1.0f / 3.0f) ? 0 : ((fy > 1.0f / 3.0f) ? 2 : 1);
+	return cells[row][col];
+}
+
+/*
+ * One side of a petal, as a cubic Bezier from the apex to a tangent
+ * point on the lobe.  The control point at the lobe end sits on the
+ * tangent line, so the side meets the arc smoothly; the one at the apex
+ * is swung out by PANEL_ROSE_BOW_DEG, which bows the side outward
+ * without rounding the apex.  Writes the interior points only, in order
+ * from the apex, so the caller owns both ends.
+ */
+static void rose_petal_side(SDL_FPoint apex, SDL_FPoint tan_pt,
+		float outx, float outy, SDL_FPoint *pts)
+{
+	float dx = tan_pt.x - apex.x, dy = tan_pt.y - apex.y;
+	float len = sqrtf(dx * dx + dy * dy);
+	float bow = tanf(PANEL_ROSE_BOW_DEG * (float) M_PI / 180.0f);
+	float bx, by, bl;
+	SDL_FPoint p1, p2;
+	int i;
+
+	if (len < 1e-6f) {
+		for (i = 0; i < PANEL_ROSE_SIDE_POINTS; i++) {
+			pts[i] = apex;
+		}
+		return;
+	}
+	dx /= len;
+	dy /= len;
+	/* the apex tangent, swung towards the petal's outer side */
+	bx = dx + bow * outx;
+	by = dy + bow * outy;
+	bl = sqrtf(bx * bx + by * by);
+	bx /= bl;
+	by /= bl;
+	p1.x = apex.x + 0.45f * len * bx;
+	p1.y = apex.y + 0.45f * len * by;
+	p2.x = tan_pt.x - 0.30f * len * dx;
+	p2.y = tan_pt.y - 0.30f * len * dy;
+	for (i = 0; i < PANEL_ROSE_SIDE_POINTS; i++) {
+		float t = (float)(i + 1) / (PANEL_ROSE_SIDE_POINTS + 1);
+		float m = 1.0f - t;
+		float w0 = m * m * m, w1 = 3.0f * m * m * t;
+		float w2 = 3.0f * m * t * t, w3 = t * t * t;
+
+		pts[i].x = w0 * apex.x + w1 * p1.x + w2 * p2.x + w3 * tan_pt.x;
+		pts[i].y = w0 * apex.y + w1 * p1.y + w2 * p2.y + w3 * tan_pt.y;
+	}
+}
+
+/*
+ * The outline of a petal as a closed polygon: the apex, one side out to
+ * the lobe, the lobe's major arc, and the other side back.  The sides
+ * are tangents to the lobe, found from the apex's distance to the lobe's
+ * centre, so there is no kink where they meet the arc.  A cardinal's
+ * lobe lies outside its apex and a diagonal's inside it; the sign s
+ * carries that difference and the rest of the arithmetic is shared.
+ * (ox, oy) is the control's origin in the target's coordinates.
+ *
+ * With inset greater than zero this returns the outline inset by that
+ * much, for the inner edge of a stroke: a narrower lobe and an apex
+ * moved along the axis to where the inset sides now meet.  Offsetting
+ * the sampled polygon instead would fold it at the apex, where the
+ * points are closer together than the stroke is thick.
+ */
+static int rose_petal_points(const struct panel_rose *pr, int petal,
+		float ox, float oy, float inset, SDL_FPoint *pts)
+{
+	float bearing = 45.0f * petal * (float) M_PI / 180.0f;
+	/* along the petal, outward, and across it */
+	float ux = sinf(bearing), uy = -cosf(bearing);
+	float vx = cosf(bearing), vy = sinf(bearing);
+	bool cardinal = (petal % 2 == 0);
+	float apex_d = (cardinal ? PANEL_ROSE_CARD_APEX : PANEL_ROSE_DIAG_APEX)
+		* pr->radius;
+	float lobe_d = (cardinal ? PANEL_ROSE_CARD_LOBE : PANEL_ROSE_DIAG_LOBE)
+		* pr->radius;
+	float rho = (cardinal ? PANEL_ROSE_CARD_RADIUS : PANEL_ROSE_DIAG_RADIUS)
+		* pr->radius;
+	float cx = ox + pr->cx, cy = oy + pr->cy;
+	/* s points from the apex towards the lobe's centre */
+	float s = (lobe_d > apex_d) ? 1.0f : -1.0f;
+	float d = fabsf(lobe_d - apex_d);
+	/* the lobe's frame: towards the apex, and across */
+	float wx = -s * ux, wy = -s * uy;
+	SDL_FPoint apex, lx, tan_a, tan_b;
+	float phi;
+	int n = 0, k;
+
+	if (inset > 0.0f) {
+		/*
+		 * The sides are tangents, so insetting them by this much
+		 * moves their meeting point inset * d / rho along the axis.
+		 */
+		float room = 0.45f * d;
+
+		if (inset > 0.6f * rho) {
+			inset = 0.6f * rho;
+		}
+		apex_d += s * MIN(inset * d / rho, room);
+		rho -= inset;
+		d = fabsf(lobe_d - apex_d);
+	}
+	apex.x = cx + apex_d * ux;
+	apex.y = cy + apex_d * uy;
+	lx.x = cx + lobe_d * ux;
+	lx.y = cy + lobe_d * uy;
+	if (d <= rho * 1.02f) {
+		/* Degenerate: the apex is inside the lobe.  Draw the lobe. */
+		d = rho * 1.02f;
+	}
+	phi = acosf(rho / d);
+	/*
+	 * Angles run from the direction of the apex, positive towards +v.
+	 * The tangent points are at +phi and -phi; the outline follows the
+	 * major arc between them, through the far side of the lobe.
+	 */
+	tan_a.x = lx.x + rho * (cosf(phi) * wx + sinf(phi) * vx);
+	tan_a.y = lx.y + rho * (cosf(phi) * wy + sinf(phi) * vy);
+	tan_b.x = lx.x + rho * (cosf(phi) * wx - sinf(phi) * vx);
+	tan_b.y = lx.y + rho * (cosf(phi) * wy - sinf(phi) * vy);
+
+	pts[n++] = apex;
+	rose_petal_side(apex, tan_a, vx, vy, pts + n);
+	n += PANEL_ROSE_SIDE_POINTS;
+	for (k = 0; k < PANEL_ROSE_ARC_POINTS; k++) {
+		float psi = phi + (2.0f * (float) M_PI - 2.0f * phi)
+			* k / (PANEL_ROSE_ARC_POINTS - 1);
+
+		pts[n].x = lx.x + rho * (cosf(psi) * wx + sinf(psi) * vx);
+		pts[n].y = lx.y + rho * (cosf(psi) * wy + sinf(psi) * vy);
+		n++;
+	}
+	/* The far side, from the lobe back to the apex. */
+	rose_petal_side(apex, tan_b, -vx, -vy, pts + n);
+	for (k = 0; k < PANEL_ROSE_SIDE_POINTS / 2; k++) {
+		SDL_FPoint tmp = pts[n + k];
+
+		pts[n + k] = pts[n + PANEL_ROSE_SIDE_POINTS - 1 - k];
+		pts[n + PANEL_ROSE_SIDE_POINTS - 1 - k] = tmp;
+	}
+	n += PANEL_ROSE_SIDE_POINTS;
+	return n;
+}
+
+/* Fill a convex polygon as a fan around its centroid. */
+static void rose_fill_polygon(SDL_Renderer *r, const SDL_FPoint *pts, int n,
+		SDL_Color color)
+{
+	SDL_Vertex verts[1 + PANEL_ROSE_POINTS];
+	int indices[3 * PANEL_ROSE_POINTS];
+	float cx = 0.0f, cy = 0.0f;
+	int i;
+
+	for (i = 0; i < n; i++) {
+		cx += pts[i].x;
+		cy += pts[i].y;
+	}
+	verts[0].position.x = cx / n;
+	verts[0].position.y = cy / n;
+	verts[0].color = color;
+	verts[0].tex_coord.x = 0.0f;
+	verts[0].tex_coord.y = 0.0f;
+	for (i = 0; i < n; i++) {
+		verts[i + 1].position = pts[i];
+		verts[i + 1].color = color;
+		verts[i + 1].tex_coord.x = 0.0f;
+		verts[i + 1].tex_coord.y = 0.0f;
+		indices[3 * i] = 0;
+		indices[3 * i + 1] = i + 1;
+		indices[3 * i + 2] = ((i + 1) % n) + 1;
+	}
+	SDL_RenderGeometry(r, NULL, verts, n + 1, indices, 3 * n);
+}
+
+/* Fill the ring between a polygon and its inset as a strip of triangles. */
+static void rose_fill_ring(SDL_Renderer *r, const SDL_FPoint *outer,
+		const SDL_FPoint *inner, int n, SDL_Color color)
+{
+	SDL_Vertex verts[2 * PANEL_ROSE_POINTS];
+	int indices[6 * PANEL_ROSE_POINTS];
+	int i;
+
+	for (i = 0; i < n; i++) {
+		int j = (i + 1) % n;
+
+		verts[2 * i].position = outer[i];
+		verts[2 * i + 1].position = inner[i];
+		verts[2 * i].color = color;
+		verts[2 * i + 1].color = color;
+		verts[2 * i].tex_coord.x = 0.0f;
+		verts[2 * i].tex_coord.y = 0.0f;
+		verts[2 * i + 1].tex_coord.x = 0.0f;
+		verts[2 * i + 1].tex_coord.y = 0.0f;
+		indices[6 * i] = 2 * i;
+		indices[6 * i + 1] = 2 * i + 1;
+		indices[6 * i + 2] = 2 * j;
+		indices[6 * i + 3] = 2 * i + 1;
+		indices[6 * i + 4] = 2 * j + 1;
+		indices[6 * i + 5] = 2 * j;
+	}
+	SDL_RenderGeometry(r, NULL, verts, 2 * n, indices, 6 * n);
+}
+
+static void fire_panel_rose(struct sdlpui_control *c, struct sdlpui_dialog *d,
+		struct sdlpui_window *w)
+{
+	struct panel_rose *pr;
+	struct panel_shared *ps;
+	bool shift, ctrl;
+	uint8_t mods = KC_MOD_KEYPAD;
+	int digit;
+
+	SDL_assert(c->type_code == PANEL_ROSE_CODE && c->priv);
+	pr = c->priv;
+	ps = panel_shared_of(d);
+	digit = rose_digit(pr->active);
+	if (!digit) {
+		return;
+	}
+	/* Shift runs and Ctrl alters, through the keypad keymaps. */
+	panel_active_mods(ps, &shift, &ctrl);
+	if (shift) {
+		mods |= KC_MOD_SHIFT;
+	}
+	if (ctrl) {
+		mods |= KC_MOD_CONTROL;
+	}
+	push_term_keypress((keycode_t)('0' + digit), mods);
+	panel_spend_oneshots(d, w);
+}
+
+static bool handle_panel_rose_mouseclick(struct sdlpui_control *c,
+		struct sdlpui_dialog *d, struct sdlpui_window *w,
+		const SDL_MouseButtonEvent *e)
+{
+	struct panel_rose *pr;
+
+	SDL_assert(c->type_code == PANEL_ROSE_CODE && c->priv);
+	pr = c->priv;
+	if (e->button == SDL_BUTTON_LEFT) {
+		if (e->state == SDL_PRESSED) {
+			int hit = rose_hit(pr, e->x - d->rect.x - c->rect.x,
+				e->y - d->rect.y - c->rect.y);
+
+			if (hit >= 0) {
+				pr->active = hit;
+				(*c->ftb->arm)(c, d, w, SDLPUI_ACTION_HINT_MOUSE);
+				fire_panel_rose(c, d, w);
+				panel_hold(d, c);
+			}
+		} else {
+			(*c->ftb->disarm)(c, d, w, SDLPUI_ACTION_HINT_MOUSE);
+			panel_release(d, c);
+		}
+	}
+	return true;
+}
+
+/*
+ * Sliding while held changes the petal without lifting: the new
+ * direction fires at once and the repeat continues from there.
+ */
+static bool handle_panel_rose_mousemove(struct sdlpui_control *c,
+		struct sdlpui_dialog *d, struct sdlpui_window *w,
+		const SDL_MouseMotionEvent *e)
+{
+	struct panel_rose *pr;
+	int hit;
+
+	SDL_assert(c->type_code == PANEL_ROSE_CODE && c->priv);
+	pr = c->priv;
+	hit = rose_hit(pr, e->x - d->rect.x - c->rect.x,
+		e->y - d->rect.y - c->rect.y);
+	if (e->state == 0) {
+		/* Hovering: stay focused while over the rose. */
+		return hit >= 0;
+	}
+	if (pr->armed && hit >= 0 && hit != pr->active) {
+		struct panel_shared *ps = panel_shared_of(d);
+
+		pr->active = hit;
+		d->dirty = true;
+		sdlpui_signal_redraw(w);
+		fire_panel_rose(c, d, w);
+		if (ps->held == c) {
+			ps->next_repeat = SDL_GetTicks()
+				+ PANEL_REPEAT_INTERVAL_MS;
+		}
+	}
+	return true;
+}
+
+static void render_panel_rose(struct sdlpui_control *c,
+		struct sdlpui_dialog *d, struct sdlpui_window *w,
+		SDL_Renderer *r)
+{
+	struct panel_rose *pr;
+	SDL_Color white = w->app->colors[COLOUR_WHITE];
+	SDL_Color ghost = white, outline = white, solid = white;
+	SDL_BlendMode old_mode;
+	SDL_FPoint pts[PANEL_ROSE_POINTS], inner[PANEL_ROSE_POINTS];
+	SDL_Rect centre;
+	float ox, oy, thickness;
+	int petal, n, side, tw = 0, th = 0;
+
+	SDL_assert(c->type_code == PANEL_ROSE_CODE && c->priv);
+	pr = c->priv;
+	if (pr->radius <= 0) {
+		return;
+	}
+	ghost.a = 40;
+	outline.a = pr->has_mouse ? 170 : 130;
+	solid.a = 220;
+	ox = (float) c->rect.x + ((d->texture) ? 0 : d->rect.x);
+	oy = (float) c->rect.y + ((d->texture) ? 0 : d->rect.y);
+	/* Thick outlines, no thicker than half a small petal's cap */
+	thickness = MIN(PANEL_ROSE_LINE_POINTS * w->ui_scale,
+		0.5f * PANEL_ROSE_DIAG_RADIUS * pr->radius);
+
+	SDL_GetRenderDrawBlendMode(r, &old_mode);
+	SDL_SetRenderDrawBlendMode(r, SDL_BLENDMODE_BLEND);
+	for (petal = 0; petal < PANEL_ROSE_PETALS; petal++) {
+		n = rose_petal_points(pr, petal, ox, oy, 0.0f, pts);
+		if (pr->armed && pr->active == petal) {
+			rose_fill_polygon(r, pts, n, solid);
+		} else {
+			(void) rose_petal_points(pr, petal, ox, oy, thickness,
+				inner);
+			rose_fill_ring(r, pts, inner, n, outline);
+		}
+	}
+
+	/* The centre: a square with the face of the stay command. */
+	side = (int)(PANEL_ROSE_CENTER_SIDE * pr->radius);
+	centre.x = (int)(ox + pr->cx - side / 2);
+	centre.y = (int)(oy + pr->cy - side / 2);
+	centre.w = side;
+	centre.h = side;
+	if (pr->armed && pr->active == PANEL_ROSE_CENTER) {
+		SDL_SetRenderDrawColor(r, solid.r, solid.g, solid.b, solid.a);
+	} else {
+		SDL_SetRenderDrawColor(r, ghost.r, ghost.g, ghost.b, ghost.a);
+	}
+	SDL_RenderFillRect(r, &centre);
+	SDL_SetRenderDrawColor(r, outline.r, outline.g, outline.b, outline.a);
+	SDL_RenderDrawRect(r, &centre);
+	if (pr->face[0]) {
+		SDL_Rect cap_r;
+		SDL_Color fg = (pr->armed && pr->active == PANEL_ROSE_CENTER) ?
+			w->app->colors[COLOUR_DARK] : white;
+
+		sdlpui_get_utf8_metrics(sdlpui_get_ttf(w), pr->face, &tw, &th);
+		cap_r.w = MIN(tw, side);
+		cap_r.h = MIN(th, side);
+		cap_r.x = centre.x + (side - cap_r.w) / 2;
+		cap_r.y = centre.y + (side - cap_r.h) / 2;
+		sdlpui_render_utf8_line(r, sdlpui_get_ttf(w), &fg, &cap_r,
+			pr->face);
+	}
+	SDL_SetRenderDrawBlendMode(r, old_mode);
+}
+
+static void gain_mouse_panel_rose(struct sdlpui_control *c,
+		struct sdlpui_dialog *d, struct sdlpui_window *w, int comp_ind)
+{
+	struct panel_rose *pr;
+
+	SDL_assert(c->type_code == PANEL_ROSE_CODE && c->priv);
+	pr = c->priv;
+	if (!pr->has_mouse) {
+		pr->has_mouse = true;
+		d->dirty = true;
+		sdlpui_signal_redraw(w);
+	}
+}
+
+static void lose_mouse_panel_rose(struct sdlpui_control *c,
+		struct sdlpui_dialog *d, struct sdlpui_window *w,
+		struct sdlpui_control *new_c, struct sdlpui_dialog *new_d)
+{
+	struct panel_rose *pr;
+
+	SDL_assert(c->type_code == PANEL_ROSE_CODE && c->priv);
+	pr = c->priv;
+	if (pr->has_mouse) {
+		pr->has_mouse = false;
+		d->dirty = true;
+		sdlpui_signal_redraw(w);
+	}
+}
+
+static void arm_panel_rose(struct sdlpui_control *c, struct sdlpui_dialog *d,
+		struct sdlpui_window *w, enum sdlpui_action_hint hint)
+{
+	struct panel_rose *pr;
+
+	SDL_assert(c->type_code == PANEL_ROSE_CODE && c->priv);
+	pr = c->priv;
+	if (!pr->armed) {
+		pr->armed = true;
+		d->dirty = true;
+		sdlpui_signal_redraw(w);
+	}
+}
+
+static void disarm_panel_rose(struct sdlpui_control *c,
+		struct sdlpui_dialog *d, struct sdlpui_window *w,
+		enum sdlpui_action_hint hint)
+{
+	struct panel_rose *pr;
+
+	SDL_assert(c->type_code == PANEL_ROSE_CODE && c->priv);
+	pr = c->priv;
+	if (pr->armed) {
+		pr->armed = false;
+		pr->active = -1;
+		d->dirty = true;
+		sdlpui_signal_redraw(w);
+	}
+}
+
+static int get_panel_rose_interactable_component(struct sdlpui_control *c,
+		bool first)
+{
+	return 1;
+}
+
+static int get_panel_rose_interactable_component_at(struct sdlpui_control *c,
+		Sint32 x, Sint32 y)
+{
+	struct panel_rose *pr;
+
+	SDL_assert(c->type_code == PANEL_ROSE_CODE && c->priv);
+	pr = c->priv;
+	/* x and y are relative to the dialog */
+	return (rose_hit(pr, x - c->rect.x, y - c->rect.y) >= 0) ? 1 : 0;
+}
+
+static void resize_panel_rose(struct sdlpui_control *c,
+		struct sdlpui_dialog *d, struct sdlpui_window *w, int width,
+		int height)
+{
+	struct panel_rose *pr;
+
+	SDL_assert(c->type_code == PANEL_ROSE_CODE && c->priv);
+	pr = c->priv;
+	c->rect.w = width;
+	c->rect.h = height;
+	pr->cx = width / 2;
+	pr->cy = height / 2;
+	pr->radius = MIN(width, height) / 2;
+}
+
+static void query_panel_rose_natural_size(struct sdlpui_control *c,
+		struct sdlpui_dialog *d, struct sdlpui_window *w, int *width,
+		int *height)
+{
+	int min_touch = (int)(PANEL_MIN_TOUCH_POINTS * w->ui_scale + 0.5f);
+
+	*width = 3 * min_touch;
+	*height = 3 * min_touch;
+}
+
+static void cleanup_panel_rose(struct sdlpui_control *c)
+{
+	SDL_assert(c->type_code == PANEL_ROSE_CODE && c->priv);
+	SDL_free(c->priv);
+	c->priv = NULL;
+}
+
+static void create_panel_rose(struct sdlpui_control *c)
+{
+	static const struct sdlpui_control_funcs panel_rose_funcs = {
+		.handle_mouseclick = handle_panel_rose_mouseclick,
+		.handle_mousemove = handle_panel_rose_mousemove,
+		.render = render_panel_rose,
+		.gain_mouse = gain_mouse_panel_rose,
+		.lose_mouse = lose_mouse_panel_rose,
+		.arm = arm_panel_rose,
+		.disarm = disarm_panel_rose,
+		.get_interactable_component =
+			get_panel_rose_interactable_component,
+		.get_interactable_component_at =
+			get_panel_rose_interactable_component_at,
+		.resize = resize_panel_rose,
+		.query_natural_size = query_panel_rose_natural_size,
+		.cleanup = cleanup_panel_rose
+	};
+	struct panel_rose *pr = SDL_calloc(1, sizeof(*pr));
+
+	pr->active = -1;
+	/* A dot: the centre is too small for a word at the dialog font. */
+	(void) my_strcpy(pr->face, "\u2022", sizeof(pr->face));
+	c->ftb = &panel_rose_funcs;
+	c->priv = pr;
+	c->type_code = PANEL_ROSE_CODE;
+	c->rect.x = 0;
+	c->rect.y = 0;
+	c->rect.w = 0;
+	c->rect.h = 0;
+}
+
+/* --- the pieces: one dialog each --- */
+
+/* The region target that holds a piece's place */
+static int panel_piece_target(enum panel_piece_kind kind)
+{
+	return (kind == PANEL_PIECE_ROSE) ? REGION_TARGET_ROSE : REGION_TARGET_KEYS;
+}
+
+static void log_panel_piece(const struct sdlpui_window *window,
+		const struct sdlpui_dialog *d, const char *what)
+{
+	const struct panel_piece *pp = d->priv;
+
+	if (pp->kind == PANEL_PIECE_ROSE) {
+		const struct panel_rose *pr = pp->rose.priv;
+
+		SDL_Log("window %u: rose piece %s %d,%d %dx%d, radius %d",
+			window->index, what, d->rect.x, d->rect.y, d->rect.w,
+			d->rect.h, (pr) ? pr->radius : 0);
+	} else {
+		SDL_Log("window %u: keys piece %s %d,%d %dx%d, %d keys",
+			window->index, what, d->rect.x, d->rect.y, d->rect.w,
+			d->rect.h, pp->nkeys);
+	}
+}
+
+static struct sdlpui_control *find_panel_control_containing(
+		struct sdlpui_dialog *d, struct sdlpui_window *w, Sint32 x,
+		Sint32 y, int *comp_ind)
+{
+	struct panel_piece *pp;
+	int i;
+
+	SDL_assert(d->type_code == PANEL_CODE && d->priv);
+	pp = d->priv;
+	*comp_ind = 0;
+	if (pp->kind == PANEL_PIECE_ROSE) {
+		if (pp->rose.priv && sdlpui_is_in_control(&pp->rose, d, x, y)
+				&& (*pp->rose.ftb->get_interactable_component_at)(
+				&pp->rose, x - d->rect.x, y - d->rect.y)) {
+			return &pp->rose;
+		}
+		return NULL;
+	}
+	for (i = 0; i < pp->nkeys; i++) {
+		struct sdlpui_control *c = &pp->keys[i];
+
+		if (panel_key_visible(pp->shared, c->priv)
+				&& c->ftb->get_interactable_component
+				&& (*c->ftb->get_interactable_component)(c, true)
+				&& sdlpui_is_in_control(c, d, x, y)) {
+			return c;
+		}
+	}
+	return NULL;
+}
+
+/*
+ * Drop the piece's hover state and its mouse and key focus, and stop any
+ * repeat.  While a dialog has focus the window is redrawn as if a menu
+ * were open, so a piece gives focus back after every tap.
+ */
+static void panel_yield_focus(struct sdlpui_dialog *d, struct sdlpui_window *w)
+{
+	panel_release(d, NULL);
+	sdlpui_dialog_handle_window_loses_mouse(d, w);
+}
+
+static void handle_panel_loses_mouse(struct sdlpui_dialog *d,
+		struct sdlpui_window *w, struct sdlpui_control *new_c,
+		struct sdlpui_dialog *new_d)
+{
+	panel_yield_focus(d, w);
+}
+
+static void handle_panel_window_loses_mouse(struct sdlpui_dialog *d,
+		struct sdlpui_window *w)
+{
+	panel_yield_focus(d, w);
+}
+
+static bool handle_panel_mouseclick(struct sdlpui_dialog *d,
+		struct sdlpui_window *w, const SDL_MouseButtonEvent *e)
+{
+	if (e->state == SDL_PRESSED) {
+		int comp_ind;
+		struct sdlpui_control *c = find_panel_control_containing(d, w,
+			e->x, e->y, &comp_ind);
+
+		if (c != d->c_mouse) {
+			if (d->c_mouse && d->c_mouse->ftb->lose_mouse) {
+				(*d->c_mouse->ftb->lose_mouse)(d->c_mouse, d,
+					w, c, d);
+			}
+			if (c && c->ftb->gain_mouse) {
+				(*c->ftb->gain_mouse)(c, d, w, comp_ind);
+			}
+			d->c_mouse = c;
+		}
+		if (c && c->ftb->handle_mouseclick) {
+			(*c->ftb->handle_mouseclick)(c, d, w, e);
+		}
+		return true;
+	}
+
+	/* The release goes to the key that was pressed, then focus is dropped. */
+	if (d->c_mouse && d->c_mouse->ftb->handle_mouseclick) {
+		(*d->c_mouse->ftb->handle_mouseclick)(d->c_mouse, d, w, e);
+	}
+	panel_yield_focus(d, w);
+	return true;
+}
+
+static bool handle_panel_mousemove(struct sdlpui_dialog *d,
+		struct sdlpui_window *w, const SDL_MouseMotionEvent *e)
+{
+	/* While the piece is being dragged the first finger moves it, not keys. */
+	if (w->app->touch.piece == d) {
+		return true;
+	}
+	if (!sdlpui_is_in_dialog(d, e->x, e->y)) {
+		/* A pointer (not a finger) left the piece. */
+		if (e->state == 0) {
+			panel_yield_focus(d, w);
+		}
+		return false;
+	}
+	return sdlpui_dialog_handle_mousemove(d, w, e);
+}
+
+/* Set the panel's background colour, at the configured alpha. */
+static void set_panel_background_color(struct sdlpui_window *w,
+		SDL_Renderer *r)
+{
+	const SDL_Color *bg = &w->app->colors[COLOUR_L_DARK];
+	int alpha = (w->config) ? w->config->panel_alpha : DEFAULT_PANEL_ALPHA;
+
+	SDL_SetRenderDrawColor(r, bg->r, bg->g, bg->b, (Uint8) alpha);
+}
+
+/*
+ * Draw the panel's home area, the "panel" region: dimmed, over the terms.
+ * The pieces are drawn over it afterwards, as dialogs.
+ */
+static void render_panel_home(struct sdlpui_window *window)
+{
+	SDL_Renderer *r = window->renderer;
+	SDL_BlendMode old_mode;
+
+	if (!window->panel || !window->has_panel) {
+		return;
+	}
+	SDL_SetRenderTarget(r, NULL);
+	SDL_GetRenderDrawBlendMode(r, &old_mode);
+	SDL_SetRenderDrawBlendMode(r, SDL_BLENDMODE_BLEND);
+	set_panel_background_color(window, r);
+	SDL_RenderFillRect(r, &window->panel_rect);
+	SDL_SetRenderDrawBlendMode(r, old_mode);
+}
+
+/*
+ * Draw a piece into its cached texture.  The texture is redrawn only when
+ * the piece changes, so that a window redraw, and a drag, which redraws
+ * on every motion event, cost one copy: the captions go through TTF,
+ * which is slow enough to matter at 92 keys.
+ */
+static void render_panel(struct sdlpui_dialog *d, struct sdlpui_window *w)
+{
+	SDL_Renderer *r = sdlpui_get_renderer(w);
+	SDL_BlendMode old_mode;
+	struct panel_piece *pp;
+	SDL_Rect all;
+	int i;
+
+	SDL_assert(d->type_code == PANEL_CODE && d->priv);
+	pp = d->priv;
+	if (d->rect.w <= 0 || d->rect.h <= 0) {
+		d->dirty = false;
+		return;
+	}
+	if (!d->texture) {
+		d->texture = make_subwindow_texture(w, d->rect.w, d->rect.h);
+	}
+	SDL_SetRenderTarget(r, d->texture);
+	SDL_GetRenderDrawBlendMode(r, &old_mode);
+	/* The background is written, not blended, so its alpha is kept. */
+	SDL_SetRenderDrawBlendMode(r, SDL_BLENDMODE_NONE);
+	set_panel_background_color(w, r);
+	all.x = 0;
+	all.y = 0;
+	all.w = d->rect.w;
+	all.h = d->rect.h;
+	SDL_RenderFillRect(r, &all);
+	SDL_SetRenderDrawBlendMode(r, SDL_BLENDMODE_BLEND);
+	if (pp->kind == PANEL_PIECE_ROSE) {
+		if (pp->rose.priv && pp->rose.ftb->render) {
+			(*pp->rose.ftb->render)(&pp->rose, d, w, r);
+		}
+	} else {
+		for (i = 0; i < pp->nkeys; i++) {
+			if (panel_key_visible(pp->shared, pp->keys[i].priv)
+					&& pp->keys[i].ftb->render) {
+				(*pp->keys[i].ftb->render)(&pp->keys[i], d, w, r);
+			}
+		}
+	}
+	SDL_SetRenderDrawBlendMode(r, old_mode);
+	SDL_SetRenderTarget(r, NULL);
+	d->dirty = false;
+}
+
+/* The cached texture is stale or gone: draw it again before the next copy. */
+static void drop_panel_texture(struct sdlpui_dialog *d)
+{
+	if (d->texture) {
+		SDL_DestroyTexture(d->texture);
+		d->texture = NULL;
+	}
+	d->dirty = true;
+}
+
+static void recreate_panel_textures(struct sdlpui_dialog *d,
+		struct sdlpui_window *w, bool all)
+{
+	drop_panel_texture(d);
+}
+
+/* Sizes the layout of both pieces uses, in pixels */
+struct panel_metrics {
+	int min_touch, max_cell, gap, lift;
+};
+
+static void get_panel_metrics(const struct sdlpui_window *w,
+		struct panel_metrics *m)
+{
+	m->min_touch = (int)(PANEL_MIN_TOUCH_POINTS * w->ui_scale + 0.5f);
+	m->max_cell = (int)(PANEL_MAX_KEY_POINTS * w->ui_scale + 0.5f);
+	m->gap = (int)(PANEL_GAP_POINTS * w->ui_scale + 0.5f);
+	m->lift = (int)(PANEL_ROSE_LIFT_POINTS * w->ui_scale + 0.5f);
+}
+
+/*
+ * The key stack's cell pitch (a cell and one gap) in a piece of the given
+ * size.  The stack is PANEL_COLS cells wide with an extra gap before the
+ * chrome, so its width is PANEL_COLS * cell_w + 2 * gap; its height is
+ * PANEL_ROWS * cell_h + gap.  Cells are no wider than PANEL_MAX_KEY_POINTS
+ * however wide the piece is, and one touch target across unless the piece
+ * is too small for that, when they shrink rather than being lost.
+ */
+static void get_keys_cell_sizes(const struct panel_metrics *m, int width,
+		int height, int *cell_w, int *cell_h)
+{
+	*cell_w = m->min_touch + m->gap;
+	if (width > 0) {
+		*cell_w = MAX(MIN((width - 2 * m->gap) / PANEL_COLS,
+			m->max_cell), 2 * m->gap);
+	}
+	*cell_h = m->min_touch + m->gap;
+	if (PANEL_ROWS * *cell_h + m->gap > height && height > 0) {
+		*cell_h = MAX((height - m->gap) / PANEL_ROWS, 2 * m->gap);
+	}
+}
+
+/*
+ * The pieces' default places in the panel's home area, in window
+ * coordinates.  In a band (a strip along the bottom): the rose at the
+ * left and the key stack at the right, both centred vertically.  In a
+ * column: the rose at the bottom left, its bottom edge lifted, and the
+ * stack above it.
+ */
+static void get_panel_default_rects(const struct sdlpui_window *w,
+		SDL_Rect *rects)
+{
+	const SDL_Rect *p = &w->panel_rect;
+	SDL_Rect *rose = &rects[PANEL_PIECE_ROSE];
+	SDL_Rect *keys = &rects[PANEL_PIECE_KEYS];
+	struct panel_metrics m;
+	int rose_max = (int)(PANEL_ROSE_SIZE_POINTS * w->ui_scale + 0.5f);
+	int rose_side, cell_w, cell_h;
+
+	get_panel_metrics(w, &m);
+	if (p->w > p->h) {
+		rose_side = MAX(MIN(rose_max, p->h - 2 * m.gap), 2 * m.min_touch);
+		rose->x = p->x + m.gap;
+		rose->y = p->y + MAX(0, (p->h - rose_side) / 2);
+		rose->w = rose_side;
+		rose->h = rose_side;
+		get_keys_cell_sizes(&m, p->w - rose_side - 3 * m.gap, p->h,
+			&cell_w, &cell_h);
+		keys->w = PANEL_COLS * cell_w + 2 * m.gap;
+		keys->h = PANEL_ROWS * cell_h + m.gap;
+		keys->x = p->x + p->w - m.gap - keys->w;
+		keys->y = p->y + MAX(0, (p->h - keys->h) / 2);
+	} else {
+		int stack_h = PANEL_ROWS * (m.min_touch + m.gap) + m.gap;
+
+		rose_side = MIN(p->w, p->h - m.lift - stack_h - m.gap);
+		rose_side = MIN(rose_side, rose_max);
+		if (rose_side < 2 * m.min_touch) {
+			rose_side = MIN(2 * m.min_touch, MIN(p->w, p->h));
+		}
+		rose->x = p->x;
+		rose->y = p->y + MAX(0, p->h - m.lift - rose_side);
+		rose->w = rose_side;
+		rose->h = rose_side;
+		get_keys_cell_sizes(&m, p->w, rose->y - p->y - m.gap,
+			&cell_w, &cell_h);
+		keys->x = p->x;
+		keys->y = p->y;
+		keys->w = PANEL_COLS * cell_w + 2 * m.gap;
+		keys->h = PANEL_ROWS * cell_h + m.gap;
+	}
+}
+
+/*
+ * Lay the key stack out in its piece, one gap in: the frame in the
+ * comment at the top of the panel code.  A slot tab's grid divides the
+ * block's width into PANEL_GRID_COLS cells of its own, wider than the
+ * frame's, so that a word fits on each.
+ */
+static void layout_keys_piece(struct sdlpui_dialog *d, struct sdlpui_window *w)
+{
+	struct panel_piece *pp = d->priv;
+	struct panel_metrics m;
+	int cell_w, cell_h, block_w, i;
+
+	get_panel_metrics(w, &m);
+	get_keys_cell_sizes(&m, d->rect.w, d->rect.h, &cell_w, &cell_h);
+	block_w = PANEL_BLOCK_COLS * cell_w;
+	for (i = 0; i < pp->nkeys; i++) {
+		struct sdlpui_control *c = &pp->keys[i];
+		struct panel_key *pk = c->priv;
+		int x, y, cw = cell_w;
+
+		if (pk->group == PANEL_GROUP_CHROME) {
+			/* Right of the block, set off by a second gap. */
+			x = block_w + m.gap
+				+ (pk->cell % PANEL_CHROME_COLS) * cell_w;
+			y = (pk->cell / PANEL_CHROME_COLS) * cell_h;
+		} else if (pk->group == PANEL_GROUP_TABS) {
+			x = pk->cell * cell_w;
+			y = 0;
+		} else if (pk->group == PANEL_GROUP_KEYS) {
+			if (pk->cell < PANEL_STRIP_COLS) {
+				x = (PANEL_TABS + pk->cell) * cell_w;
+				y = 0;
+			} else {
+				int n = pk->cell - PANEL_STRIP_COLS;
+
+				x = (n % PANEL_BLOCK_COLS) * cell_w;
+				y = (1 + n / PANEL_BLOCK_COLS) * cell_h;
+			}
+		} else {
+			int col = pk->cell % PANEL_GRID_COLS;
+
+			x = (col * block_w) / PANEL_GRID_COLS;
+			cw = ((col + 1) * block_w) / PANEL_GRID_COLS - x;
+			y = (1 + pk->cell / PANEL_GRID_COLS) * cell_h;
+		}
+		c->rect.x = m.gap + x;
+		c->rect.y = m.gap + y;
+		(*c->ftb->resize)(c, d, w, cw - m.gap, cell_h - m.gap);
+	}
+}
+
+/* The rose fills its piece. */
+static void layout_rose_piece(struct sdlpui_dialog *d, struct sdlpui_window *w)
+{
+	struct panel_piece *pp = d->priv;
+
+	if (pp->rose.priv) {
+		pp->rose.rect.x = 0;
+		pp->rose.rect.y = 0;
+		(*pp->rose.ftb->resize)(&pp->rose, d, w, d->rect.w, d->rect.h);
+	}
+}
+
+static void resize_panel(struct sdlpui_dialog *d, struct sdlpui_window *w,
+		int width, int height)
+{
+	struct panel_piece *pp;
+
+	SDL_assert(d->type_code == PANEL_CODE && d->priv);
+	pp = d->priv;
+	d->rect.w = width;
+	d->rect.h = height;
+	if (pp->kind == PANEL_PIECE_ROSE) {
+		layout_rose_piece(d, w);
+	} else {
+		layout_keys_piece(d, w);
+	}
+	drop_panel_texture(d);
+}
+
+static void query_panel_natural_size(struct sdlpui_dialog *d,
+		struct sdlpui_window *w, int *width, int *height)
+{
+	*width = d->rect.w;
+	*height = d->rect.h;
+}
+
+static void cleanup_panel(struct sdlpui_dialog *d)
+{
+	struct panel_piece *pp;
+	int i;
+
+	SDL_assert(d->type_code == PANEL_CODE && d->priv);
+	pp = d->priv;
+	for (i = 0; i < pp->nkeys; i++) {
+		if (pp->keys[i].ftb->cleanup) {
+			(*pp->keys[i].ftb->cleanup)(&pp->keys[i]);
+		}
+	}
+	if (pp->rose.priv && pp->rose.ftb->cleanup) {
+		(*pp->rose.ftb->cleanup)(&pp->rose);
+	}
+	if (d->texture) {
+		SDL_DestroyTexture(d->texture);
+		d->texture = NULL;
+	}
+	SDL_free(pp);
+	d->priv = NULL;
+}
+
+/* A piece popping down leaves the shared state; see unload_panel(). */
+static void hide_panel(struct sdlpui_dialog *d, struct sdlpui_window *w,
+		bool up)
+{
+	struct panel_piece *pp;
+
+	SDL_assert(d->type_code == PANEL_CODE && d->priv);
+	pp = d->priv;
+	if (up || !w->panel || w->panel->pieces[pp->kind] != d) {
+		return;
+	}
+	w->panel->pieces[pp->kind] = NULL;
+	if (w->panel->held_d == d) {
+		w->panel->held = NULL;
+		w->panel->held_d = NULL;
+	}
+	if (w->app->touch.piece == d) {
+		w->app->touch.piece = NULL;
+	}
+}
+
+/*
+ * The rect for a piece in the window's current orientation: its own
+ * region if it has one, else its default place in the panel's home area.
+ * Returns false if it has neither.
+ */
+static bool get_panel_piece_rect(const struct sdlpui_window *window,
+		enum panel_piece_kind kind, SDL_Rect *rect)
+{
+	const struct layout_region *r =
+		find_region(window, panel_piece_target(kind));
+	SDL_Rect rects[PANEL_PIECE_COUNT];
+
+	if (r) {
+		region_to_rect(window, r, rect);
+		return true;
+	}
+	if (!window->has_panel) {
+		return false;
+	}
+	get_panel_default_rects(window, rects);
+	*rect = rects[kind];
+	return true;
+}
+
+/* Create a piece at rect and pop it up; the shared state must exist. */
+static void create_panel_piece(struct sdlpui_window *window,
+		enum panel_piece_kind kind, const SDL_Rect *rect)
+{
+	static const struct sdlpui_dialog_funcs panel_funcs = {
+		.handle_mouseclick = handle_panel_mouseclick,
+		.handle_mousemove = handle_panel_mousemove,
+		.handle_loses_mouse = handle_panel_loses_mouse,
+		.handle_loses_key = sdlpui_dialog_handle_loses_key,
+		.handle_window_loses_mouse = handle_panel_window_loses_mouse,
+		.handle_window_loses_key =
+			sdlpui_dialog_handle_window_loses_key,
+		.render = render_panel,
+		.find_control_containing = find_panel_control_containing,
+		.resize = resize_panel,
+		.query_natural_size = query_panel_natural_size,
+		.cleanup = cleanup_panel
+	};
+	struct panel_shared *ps = window->panel;
+	struct sdlpui_dialog *d;
+	struct panel_piece *pp;
+
+	SDL_assert(ps && !ps->pieces[kind]);
+	d = SDL_calloc(1, sizeof(*d));
+	pp = SDL_calloc(1, sizeof(*pp));
+	pp->kind = kind;
+	pp->shared = ps;
+	if (kind == PANEL_PIECE_ROSE) {
+		create_panel_rose(&pp->rose);
+	} else {
+		create_panel_keys(pp);
+	}
+
+	d->ftb = &panel_funcs;
+	d->pop_callback = hide_panel;
+	d->recreate_textures_callback = recreate_panel_textures;
+	d->next = NULL;
+	d->prev = NULL;
+	d->texture = NULL;
+	d->c_mouse = NULL;
+	d->c_key = NULL;
+	d->priv = pp;
+	d->type_code = PANEL_CODE;
+	d->tag = 0;
+	/* Never removed when another dialog pops down. */
+	d->pinned = true;
+	d->dirty = true;
+	d->rect = *rect;
+	(*d->ftb->resize)(d, window, rect->w, rect->h);
+
+	ps->pieces[kind] = d;
+	sdlpui_popup_dialog(d, window, false);
+	log_panel_piece(window, d, "at");
+}
+
+/*
+ * Create the touch panel: its shared state and every piece that has a
+ * place, if the window is the main one and the panel is enabled.
+ */
+static void load_panel(struct sdlpui_window *window)
+{
+	int kind;
+
+	if (window->panel || window->index != MAIN_WINDOW || !window->config
+			|| !window->config->panel_enabled) {
+		return;
+	}
+	for (kind = 0; kind < PANEL_PIECE_COUNT; kind++) {
+		SDL_Rect rect;
+
+		if (!get_panel_piece_rect(window, kind, &rect)) {
+			continue;
+		}
+		if (!window->panel) {
+			window->panel = SDL_calloc(1, sizeof(*window->panel));
+			window->panel->cur_tab = 0;
+			load_panel_slots(window->panel);
+		}
+		create_panel_piece(window, kind, &rect);
+	}
+}
+
+/* Remove every piece and the shared state. */
+static void unload_panel(struct sdlpui_window *window)
+{
+	int kind;
+
+	if (!window->panel) {
+		return;
+	}
+	for (kind = 0; kind < PANEL_PIECE_COUNT; kind++) {
+		if (window->panel->pieces[kind]) {
+			/* hide_panel() clears the pointer */
+			sdlpui_popdown_dialog(window->panel->pieces[kind], window,
+				false);
+		}
+	}
+	free_panel_slots(window->panel);
+	SDL_free(window->panel);
+	window->panel = NULL;
+}
+
+/*
+ * Write a fresh panel.txt from the command tables and show it: what the
+ * Menu's "Reset Panel Slots" does.  The old file is kept, because the
+ * player may have spent time on it.
+ */
+/* Copy the shipped panel.txt, line by line, over the player's. */
+static bool copy_panel_file(const char *from, const char *to)
+{
+	char line[1024];
+	ang_file *in = file_open(from, MODE_READ, FTYPE_TEXT);
+	ang_file *out;
+
+	if (!in) {
+		return false;
+	}
+	out = file_open(to, MODE_WRITE, FTYPE_TEXT);
+	if (!out) {
+		file_close(in);
+		SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION, "could not write %s",
+			to);
+		return false;
+	}
+	while (file_getl(in, line, sizeof(line))) {
+		file_putf(out, "%s\n", line);
+	}
+	file_close(out);
+	file_close(in);
+	SDL_Log("copied panel slots from %s to %s", from, to);
+
+	return true;
+}
+
+/*
+ * The Menu's "Reset Panel Slots": the player's panel.txt goes back to the
+ * shipped one, whose order is chosen by hand, or to one seeded from the
+ * command tables where nothing is shipped.
+ */
+static void reset_panel_slots(struct sdlpui_window *window)
+{
+	char path[1024], old[1024], shipped[1024];
+
+	path_build(path, sizeof(path), ANGBAND_DIR_USER, PANEL_SLOT_FILE);
+	path_build(old, sizeof(old), ANGBAND_DIR_USER, PANEL_OLD_SLOT_FILE);
+	path_build(shipped, sizeof(shipped), ANGBAND_DIR_CUSTOMIZE,
+		PANEL_SLOT_FILE);
+	if (file_exists(path)) {
+		file_delete(old);
+		if (file_move(path, old)) {
+			SDL_Log("kept the old panel slots as %s", old);
+		}
+	}
+	if (file_exists(shipped) ? !copy_panel_file(shipped, path)
+			: !seed_panel_file(path)) {
+		return;
+	}
+	unload_panel(window);
+	load_panel(window);
+	sdlpui_signal_redraw(window);
+}
+
+/*
+ * After a layout: move each piece to its place for the new size and
+ * orientation, remove the pieces that have none, and create any that now
+ * have one.
+ */
+static void relayout_panel(struct sdlpui_window *window)
+{
+	int kind, remaining = 0;
+
+	/* A drag cannot survive a layout; the piece goes where the layout says. */
+	if (window->app->touch.piece
+			&& window->app->touch.window == window) {
+		window->app->touch.piece = NULL;
+	}
+	if (!window->panel) {
+		load_panel(window);
+		return;
+	}
+	if (!window->config || !window->config->panel_enabled) {
+		unload_panel(window);
+		return;
+	}
+	for (kind = 0; kind < PANEL_PIECE_COUNT; kind++) {
+		struct sdlpui_dialog *d = window->panel->pieces[kind];
+		SDL_Rect rect;
+		bool placed = get_panel_piece_rect(window, kind, &rect);
+
+		if (d && placed) {
+			d->rect.x = rect.x;
+			d->rect.y = rect.y;
+			(*d->ftb->resize)(d, window, rect.w, rect.h);
+			log_panel_piece(window, d, "moved to");
+			remaining++;
+		} else if (d) {
+			/* hide_panel() clears the pointer */
+			sdlpui_popdown_dialog(d, window, false);
+		} else if (placed) {
+			create_panel_piece(window, kind, &rect);
+			remaining++;
+		}
+	}
+	if (!remaining) {
+		unload_panel(window);
+	}
+}
+
+/* --- the two-finger drag --- */
+
+/* The front-most piece under the window point (x, y), or NULL */
+static struct sdlpui_dialog *panel_piece_at(const struct sdlpui_window *window,
+		int x, int y)
+{
+	struct sdlpui_dialog *d;
+
+	if (!window->panel) {
+		return NULL;
+	}
+	for (d = window->d_head; d; d = d->next) {
+		if (d->type_code == PANEL_CODE && sdlpui_is_in_dialog(d, x, y)) {
+			return d;
+		}
+	}
+	return NULL;
+}
+
+/*
+ * The mouse position in the window's pixels, as mouse events report it:
+ * SDL scales those to the renderer's logical size, which is its output
+ * size here, while the raw position is in window units.
+ */
+static void get_mouse_pixels(const struct sdlpui_window *window, int *x,
+		int *y)
+{
+	int mx = 0, my = 0;
+
+	SDL_GetMouseState(&mx, &my);
+	*x = (int)(mx * window->ui_scale);
+	*y = (int)(my * window->ui_scale);
+}
+
+/* Disarm every control of a piece, so nothing in it fires or repeats. */
+static void disarm_panel_piece(struct sdlpui_dialog *d, struct sdlpui_window *w)
+{
+	struct panel_piece *pp = d->priv;
+	int i;
+
+	panel_release(d, NULL);
+	if (pp->rose.priv && pp->rose.ftb->disarm) {
+		(*pp->rose.ftb->disarm)(&pp->rose, d, w, SDLPUI_ACTION_HINT_NONE);
+	}
+	for (i = 0; i < pp->nkeys; i++) {
+		if (pp->keys[i].ftb->disarm) {
+			(*pp->keys[i].ftb->disarm)(&pp->keys[i], d, w,
+				SDLPUI_ACTION_HINT_NONE);
+		}
+	}
+}
+
+/*
+ * Record a piece's rect as its region for the window's current
+ * orientation, in per-mille of the inner rect, replacing any it had; the
+ * next layout and dump_config_file() use it.  The edges are rounded, not
+ * the size, so the rect comes back within a pixel.
+ */
+static void set_panel_piece_region(struct sdlpui_window *window,
+		enum panel_piece_kind kind, const SDL_Rect *rect)
+{
+	struct window_config *config = window->config;
+	const SDL_Rect *in = &window->inner_rect;
+	struct layout_region reg;
+	int x1, y1, i;
+
+	if (!config || in->w <= 0 || in->h <= 0) {
+		return;
+	}
+	reg.target = panel_piece_target(kind);
+	reg.orient = (in->w > in->h) ?
+		REGION_ORIENT_LANDSCAPE : REGION_ORIENT_PORTRAIT;
+	reg.x = ((rect->x - in->x) * REGION_PER_MILLE + in->w / 2) / in->w;
+	reg.y = ((rect->y - in->y) * REGION_PER_MILLE + in->h / 2) / in->h;
+	x1 = ((rect->x + rect->w - in->x) * REGION_PER_MILLE + in->w / 2) / in->w;
+	y1 = ((rect->y + rect->h - in->y) * REGION_PER_MILLE + in->h / 2) / in->h;
+	reg.w = MAX(1, x1 - reg.x);
+	reg.h = MAX(1, y1 - reg.y);
+	reg.w = MIN(reg.w, REGION_PER_MILLE);
+	reg.h = MIN(reg.h, REGION_PER_MILLE);
+	reg.x = MAX(0, MIN(reg.x, REGION_PER_MILLE - reg.w));
+	reg.y = MAX(0, MIN(reg.y, REGION_PER_MILLE - reg.h));
+
+	for (i = 0; i < config->num_regions; i++) {
+		if (config->regions[i].target == reg.target
+				&& config->regions[i].orient == reg.orient) {
+			config->regions[i] = reg;
+			return;
+		}
+	}
+	if (config->num_regions < MAX_REGIONS) {
+		config->regions[config->num_regions++] = reg;
+	}
+}
+
+/*
+ * Pick a piece up with the mouse at (x, y): it draws over the other piece
+ * and nothing in it fires.
+ */
+static void start_panel_drag(struct my_app *a, struct sdlpui_window *window,
+		struct sdlpui_dialog *piece, int x, int y)
+{
+	struct touch_drag *td = &a->touch;
+
+	td->piece = piece;
+	td->window = window;
+	td->origin.x = piece->rect.x;
+	td->origin.y = piece->rect.y;
+	td->start.x = x;
+	td->start.y = y;
+	disarm_panel_piece(piece, window);
+	sdlpui_dialog_push_to_top(window, piece);
+	piece->dirty = true;
+	sdlpui_signal_redraw(window);
+	log_panel_piece(window, piece, "picked up at");
+}
+
+/* Move the dragged piece with the mouse, now at (x, y). */
+static void move_panel_drag(struct my_app *a, int x, int y)
+{
+	struct touch_drag *td = &a->touch;
+	int nx, ny;
+
+	if (!td->piece) {
+		return;
+	}
+	nx = td->origin.x + (x - td->start.x);
+	ny = td->origin.y + (y - td->start.y);
+	if (nx != td->piece->rect.x || ny != td->piece->rect.y) {
+		td->piece->rect.x = nx;
+		td->piece->rect.y = ny;
+		sdlpui_signal_redraw(td->window);
+	}
+}
+
+/*
+ * Put the dragged piece down: clamp it into the window and remember its
+ * place as a region for the current orientation, so it survives a
+ * rotation and is written to the configuration file.
+ */
+static void end_panel_drag(struct my_app *a)
+{
+	struct touch_drag *td = &a->touch;
+	struct sdlpui_dialog *piece = td->piece;
+	struct sdlpui_window *window = td->window;
+	struct panel_piece *pp;
+
+	td->piece = NULL;
+	if (!piece || !window) {
+		return;
+	}
+	pp = piece->priv;
+	fit_rect_in_rect_by_xy(&piece->rect, &window->inner_rect);
+	set_panel_piece_region(window, pp->kind, &piece->rect);
+	sdlpui_signal_redraw(window);
+	log_panel_piece(window, piece, "put down at");
+}
+
+/*
+ * Fingers beyond the first, which SDL turns into mouse events, matter only
+ * to the two-finger drag.  A second finger landing while the first is
+ * pressing a piece picks the piece up (the first finger's press has
+ * already fired its key); the piece then follows the first finger's mouse
+ * motion (handle_mousemotion()); any finger lifting, or the first finger's
+ * mouse release (handle_mousebutton()), puts it down.  The first finger is
+ * known by SDL's own rule, mirrored here: the first finger down while none
+ * is tracked, until it lifts.  Nothing here reads SDL's list of fingers:
+ * on the iPad a lift can go undelivered and leave a phantom finger in
+ * it, which once made a drag pick up the wrong piece and then blocked
+ * every drag.  Only a touch screen counts, a direct device; a trackpad is
+ * indirect.  Returns true when something changed, so the window is
+ * redrawn.
+ */
+static bool handle_finger(struct my_app *a, const SDL_TouchFingerEvent *e)
+{
+	struct touch_drag *td = &a->touch;
+	struct sdlpui_window *window;
+	struct sdlpui_dialog *piece;
+	bool is_mouse_finger;
+	int mx, my;
+
+	if (SDL_GetTouchDeviceType(e->touchId) != SDL_TOUCH_DEVICE_DIRECT) {
+		return false;
+	}
+	is_mouse_finger = td->has_mouse_finger
+		&& e->touchId == td->mouse_touch_id
+		&& e->fingerId == td->mouse_finger_id;
+	if (e->type == SDL_FINGERUP) {
+		if (is_mouse_finger) {
+			td->has_mouse_finger = false;
+		}
+		if (td->piece) {
+			end_panel_drag(a);
+			return true;
+		}
+		return false;
+	}
+	if (e->type != SDL_FINGERDOWN) {
+		return false;
+	}
+	if (!td->has_mouse_finger) {
+		td->has_mouse_finger = true;
+		td->mouse_touch_id = e->touchId;
+		td->mouse_finger_id = e->fingerId;
+		if (!td->test_one_finger) {
+			return false;
+		}
+	} else if (is_mouse_finger || td->piece) {
+		return false;
+	}
+	/* A second finger.  Is the first pressing a piece? */
+	if (!(SDL_GetMouseState(NULL, NULL) & SDL_BUTTON_LMASK)) {
+		return false;
+	}
+	window = get_window_by_id(a, e->windowID);
+	if (!window) {
+		window = a->w_mouse;
+	}
+	if (!window || !window->panel) {
+		return false;
+	}
+	get_mouse_pixels(window, &mx, &my);
+	piece = panel_piece_at(window, mx, my);
+	if (!piece) {
+		return false;
+	}
+	start_panel_drag(a, window, piece, mx, my);
+	return true;
+}
+
+/*
+ * Stop any repeat in every window's panel and put down any dragged piece
+ * (the app went to the background).
+ */
+static void panel_cancel_repeat(struct my_app *a)
+{
+	int i;
+
+	for (i = 0; i < MAX_WINDOWS; i++) {
+		struct panel_shared *ps = a->windows[i].panel;
+
+		if (ps) {
+			ps->held = NULL;
+			ps->held_d = NULL;
+		}
+	}
+	if (a->touch.piece) {
+		end_panel_drag(a);
+	}
+}
+
+/*
+ * Re-fire the held control on the repeat schedule.  Called from the
+ * event loop while the game waits for input.  A held control whose
+ * button is no longer down (a release the panel never saw) is dropped.
+ */
+static void panel_tick(struct my_app *a)
+{
+	struct sdlpui_window *w = &a->windows[MAIN_WINDOW];
+	struct panel_shared *ps = w->panel;
+	Uint32 now;
+
+	if (!ps || !ps->held) {
+		return;
+	}
+	if (!(SDL_GetMouseState(NULL, NULL) & SDL_BUTTON_LMASK)) {
+		ps->held = NULL;
+		ps->held_d = NULL;
+		return;
+	}
+	now = SDL_GetTicks();
+	if ((Sint32)(now - ps->next_repeat) < 0) {
+		return;
+	}
+	if (ps->held->type_code == PANEL_ROSE_CODE) {
+		fire_panel_rose(ps->held, ps->held_d, w);
+	} else {
+		fire_panel_key(ps->held, ps->held_d, w);
+	}
+	ps->next_repeat = now + PANEL_REPEAT_INTERVAL_MS;
+}
+
+#else /* !ON_IOS */
+
+/*
+ * Stand-ins for the touch panel on the platforms that do not build it.  A
+ * window never gets a panel, so window->panel stays NULL and the callers'
+ * panel branches fall away.
+ */
+static void load_panel(struct sdlpui_window *window) { }
+static void relayout_panel(struct sdlpui_window *window) { }
+static void render_panel_home(struct sdlpui_window *window) { }
+static void panel_tick(struct my_app *a) { }
+static void panel_cancel_repeat(struct my_app *a) { }
+static void move_panel_drag(struct my_app *a, int x, int y) { }
+static void end_panel_drag(struct my_app *a) { }
+
+static bool handle_finger(struct my_app *a, const SDL_TouchFingerEvent *e)
+{
+	return false;
+}
+
+static struct sdlpui_dialog *panel_piece_at(const struct sdlpui_window *window,
+		int x, int y)
+{
+	return NULL;
+}
+
+#endif /* ON_IOS */
 
 static void handle_button_open_subwindow(struct sdlpui_control *ctrl,
 		struct sdlpui_dialog *dlg, struct sdlpui_window *window)
@@ -5979,6 +9476,225 @@ static void fit_subwindow_in_window(const struct sdlpui_window *window,
 	}
 }
 
+/*
+ * Return the region for target (a subwindow index or REGION_TARGET_PANEL)
+ * in the window's current orientation, or NULL if there is none.  A region
+ * for the specific orientation wins over one for "any".
+ */
+static const struct layout_region *find_region(
+		const struct sdlpui_window *window, int target)
+{
+	const struct layout_region *found = NULL;
+	enum region_orient want =
+		(window->inner_rect.w > window->inner_rect.h) ?
+		REGION_ORIENT_LANDSCAPE : REGION_ORIENT_PORTRAIT;
+	int i;
+
+	if (!window->config) {
+		return NULL;
+	}
+	for (i = 0; i < window->config->num_regions; i++) {
+		const struct layout_region *r = &window->config->regions[i];
+
+		if (r->target != target) {
+			continue;
+		}
+		if (r->orient == want) {
+			return r;
+		}
+		if (r->orient == REGION_ORIENT_ANY) {
+			found = r;
+		}
+	}
+	return found;
+}
+
+/*
+ * Convert a region to a pixel rect in the window.  Both edges come from
+ * the region's end points so that adjacent regions tile exactly.
+ */
+static void region_to_rect(const struct sdlpui_window *window,
+		const struct layout_region *r, SDL_Rect *rect)
+{
+	const SDL_Rect *in = &window->inner_rect;
+	int x0 = in->w * r->x / REGION_PER_MILLE;
+	int y0 = in->h * r->y / REGION_PER_MILLE;
+	int x1 = in->w * (r->x + r->w) / REGION_PER_MILLE;
+	int y1 = in->h * (r->y + r->h) / REGION_PER_MILLE;
+
+	rect->x = in->x + x0;
+	rect->y = in->y + y0;
+	rect->w = x1 - x0;
+	rect->h = y1 - y0;
+}
+
+/*
+ * Set the window's panel rect from the "panel" region for the current
+ * orientation, if there is one.
+ */
+static void resolve_panel_rect(struct sdlpui_window *window)
+{
+	const struct layout_region *r =
+		find_region(window, REGION_TARGET_PANEL);
+
+	if (r) {
+		region_to_rect(window, r, &window->panel_rect);
+		window->has_panel = true;
+	} else {
+		memset(&window->panel_rect, 0, sizeof(window->panel_rect));
+		window->has_panel = false;
+	}
+}
+
+/*
+ * If rect cannot hold the subwindow's minimum columns and rows with its
+ * current font, grow it to the minimum and clamp it into the window, as
+ * fit_subwindow_in_window() would.  A region that is too small then shows
+ * the error border instead of aborting the game.
+ */
+static void ensure_minimum_rect(const struct subwindow *subwindow,
+		SDL_Rect *rect)
+{
+	int min_w, min_h;
+
+	get_minimum_subwindow_size(subwindow->index == MAIN_SUBWINDOW,
+		subwindow->font->ttf.glyph.w, subwindow->font->ttf.glyph.h,
+		&min_w, &min_h);
+	if (rect->w < min_w || rect->h < min_h) {
+		rect->w = MAX(rect->w, min_w);
+		rect->h = MAX(rect->h, min_h);
+		coerce_rect_in_rect(rect, &subwindow->window->inner_rect,
+			min_w, min_h);
+	}
+}
+
+/*
+ * Measure a vector font's glyph cell at a size without building a cache.
+ * Uses the same metrics as load_font().
+ */
+static bool measure_font(const char *path, int size, int *w, int *h)
+{
+	TTF_Font *handle = TTF_OpenFont(path, size);
+
+	if (handle == NULL) {
+		return false;
+	}
+	*h = TTF_FontHeight(handle);
+	if (TTF_GlyphMetrics(handle, GLYPH_FOR_ADVANCE, NULL, NULL, NULL,
+			NULL, w) != 0) {
+		TTF_CloseFont(handle);
+		return false;
+	}
+	TTF_CloseFont(handle);
+	return true;
+}
+
+/*
+ * Return the largest size in the subwindow's configured font range at
+ * which font, a vector font, fits the subwindow's minimum columns and rows
+ * in rect.  Returns 0 if the subwindow has no range, the font is a raster
+ * font, or no size in the range fits.
+ */
+static int fit_font_size(const struct subwindow *subwindow,
+		const struct font_info *info, const SDL_Rect *rect)
+{
+	int max_size, min_size, size;
+
+	if (subwindow->config == NULL || subwindow->config->font_size_max <= 0
+			|| info->type != FONT_TYPE_VECTOR) {
+		return 0;
+	}
+	max_size = MIN(subwindow->config->font_size_max, MAX_VECTOR_FONT_SIZE);
+	min_size = MAX(subwindow->config->font_size_min, MIN_VECTOR_FONT_SIZE);
+	for (size = max_size; size >= min_size; size--) {
+		int w, h;
+
+		if (!measure_font(info->path, size, &w, &h)) {
+			return 0;
+		}
+		if (is_ok_col_row(subwindow, rect, w, h)) {
+			return size;
+		}
+	}
+	return 0;
+}
+
+/*
+ * Move a loaded subwindow into rect, refitting its font if it has a font
+ * range (see ensure_minimum_rect() for a rect that is too small).
+ */
+static void relayout_subwindow(struct subwindow *subwindow,
+		const SDL_Rect *rect)
+{
+	struct sdlpui_window *window = subwindow->window;
+
+	assert(subwindow->loaded);
+
+	if (subwindow->config && subwindow->config->font_size_max > 0) {
+		const struct font_info *info =
+			&window->app->fonts[subwindow->font->index];
+		int size = fit_font_size(subwindow, info, rect);
+
+		if (size > 0 && size != subwindow->font->size) {
+			struct font *new_font =
+				make_font(window, info->name, size);
+
+			if (new_font) {
+				free_font(subwindow->font);
+				subwindow->font = new_font;
+			}
+		}
+	}
+
+	subwindow->sizing_rect = *rect;
+	ensure_minimum_rect(subwindow, &subwindow->sizing_rect);
+	resize_subwindow(subwindow);
+	SDL_Log("subwindow %u: region %d,%d %dx%d, font %d, %dx%d cells",
+		subwindow->index, subwindow->full_rect.x,
+		subwindow->full_rect.y, subwindow->full_rect.w,
+		subwindow->full_rect.h, subwindow->font->size,
+		subwindow->cols, subwindow->rows);
+}
+
+/*
+ * Lay out the window's subwindows and panel for its current size and
+ * orientation.  Subwindows with a region move into it; the others are only
+ * clamped into the window.  Called from resize_window().  At start-up,
+ * load_subwindow() applies the region itself, because the term does not
+ * exist yet.
+ */
+static void resolve_layout(struct sdlpui_window *window)
+{
+	int minw, minh;
+
+	SDL_Log("window %u: layout for %dx%d (%s)", window->index,
+		window->inner_rect.w, window->inner_rect.h,
+		(window->inner_rect.w > window->inner_rect.h) ?
+		"landscape" : "portrait");
+	resolve_panel_rect(window);
+	relayout_panel(window);
+	for (size_t i = 0; i < N_ELEMENTS(window->subwindows); i++) {
+		struct subwindow *subwindow = window->subwindows[i];
+		const struct layout_region *r;
+		SDL_Rect rect;
+
+		if (subwindow == NULL) {
+			continue;
+		}
+		r = find_region(window, subwindow->index);
+		if (r == NULL) {
+			fit_subwindow_in_window(window, subwindow);
+			continue;
+		}
+		region_to_rect(window, r, &rect);
+		relayout_subwindow(subwindow, &rect);
+	}
+
+	/* A change of font can change the minimum window size. */
+	get_minimum_window_size(window, &minw, &minh);
+	SDL_SetWindowMinimumSize(window->window, minw, minh);
+}
+
 static void resize_window(struct sdlpui_window *window, int w, int h)
 {
 	if (window->full_rect.w == w
@@ -5995,12 +9711,7 @@ static void resize_window(struct sdlpui_window *window, int w, int h)
 	adjust_window_geometry(window);
 	
 	clear_all_borders(window);
-	for (size_t i = 0; i < N_ELEMENTS(window->subwindows); i++) {
-		struct subwindow *subwindow = window->subwindows[i];
-		if (subwindow != NULL) {
-			fit_subwindow_in_window(window, subwindow);
-		}
-	}
+	resolve_layout(window);
 
 	redraw_window(window);
 }
@@ -6161,6 +9872,9 @@ static void start_window(struct sdlpui_window *window)
 				window->stored_rect = tmp_rect;
 			}
 		}
+#ifdef __APPLE__
+		window->config->window_flags = window->config->window_flags | SDL_WINDOW_ALLOW_HIGHDPI;
+#endif
 		window->window = SDL_CreateWindow(VERSION_NAME,
 				window->full_rect.x, window->full_rect.y,
 				window->full_rect.w, window->full_rect.h,
@@ -6181,6 +9895,28 @@ static void start_window(struct sdlpui_window *window)
 		quit_fmt("cannot create renderer for window %u: %s",
 				window->index, SDL_GetError());
 	}
+	{
+		int rw = 0, rh = 0, ww = 0, wh = 0;
+
+		/*
+		 * Render in the renderer's output pixels, which on a HiDPI
+		 * display are more than the window's units; with the
+		 * logical size set, SDL scales mouse events to match.
+		 */
+		SDL_GetRendererOutputSize(window->renderer, &rw, &rh);
+		SDL_GetWindowSize(window->window, &ww, &wh);
+		SDL_RenderSetLogicalSize(window->renderer, rw, rh);
+		window->ui_scale = (ww > 0) ? (float)rw / (float)ww : 1.0f;
+		/*
+		 * The window need not have the configured size: a fullscreen
+		 * window takes the display's size, and the display may have
+		 * been rotated since the configuration was written.
+		 */
+		window->full_rect.w = rw;
+		window->full_rect.h = rh;
+		SDL_Log("window %u: %dx%d units, %dx%d pixels, ui_scale %.2f",
+			window->index, ww, wh, rw, rh, window->ui_scale);
+	}
 
 	SDL_RendererInfo info;
 	if (SDL_GetRendererInfo(window->renderer, &info) != 0) {
@@ -6192,6 +9928,8 @@ static void start_window(struct sdlpui_window *window)
 	}
 
 	load_window(window);
+	resolve_panel_rect(window);
+	load_panel(window);
 
 	for (size_t i = 0; i < N_ELEMENTS(window->subwindows); i++) {
 		if (window->subwindows[i] != NULL) {
@@ -6210,6 +9948,8 @@ static void wipe_window_aux_config(struct sdlpui_window *window)
 {
 	window->config = mem_zalloc(sizeof(*window->config));
 	assert(window->config != NULL);
+	window->config->panel_enabled = true;
+	window->config->panel_alpha = DEFAULT_PANEL_ALPHA;
 
 	const struct sdlpui_window *main_window =
 		get_window_direct(window->app, MAIN_WINDOW);
@@ -6290,7 +10030,7 @@ static void wipe_window(struct sdlpui_window *window, int display)
 	window->alpha = DEFAULT_ALPHA_FULL;
 
 	window->wallpaper.texture = NULL;
-	window->wallpaper.mode = WALLPAPER_TILED;
+	window->wallpaper.mode = WALLPAPER_DONT_SHOW;
 
 	window->stipple.texture = NULL;
 
@@ -6299,8 +10039,39 @@ static void wipe_window(struct sdlpui_window *window, int display)
 
 	window->dirty = true;
 
+	window->has_panel = false;
+	window->ui_scale = 1.0f;
+
 	window->config = NULL;
 	window->inited = true;
+}
+
+/* Inverse of region_target_from_name(); buf must hold at least 8 bytes. */
+static const char *region_target_name(int target, char *buf, size_t len)
+{
+	if (target == MAIN_SUBWINDOW) {
+		return "map";
+	}
+	if (target == REGION_TARGET_PANEL) {
+		return "panel";
+	}
+	if (target == REGION_TARGET_ROSE) {
+		return "rose";
+	}
+	if (target == REGION_TARGET_KEYS) {
+		return "keys";
+	}
+	strnfmt(buf, len, "sub%d", target);
+	return buf;
+}
+
+static const char *region_orient_name(enum region_orient orient)
+{
+	switch (orient) {
+		case REGION_ORIENT_PORTRAIT: return "portrait";
+		case REGION_ORIENT_LANDSCAPE: return "landscape";
+		default: return "any";
+	}
 }
 
 static void dump_subwindow(const struct subwindow *subwindow, ang_file *config)
@@ -6326,6 +10097,12 @@ static void dump_subwindow(const struct subwindow *subwindow, ang_file *config)
 	}
 	DUMP_SUBWINDOW("font", "%d:%s",
 			subwindow->font->size, subwindow->font->name);
+	if (subwindow->config && subwindow->config->font_size_max > 0) {
+		DUMP_SUBWINDOW("font-max", "%d",
+			subwindow->config->font_size_max);
+		DUMP_SUBWINDOW("font-min", "%d",
+			subwindow->config->font_size_min);
+	}
 	DUMP_SUBWINDOW("borders", "%s",
 			subwindow->borders.visible ? "true" : "false");
 	DUMP_SUBWINDOW("top", "%s:%s",
@@ -6386,6 +10163,27 @@ static void dump_window(const struct sdlpui_window *window, ang_file *config)
 	DUMP_WINDOW("tile-scale", "height:%d", tile_height);
 #undef DUMP_WINDOW
 	file_put(config, "\n");
+
+	if (window->config && window->config->num_regions > 0) {
+		for (int i = 0; i < window->config->num_regions; i++) {
+			const struct layout_region *r =
+				&window->config->regions[i];
+			char buf[8];
+
+			file_putf(config, "region:%s:%s:%d:%d:%d:%d\n",
+				region_target_name(r->target, buf, sizeof(buf)),
+				region_orient_name(r->orient),
+				r->x, r->y, r->w, r->h);
+		}
+		file_put(config, "\n");
+	}
+
+	if (window->config && window->index == MAIN_WINDOW) {
+		file_putf(config, "panel:%s\n",
+			window->config->panel_enabled ? "on" : "off");
+		file_putf(config, "panel-alpha:%d\n\n",
+			window->config->panel_alpha);
+	}
 
 	for (size_t i = 0; i < N_ELEMENTS(window->subwindows); i++) {
 		struct subwindow *subwindow = window->subwindows[i];
@@ -6506,14 +10304,47 @@ static void load_subwindow(struct sdlpui_window *window,
 	assert(window->loaded);
 	assert(!subwindow->loaded);
 
+	/*
+	 * For newer configuration files, stored_rect will have the desired
+	 * size for fullscreen.  Older configuration files only save the
+	 * size of whatever mode (fullscreen, not fullscreen) the game was in
+	 * so those will already have the right size in full_rect.
+	 */
+	if (subwindow->config && window->config && (window->config->window_flags
+			& SDL_WINDOW_FULLSCREEN_DESKTOP)
+			&& subwindow->stored_rect.w
+			&& subwindow->stored_rect.h) {
+		SDL_Rect tmp_rect = subwindow->full_rect;
+
+		subwindow->full_rect = subwindow->stored_rect;
+		subwindow->stored_rect = tmp_rect;
+	}
+
+	/* A region for the current orientation overrides the configured rect. */
+	{
+		const struct layout_region *r =
+			find_region(window, subwindow->index);
+
+		if (r) {
+			region_to_rect(window, r, &subwindow->full_rect);
+		}
+	}
+
 	if (subwindow->font == NULL) {
 		const char *try_names[3];
 		int try_sizes[3];
 		int n_tries = 0, i = 0;
 
 		if (subwindow->config && subwindow->config->font_name) {
+			const struct font_info *info = find_font_info(
+				window->app->fonts, window->app->font_count,
+				subwindow->config->font_name);
+			int fitted = (info) ? fit_font_size(subwindow, info,
+				&subwindow->full_rect) : 0;
+
 			try_names[n_tries] = subwindow->config->font_name;
-			try_sizes[n_tries] = subwindow->config->font_size;
+			try_sizes[n_tries] = (fitted > 0) ?
+				fitted : subwindow->config->font_size;
 			++n_tries;
 		}
 		try_names[n_tries] = DEFAULT_FONT;
@@ -6551,26 +10382,20 @@ static void load_subwindow(struct sdlpui_window *window,
 		}
 	}
 
-	/*
-	 * For newer configuration files, stored_rect will have the desired
-	 * size for fullscreen.  Older configuration files only save the
-	 * size of whatever mode (fullscreen, not fullscreen) the game was in
-	 * so those will already have the right size in full_rect.
-	 */
-	if (subwindow->config && window->config && (window->config->window_flags
-			& SDL_WINDOW_FULLSCREEN_DESKTOP)
-			&& subwindow->stored_rect.w
-			&& subwindow->stored_rect.h) {
-		SDL_Rect tmp_rect = subwindow->full_rect;
-
-		subwindow->full_rect = subwindow->stored_rect;
-		subwindow->stored_rect = tmp_rect;
+	/* The region, if any, may be too small for the font chosen above. */
+	if (find_region(window, subwindow->index)) {
+		ensure_minimum_rect(subwindow, &subwindow->full_rect);
 	}
 
 	if (!adjust_subwindow_geometry(window, subwindow)) {
 		quit_fmt("cannot adjust geometry of subwindow %u in window %u",
 				subwindow->index, window->index);
 	}
+	SDL_Log("subwindow %u: rect %d,%d %dx%d, font %d, %dx%d cells",
+		subwindow->index, subwindow->full_rect.x,
+		subwindow->full_rect.y, subwindow->full_rect.w,
+		subwindow->full_rect.h, subwindow->font->size,
+		subwindow->cols, subwindow->rows);
 	subwindow->texture = make_subwindow_texture(window,
 			subwindow->full_rect.w, subwindow->full_rect.h);
 	assert(subwindow->texture != NULL);
@@ -6891,6 +10716,11 @@ static void free_window(struct sdlpui_window *window)
 	window->infod = NULL;
 	window->shorte = NULL;
 	window->detaild = NULL;
+	/* The pieces went with the dialogs; the shared state remains. */
+	if (window->panel) {
+		SDL_free(window->panel);
+		window->panel = NULL;
+	}
 
 	for (size_t i = 0; i < N_ELEMENTS(window->subwindows); i++) {
 		struct subwindow *subwindow = window->subwindows[i];
@@ -7094,13 +10924,20 @@ static void init_systems(void)
 		quit("sdlpui_init() failed");
 	}
 	SHORTCUT_EDITOR_CODE = sdlpui_register_code("ANGBAND_SHORTCUT_EDITOR");
+	PANEL_CODE = sdlpui_register_code("ANGBAND_TOUCH_PANEL");
+	PANEL_KEY_CODE = sdlpui_register_code("ANGBAND_TOUCH_PANEL_KEY");
+	PANEL_ROSE_CODE = sdlpui_register_code("ANGBAND_TOUCH_PANEL_ROSE");
 	SDL_assert(SHORTCUT_EDITOR_CODE);
 
-	/* On (some?) Macs the touchpad sends both mouse events and touch events;
-	 * the latter interfere badly with the working of the status bar */
-	SDL_EventState(SDL_FINGERMOTION, SDL_DISABLE);
-	SDL_EventState(SDL_FINGERDOWN, SDL_DISABLE);
-	SDL_EventState(SDL_FINGERUP, SDL_DISABLE);
+	/*
+	 * Finger events used to be disabled here because on (some?) Macs the
+	 * touchpad sends both mouse events and touch events, and the latter
+	 * interfered with the status bar.  The touch panel's two-finger drag
+	 * needs them (handle_finger()), which acts only on a touch screen, a
+	 * direct device; a touchpad is indirect and its finger events are
+	 * still ignored.  SDL keeps turning the first finger into mouse
+	 * events, which is how the panel's keys are pressed.
+	 */
 	/* Ignore Keymap changed events since they are not handled */
 	SDL_EventState(SDL_KEYMAPCHANGED, SDL_DISABLE);
 
@@ -7237,6 +11074,10 @@ static void init_globals(struct my_app *a)
 
 	path_build(a->config_file, sizeof(a->config_file),
 			DEFAULT_CONFIG_FILE_DIR, DEFAULT_CONFIG_FILE);
+	if(!file_exists(a->config_file)) {
+		path_build(a->config_file, sizeof(a->config_file),
+										   ANGBAND_DIR_PLATFORM, DEFAULT_CONFIG_FILE);
+	}
 
 	for (size_t i = 0; i < N_ELEMENTS(a->subwindows); i++) {
 		a->subwindows[i].index = i;
@@ -7254,6 +11095,7 @@ static void init_globals(struct my_app *a)
 	a->w_mouse = NULL;
 	a->w_key = NULL;
 	a->kp_as_mod = true;
+	a->touch.test_one_finger = SDL_getenv("ANGBAND_PANEL_DRAG_TEST") != NULL;
 	a->controller = NULL;
 	num_joysticks = SDL_NumJoysticks();
 	for (int i = 0; i < num_joysticks; i++) {
@@ -7404,6 +11246,21 @@ static void dump_config_file(const struct my_app *a)
 {
 	ang_file *config = file_open(a->config_file, MODE_WRITE, FTYPE_TEXT);
 
+	if (config == NULL) {
+		/*
+		 * Compare to the two attempts to open the config file in
+		 * init_globals().  When the DEFAULT_CONFIG_FILE_DIR version is
+		 * missing on launch we read the one inside lib/, and so arrive
+		 * here on exit with a path that cannot be written; write the
+		 * per-user copy instead.  Later exits will not come this way.
+		 */
+		char fallback[sizeof(a->config_file)];
+
+		path_build(fallback, sizeof(fallback), DEFAULT_CONFIG_FILE_DIR,
+			DEFAULT_CONFIG_FILE);
+		config = file_open(fallback, MODE_WRITE, FTYPE_TEXT);
+	}
+
 	assert(config != NULL);
 
 	for (size_t i = 0; i < N_ELEMENTS(a->windows); i++) {
@@ -7463,6 +11320,8 @@ static enum parser_error config_window_display(struct parser *parser)
 	window->config = mem_zalloc(sizeof(*window->config));
 
 	window->config->window_flags = SDL_WINDOW_RESIZABLE;
+	window->config->panel_enabled = true;
+	window->config->panel_alpha = DEFAULT_PANEL_ALPHA;
 
 	return PARSE_ERROR_NONE;
 }
@@ -7776,6 +11635,41 @@ static enum parser_error config_subwindow_font(struct parser *parser)
 	return PARSE_ERROR_NONE;
 }
 
+static enum parser_error config_subwindow_font_range(struct parser *parser,
+		bool is_max)
+{
+	struct subwindow *subwindow = get_subwindow_from_parser(parser);
+	int size = parser_getint(parser, "size");
+
+	if (!subwindow) {
+		return PARSE_ERROR_OUT_OF_BOUNDS;
+	}
+	if (!subwindow->inited) {
+		return PARSE_ERROR_MISSING_RECORD_HEADER;
+	}
+	if (size < MIN_VECTOR_FONT_SIZE || size > MAX_VECTOR_FONT_SIZE) {
+		return PARSE_ERROR_OUT_OF_BOUNDS;
+	}
+
+	if (is_max) {
+		subwindow->config->font_size_max = size;
+	} else {
+		subwindow->config->font_size_min = size;
+	}
+
+	return PARSE_ERROR_NONE;
+}
+
+static enum parser_error config_subwindow_font_max(struct parser *parser)
+{
+	return config_subwindow_font_range(parser, true);
+}
+
+static enum parser_error config_subwindow_font_min(struct parser *parser)
+{
+	return config_subwindow_font_range(parser, false);
+}
+
 static enum parser_error config_subwindow_borders(struct parser *parser)
 {
 	struct subwindow *subwindow = get_subwindow_from_parser(parser);
@@ -7852,6 +11746,136 @@ static enum parser_error config_subwindow_alpha(struct parser *parser)
 	return PARSE_ERROR_NONE;
 }
 
+/*
+ * Map the name in a "region:" line to a subwindow index or
+ * REGION_TARGET_PANEL.  Returns -1 for an unknown name.
+ */
+static int region_target_from_name(const char *name)
+{
+	if (streq(name, "map")) {
+		return MAIN_SUBWINDOW;
+	}
+	if (streq(name, "panel")) {
+		return REGION_TARGET_PANEL;
+	}
+	if (streq(name, "rose")) {
+		return REGION_TARGET_ROSE;
+	}
+	if (streq(name, "keys")) {
+		return REGION_TARGET_KEYS;
+	}
+	if (strncmp(name, "sub", 3) == 0 && name[3] >= '0' && name[3] <= '9'
+			&& name[4] == '\0') {
+		int index = name[3] - '0';
+
+		if (index > MAIN_SUBWINDOW && index < MAX_SUBWINDOWS) {
+			return index;
+		}
+	}
+	return -1;
+}
+
+static bool region_orient_from_name(const char *name,
+		enum region_orient *orient)
+{
+	if (streq(name, "any")) {
+		*orient = REGION_ORIENT_ANY;
+	} else if (streq(name, "portrait")) {
+		*orient = REGION_ORIENT_PORTRAIT;
+	} else if (streq(name, "landscape")) {
+		*orient = REGION_ORIENT_LANDSCAPE;
+	} else {
+		return false;
+	}
+	return true;
+}
+
+static enum parser_error config_region(struct parser *parser)
+{
+	struct my_app *a = parser_priv(parser);
+	struct sdlpui_window *window = &a->windows[MAIN_WINDOW];
+	struct window_config *config;
+	struct layout_region reg;
+	int i;
+
+	/* Regions belong to the main window, which must come first. */
+	if (!window->inited || !window->config) {
+		return PARSE_ERROR_MISSING_RECORD_HEADER;
+	}
+	config = window->config;
+
+	reg.target = region_target_from_name(parser_getsym(parser, "name"));
+	if (reg.target < 0) {
+		return PARSE_ERROR_INVALID_VALUE;
+	}
+	if (!region_orient_from_name(parser_getsym(parser, "orient"),
+			&reg.orient)) {
+		return PARSE_ERROR_INVALID_VALUE;
+	}
+	reg.x = parser_getint(parser, "x");
+	reg.y = parser_getint(parser, "y");
+	reg.w = parser_getint(parser, "w");
+	reg.h = parser_getint(parser, "h");
+	if (reg.x < 0 || reg.y < 0 || reg.w <= 0 || reg.h <= 0
+			|| reg.x + reg.w > REGION_PER_MILLE
+			|| reg.y + reg.h > REGION_PER_MILLE) {
+		return PARSE_ERROR_OUT_OF_BOUNDS;
+	}
+
+	/* A later line for the same target and orientation replaces it. */
+	for (i = 0; i < config->num_regions; i++) {
+		if (config->regions[i].target == reg.target
+				&& config->regions[i].orient == reg.orient) {
+			config->regions[i] = reg;
+			return PARSE_ERROR_NONE;
+		}
+	}
+	if (config->num_regions >= MAX_REGIONS) {
+		return PARSE_ERROR_TOO_MANY_ENTRIES;
+	}
+	config->regions[config->num_regions++] = reg;
+
+	return PARSE_ERROR_NONE;
+}
+
+static enum parser_error config_panel(struct parser *parser)
+{
+	struct my_app *a = parser_priv(parser);
+	struct sdlpui_window *window = &a->windows[MAIN_WINDOW];
+	const char *state = parser_getsym(parser, "state");
+
+	/* The panel belongs to the main window, which must come first. */
+	if (!window->inited || !window->config) {
+		return PARSE_ERROR_MISSING_RECORD_HEADER;
+	}
+	if (streq(state, "on") || streq(state, "true")) {
+		window->config->panel_enabled = true;
+	} else if (streq(state, "off") || streq(state, "false")) {
+		window->config->panel_enabled = false;
+	} else {
+		return PARSE_ERROR_INVALID_VALUE;
+	}
+
+	return PARSE_ERROR_NONE;
+}
+
+static enum parser_error config_panel_alpha(struct parser *parser)
+{
+	struct my_app *a = parser_priv(parser);
+	struct sdlpui_window *window = &a->windows[MAIN_WINDOW];
+	int alpha = parser_getint(parser, "alpha");
+
+	if (!window->inited || !window->config) {
+		return PARSE_ERROR_MISSING_RECORD_HEADER;
+	}
+	if (alpha < 0 || alpha > DEFAULT_ALPHA_FULL) {
+		return PARSE_ERROR_OUT_OF_BOUNDS;
+	}
+	window->config->panel_alpha = alpha;
+
+	return PARSE_ERROR_NONE;
+}
+
 static enum parser_error config_menu_shortcut(struct parser *parser)
 {
 	struct my_app *a = parser_priv(parser);
@@ -7921,12 +11945,21 @@ static struct parser *init_parse_config(struct my_app *a)
 			"int w int h", config_subwindow_rect_fs);
 	parser_reg(parser, "subwindow-font uint index int size str name",
 			config_subwindow_font);
+	parser_reg(parser, "subwindow-font-max uint index int size",
+			config_subwindow_font_max);
+	parser_reg(parser, "subwindow-font-min uint index int size",
+			config_subwindow_font_min);
 	parser_reg(parser, "subwindow-borders uint index sym borders",
 			config_subwindow_borders);
 	parser_reg(parser, "subwindow-top uint index sym top sym always",
 			config_subwindow_top);
 	parser_reg(parser, "subwindow-alpha uint index int alpha",
 			config_subwindow_alpha);
+
+	parser_reg(parser, "region sym name sym orient int x int y int w int h",
+			config_region);
+	parser_reg(parser, "panel sym state", config_panel);
+	parser_reg(parser, "panel-alpha int alpha", config_panel_alpha);
 
 	parser_reg(parser, "menu-shortcut uint index str keypress",
 			config_menu_shortcut);
