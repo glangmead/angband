@@ -2311,6 +2311,9 @@ static void show_about(struct sdlpui_window *window, int x, int y)
 		sdlpui_simple_info_add_label(window->infod,
 			"Visit our forum at https://angband.live/forums/",
 			SDLPUI_HOR_CENTER);
+		sdlpui_simple_info_add_label(window->infod,
+			"Includes JuliaMono by cormullion, under the SIL OFL 1.1",
+			SDLPUI_HOR_CENTER);
 		sdlpui_complete_simple_info(window->infod, window);
 		window->infod->pop_callback = hide_about;
 		window->infod->rect.x = x;
