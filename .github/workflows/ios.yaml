@@ -5,6 +5,16 @@ on:
     branches: [ sdl_touch_panel ]
   pull_request:
 
+# One run at a time per ref, so a second push cannot race the first one's
+# upload to the release below.
+concurrency:
+  group: ${{ github.ref }}-${{ github.workflow }}
+  cancel-in-progress: true
+
+# Moving the tag and editing the release both write to the repository.
+permissions:
+  contents: write
+
 jobs:
   build:
     name: iOS
@@ -62,9 +72,46 @@ jobs:
           cd build
           cpack -G ZIP -C RelWithDebInfo
 
+      - name: Check the ipa
+        # An .ipa is a zip whose whole content is Payload/<App>.app.  Catch a
+        # mispackaged archive here rather than when someone tries to install
+        # it, and confirm the font licence rode along as the OFL requires.
+        run: |
+          set -eu
+          unzip -l build/Angband.ipa | grep -q ' Payload/Angband\.app/Info\.plist$'
+          unzip -l build/Angband.ipa | grep -q ' Payload/Angband\.app/lib/fonts/JuliaMono-LICENSE\.txt$'
+
       - name: Upload
         uses: actions/upload-artifact@v4
         with:
           name: Angband.ipa
           path:  build/Angband.ipa
           retention-days: 7
+
+      - name: Attach to the continuous iOS release
+        # Only from the branch itself: a pull request must not move the tag
+        # or overwrite what is published.
+        if: github.ref == 'refs/heads/sdl_touch_panel'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          # One rolling tag, moved to whatever was just built, so the release
+          # always holds the newest .ipa at a stable download URL.
+          git push --force origin '${{ github.sha }}:refs/tags/continuous-ios'
+          # printf keeps the notes clear of the indentation this block needs:
+          # carried into the string, it would render as a code block.
+          notes=$(printf '%s\n' \
+            "Unsigned sideload build of the SDL2 touch panel branch, made on $(date -u '+%Y-%m-%d %H:%M') UTC from ${{ github.sha }}." \
+            "" \
+            "The .ipa is not code signed: install it with something that signs as it installs, such as Sideloadly or AltStore.  This is an automated build of a development branch and may be unstable." \
+            "" \
+            "https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}")
+          if gh release view continuous-ios >/dev/null 2>&1; then
+            gh release edit continuous-ios --title 'Continuous iOS build' \
+              --notes "$notes" --prerelease
+          else
+            gh release create continuous-ios --title 'Continuous iOS build' \
+              --notes "$notes" --prerelease
+          fi
+          gh release upload continuous-ios build/Angband.ipa --clobber
