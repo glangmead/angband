@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.7...3.26 FATAL_ERROR)
+cmake_minimum_required(VERSION 3.13...3.26 FATAL_ERROR)
 project(Angband LANGUAGES C)
 string(TOLOWER ${PROJECT_NAME} OUR_EXECUTABLE_NAME)
 
@@ -427,13 +427,64 @@ add_executable(OurExecutable
         $<$<BOOL:${SUPPORT_STATS_FRONTEND}>:src/main-stats.c>
         $<$<BOOL:${SUPPORT_STATS_FRONTEND}>:src/stats/db.c>
         $<$<BOOL:${SUPPORT_TEST_FRONTEND}>:src/main-test.c>
+        $<$<BOOL:${IOS}>:src/main-uikit-sdl2.c>
         $<$<NOT:$<BOOL:${SUPPORT_WINDOWS_FRONTEND}>>:src/main.c>
 )
+
+if(IOS)
+    set(CMAKE_OSX_ARCHITECTURES "arm64" CACHE STRING "")
+    # ON_IOS marks the code that only the iOS app wants: the touch panel,
+    # and the paths that put the user's files in the Documents directory so
+    # the Files app can reach them.
+    add_compile_definitions(USE_SDL2 GAMEDATA_IN_LIB ON_IOS)
+    set(RESOURCES
+            "os/ios/AppIcon.xcassets"
+            "os/ios/Media.xcassets"
+            "lib"
+    )
+
+    target_sources(OurExecutable PUBLIC ${RESOURCES})
+    set_source_files_properties(${RESOURCES} PROPERTIES MACOSX_PACKAGE_LOCATION "Resources")
+
+    # CMake copies the plist into CMakeFiles/OurExecutable.dir/ when it
+    # configures, and every build uses that copy, so editing the original
+    # does nothing until CMake runs again.  Say the configure is out of date
+    # when the original changes; without this a stale copy goes on shipping,
+    # which is how FAangband kept the landscape-only orientations it had
+    # before the plist allowed portrait.
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+            "${CMAKE_SOURCE_DIR}/os/ios/Info.plist")
+
+    # The bundle is named for the project rather than OUR_EXECUTABLE_NAME:
+    # the latter is lowercased for the Unix executable, and the home screen,
+    # the bundle identifier and the .ipa should keep the game's own casing.
+    set_target_properties(OurExecutable PROPERTIES
+            MACOSX_BUNDLE_INFO_PLIST "${CMAKE_SOURCE_DIR}/os/ios/Info.plist"
+            XCODE_ATTRIBUTE_ASSETCATALOG_COMPILER_APPICON_NAME "AppIcon"
+            XCODE_ATTRIBUTE_PRODUCT_BUNDLE_IDENTIFIER "org.rephial.${PROJECT_NAME}"
+            XCODE_ATTRIBUTE_TARGETED_DEVICE_FAMILY "1,2"
+    )
+
+    set(MACOSX_BUNDLE_BUNDLE_NAME "${PROJECT_NAME}")
+    set(MACOSX_BUNDLE_DISPLAY_NAME "${PROJECT_NAME}")
+    set(MACOSX_BUNDLE_GUI_IDENTIFIER "org.rephial.${PROJECT_NAME}")
+
+    install(TARGETS OurExecutable DESTINATION "Payload")
+    set(CPACK_GENERATOR "ZIP")
+    set(CPACK_INCLUDE_TOPLEVEL_DIRECTORY OFF)
+    set(CPACK_PACKAGE_FILE_NAME "${PROJECT_NAME}")
+    set(CPACK_ARCHIVE_FILE_EXTENSION "ipa")
+endif()
 
 set_target_properties(OurExecutable PROPERTIES
     C_STANDARD 99
     OUTPUT_NAME ${OUR_EXECUTABLE_NAME}
 )
+if(IOS)
+    # Name the bundle for the project, not the lowercased Unix executable,
+    # so it is Angband.app inside Angband.ipa and the home screen agrees.
+    set_target_properties(OurExecutable PROPERTIES OUTPUT_NAME "${PROJECT_NAME}")
+endif()
 target_include_directories(OurExecutable PRIVATE
     ${ANGBAND_CORE_INCLUDE_DIRS}
 )
@@ -783,17 +834,22 @@ if(SC_INSTALL)
         target_compile_definitions(OurExecutable PRIVATE -D DEFAULT_DATA_PATH="${ANGBAND_DATA_PATH}")
     endif()
     # Provide an install rule which copies the self-contained form to another
-    # location.
-    install(TARGETS OurExecutable DESTINATION . PERMISSIONS ${EXECUTABLE_PERMISSIONS})
-    if(SUPPORT_WINDOWS_FRONTEND AND PNG_DLLS)
-        # DATA_PERMISSIONS matches the permissions those files have in the
-        # source tree, but should the installed permissions be
-        # EXECUTABLE_PERMISSIONS?
-        install(FILES ${PNG_DLLS} DESTINATION . PERMISSIONS ${DATA_PERMISSIONS})
-    endif()
-    install(DIRECTORY lib/ DESTINATION lib)
-    if(BUILD_DOC)
-        install(DIRECTORY docs/ DESTINATION docs)
+    # location.  Not on iOS: there the app bundle already carries lib/ as a
+    # resource and is installed into Payload/ above, which is the whole of an
+    # .ipa.  Installing here as well put a second copy of both the bundle and
+    # lib/ beside it, at roughly twice the size.
+    if(NOT IOS)
+        install(TARGETS OurExecutable DESTINATION . PERMISSIONS ${EXECUTABLE_PERMISSIONS})
+        if(SUPPORT_WINDOWS_FRONTEND AND PNG_DLLS)
+            # DATA_PERMISSIONS matches the permissions those files have in the
+            # source tree, but should the installed permissions be
+            # EXECUTABLE_PERMISSIONS?
+            install(FILES ${PNG_DLLS} DESTINATION . PERMISSIONS ${DATA_PERMISSIONS})
+        endif()
+        install(DIRECTORY lib/ DESTINATION lib)
+        if(BUILD_DOC)
+            install(DIRECTORY docs/ DESTINATION docs)
+        endif()
     endif()
 
     # Set up a target to transfer the files in lib/ at build time.
