@@ -3,6 +3,7 @@
 #   ./gregsim.sh            configure (first time), build, install, launch
 #   ./gregsim.sh shot out.png   screenshot the booted simulator
 #   ./gregsim.sh rotate [left|right]   rotate the simulator
+#   ./gregsim.sh idb        start the idb companion so that "idb ui tap" works
 # Works from any of the three repos; the app name comes from CMakeLists.txt.
 set -e
 APP=$(sed -n 's/^PROJECT(\([A-Za-z]*\).*/\1/p' CMakeLists.txt)
@@ -15,6 +16,14 @@ CFG=RelWithDebInfo
 case "$1" in
   shot)
     xcrun simctl io "$SIM" screenshot "${2:-shot.png}"; exit ;;
+  idb)
+    # Xcode 27 dropped the private SimulatorKit.framework that idb's companion
+    # needs; the older Xcode still has it and drives this simulator fine.
+    OLD_XCODE="${OLD_XCODE:-/Applications/Xcode.app}"
+    idb kill >/dev/null 2>&1 || true
+    DEVELOPER_DIR="$OLD_XCODE" nohup idb_companion --udid "$SIM" > /tmp/idb_companion.log 2>&1 &
+    disown; sleep 3
+    idb connect localhost 10882; exit ;;
   rotate)
     # ./gregsim.sh rotate [left|right]; default left. From portrait, left gives landscape;
     # from that landscape, right gives portrait again (upside-down portrait is not allowed).
@@ -26,7 +35,17 @@ case "$1" in
 esac
 
 xcrun simctl bootstatus "$SIM" -b >/dev/null
-if [ ! -d "$BUILD" ]; then
+# After an Xcode update the cached SDK no longer matches xcodebuild and the build
+# fails with "SDK lookup failed"; wipe the cache so the configure below runs again.
+if [ -f "$BUILD/CMakeCache.txt" ]; then
+  SYSROOT=$(sed -n 's/^CMAKE_OSX_SYSROOT:INTERNAL=//p' "$BUILD/CMakeCache.txt")
+  case "$SYSROOT" in
+    "$(xcode-select -p)"/*) ;;
+    *) echo "cached SDK $SYSROOT is not the selected Xcode's; reconfiguring"
+       rm -rf "$BUILD/CMakeCache.txt" "$BUILD/CMakeFiles" ;;
+  esac
+fi
+if [ ! -f "$BUILD/CMakeCache.txt" ]; then
   cmake -B "$BUILD" -G Xcode \
     -D CMAKE_TOOLCHAIN_FILE=src/cmake/toolchain/ios.toolchain.cmake \
     -D ENABLE_BITCODE=0 \

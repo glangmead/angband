@@ -6210,14 +6210,28 @@ static void push_term_keypress(keycode_t code, uint8_t mods)
  * keycode with modifiers or text, when it is pressed.  Between taps the
  * panel holds no focus, so the game owns the redraws.
  *
- * The key stack: the chrome (two rows of five: Esc, up, Enter, Backspace,
- * Shift; left, down, right, Space, Ctrl), the tab strip (Act, Items,
- * Info, Mine, Keys) and the grid of the current tab, seven by four.  Only
- * the Keys tab has content yet: a letters layer, a symbols layer and a
- * numbers layer, switched by the key in the grid's last cell.  Shift and
- * Ctrl are sticky: one tap applies to the next key, a quick second tap
- * locks, a tap when locked (or a slow second tap) clears.  Keys with
- * repeat set, and the rose, re-fire while held.
+ * The key stack is one frame of PANEL_COLS by PANEL_ROWS cells, the same
+ * on every tab:
+ *
+ *   Act  Items Info  Mine  Keys  .  .  .  .  .  .   ^   v
+ *   .    .     .     .     .     .  .  .  .  .  .   <   >
+ *   .    .     .     .     .     .  .  .  .  .  .   BS  Ctrl
+ *   .    .     .     .     .     .  .  .  .  .  .   Sh  Space
+ *   .    .     .     .     .     .  .  .  .  .  .   Esc Enter
+ *
+ * The chrome is the two right-hand columns, beside the right thumb, with
+ * the most pressed keys (Escape and Enter) in the bottom corner and the
+ * least (the arrows, which the rose supersedes except in text prompts and
+ * the recall viewers) at the top.  The tab strip is the top left.  The
+ * rest -- the strip of cells beside the tabs and the block under them --
+ * is the current tab's: a slot tab lays its PANEL_GRID_COLS by
+ * PANEL_GRID_ROWS grid of word-faced keys over the block, in cells wide
+ * enough for a word, and leaves the strip for the fast keys
+ * (CORE_HOOKS_PLAN.md); the Keys tab fills strip and block with a
+ * keyboard's characters.  Shift and Ctrl are sticky: one tap applies to
+ * the next key, a quick second tap locks, a tap when locked (or a slow
+ * second tap) clears.  Keys with repeat set, and the rose, re-fire while
+ * held.
  *
  * Placement: the "panel" region is the home area, drawn dimmed and taking
  * no taps for the terms under it.  By default the rose sits at its bottom
@@ -6233,16 +6247,24 @@ static void push_term_keypress(keycode_t code, uint8_t mods)
 #define PANEL_MAX_KEY_POINTS 64
 /* space between keys, in points */
 #define PANEL_GAP_POINTS 4
-#define PANEL_CHROME_COLS 5
-#define PANEL_CHROME_ROWS 2
+/* the key stack's frame; see the comment above */
+#define PANEL_COLS 13
+#define PANEL_ROWS 5
+#define PANEL_CHROME_COLS 2
+#define PANEL_CHROME_KEYS (PANEL_CHROME_COLS * PANEL_ROWS)
 #define PANEL_TABS 5
 #define PANEL_TAB_KEYS 4
+/* the current tab's area: the strip beside the tabs, the block below */
+#define PANEL_BLOCK_COLS (PANEL_COLS - PANEL_CHROME_COLS)
+#define PANEL_BLOCK_ROWS (PANEL_ROWS - 1)
+#define PANEL_STRIP_COLS (PANEL_BLOCK_COLS - PANEL_TABS)
+#define PANEL_KEYS_CELLS (PANEL_STRIP_COLS + PANEL_BLOCK_COLS * PANEL_BLOCK_ROWS)
+/* a slot tab's grid, laid over the block */
 #define PANEL_GRID_COLS 7
-#define PANEL_GRID_ROWS 4
+#define PANEL_GRID_ROWS PANEL_BLOCK_ROWS
 #define PANEL_GRID_CELLS (PANEL_GRID_COLS * PANEL_GRID_ROWS)
-#define PANEL_LAYERS 3
-#define PANEL_MAX_KEYS (PANEL_CHROME_COLS * PANEL_CHROME_ROWS + PANEL_TABS \
-	+ (PANEL_TAB_KEYS + PANEL_LAYERS) * PANEL_GRID_CELLS)
+#define PANEL_MAX_KEYS (PANEL_CHROME_KEYS + PANEL_TABS \
+	+ PANEL_TAB_KEYS * PANEL_GRID_CELLS + PANEL_KEYS_CELLS)
 /* a second tap on a modifier within this many ms locks it */
 #define PANEL_DOUBLE_TAP_MS 400
 /* a held key re-fires after this delay, then at this interval (ms) */
@@ -6282,27 +6304,21 @@ static void push_term_keypress(keycode_t code, uint8_t mods)
 #define PANEL_ROSE_ARC_POINTS 15
 #define PANEL_ROSE_POINTS \
 	(1 + 2 * PANEL_ROSE_SIDE_POINTS + PANEL_ROSE_ARC_POINTS)
-/* the key stack's wide form: the chrome beside the tabs and grid */
-#define PANEL_WIDE_COLS (PANEL_CHROME_COLS + PANEL_GRID_COLS)
-#define PANEL_WIDE_ROWS (1 + PANEL_GRID_ROWS)
-
 enum panel_key_kind {
 	PANEL_KEY_SEND,		/* sends a key or text */
 	PANEL_KEY_MODIFIER,	/* sticky Shift or Ctrl; value is the modifier */
-	PANEL_KEY_TAB,		/* selects a tab; value is the tab */
-	PANEL_KEY_LAYER		/* selects a Keys layer; value is the layer */
+	PANEL_KEY_TAB		/* selects a tab; value is the tab */
 };
 
 /*
  * Where a key lives: the chrome, the tab strip, a slot tab's grid
- * (PANEL_GROUP_TAB0 + the tab) or a Keys layer (PANEL_GROUP_LAYER0 + the
- * layer).
+ * (PANEL_GROUP_TAB0 + the tab) or the Keys tab.
  */
 enum panel_group {
 	PANEL_GROUP_CHROME,
 	PANEL_GROUP_TABS,
 	PANEL_GROUP_TAB0,
-	PANEL_GROUP_LAYER0 = PANEL_GROUP_TAB0 + PANEL_TAB_KEYS
+	PANEL_GROUP_KEYS = PANEL_GROUP_TAB0 + PANEL_TAB_KEYS
 };
 
 enum panel_modifier {
@@ -6355,6 +6371,8 @@ struct panel_key {
 	/* what a send key sends: sym, or text if sym is SDLK_UNKNOWN */
 	SDL_Keycode sym;
 	char text[8];
+	/* what a text key sends, and shows, while Shift is active; or empty */
+	char shift_text[8];
 	/*
 	 * What a slot from panel.txt sends: the command whose key is looked
 	 * up for the active keyset when the slot is pressed, or a keymap
@@ -6362,6 +6380,11 @@ struct panel_key {
 	 */
 	const struct cmd_info *cmd;
 	struct keypress *act;
+	/*
+	 * A slot's word (its face from panel.txt or the face table), shown
+	 * beneath what the slot sends; NULL for every other key.
+	 */
+	char *word;
 	/* re-fires while held */
 	bool repeat;
 	bool armed;
@@ -6390,7 +6413,6 @@ struct panel_shared {
 	/* the pieces' dialogs; NULL where a piece has no place */
 	struct sdlpui_dialog *pieces[PANEL_PIECE_COUNT];
 	int cur_tab;
-	int cur_layer;
 	/* the slot tabs' grids, from panel.txt; see load_panel_slots() */
 	struct panel_slot slots[PANEL_TAB_KEYS][PANEL_GRID_CELLS];
 	enum panel_mod_state mod_state[PANEL_MOD_COUNT];
@@ -6431,7 +6453,7 @@ static void panel_redraw(struct panel_shared *ps, struct sdlpui_window *w)
 	sdlpui_signal_redraw(w);
 }
 
-/* Is the key shown for the panel's current tab and layer? */
+/* Is the key shown for the panel's current tab? */
 static bool panel_key_visible(const struct panel_shared *ps,
 		const struct panel_key *pk)
 {
@@ -6441,7 +6463,7 @@ static bool panel_key_visible(const struct panel_shared *ps,
 	if (ps->cur_tab < PANEL_TAB_KEYS) {
 		return pk->group == PANEL_GROUP_TAB0 + ps->cur_tab;
 	}
-	return pk->group == PANEL_GROUP_LAYER0 + ps->cur_layer;
+	return pk->group == PANEL_GROUP_KEYS;
 }
 
 /* A single ASCII letter, which Shift and Ctrl act on */
@@ -6495,6 +6517,97 @@ static void panel_release(struct sdlpui_dialog *d, struct sdlpui_control *c)
 	}
 }
 
+/*
+ * The key a command slot sends now: looked up at the press, and at each
+ * redraw, for the keyset in force, so that turning the roguelike option
+ * on or off never means editing or re-seeding panel.txt.
+ */
+static keycode_t panel_command_key(const struct cmd_info *cmd)
+{
+	int mode = (player && OPT(player, rogue_like_commands)) ?
+		KEYMAP_MODE_ROGUE : KEYMAP_MODE_ORIG;
+	keycode_t key = cmd->key[mode];
+
+	/* Before cmd_init() the roguelike keys are still unfilled. */
+	if (!key) {
+		key = cmd->key[0];
+	}
+	return key;
+}
+
+/*
+ * Append one keypress to a face the way a keycap would show it: ^X for
+ * a control character, a glyph for the named keys the panel's font has,
+ * [Name] for the other named keys, and the character itself otherwise.
+ * Follows keypress_to_text() but without that function's escapes, which
+ * are for a file, not a face.
+ */
+static void cat_keypress_face(char *buf, size_t len, struct keypress k)
+{
+	static const struct { keycode_t code; const char *glyph; } glyphs[] = {
+		{ ESCAPE, "⎋" }, { KC_ENTER, "⏎" }, { KC_TAB, "⇥" },
+		{ KC_BACKSPACE, "⌫" }, { ARROW_UP, "↑" }, { ARROW_DOWN, "↓" },
+		{ ARROW_LEFT, "←" }, { ARROW_RIGHT, "→" }, { ' ', "␣" }
+	};
+	keycode_t code = k.code;
+	int mods = k.mods;
+	const char *desc = keycode_find_desc(code);
+	char tmp[32];
+	size_t i;
+
+	if (code < 0x20 && !desc) {
+		mods |= KC_MOD_CONTROL;
+		code = UN_KTRL(code);
+	}
+	if (mods & KC_MOD_CONTROL && !(mods & ~KC_MOD_CONTROL)) {
+		my_strcat(buf, "^", len);
+	} else if (mods) {
+		my_strcat(buf, "{", len);
+		if (mods & KC_MOD_CONTROL) my_strcat(buf, "^", len);
+		if (mods & KC_MOD_SHIFT) my_strcat(buf, "S", len);
+		if (mods & KC_MOD_ALT) my_strcat(buf, "A", len);
+		if (mods & KC_MOD_META) my_strcat(buf, "M", len);
+		if (mods & KC_MOD_KEYPAD) my_strcat(buf, "K", len);
+		my_strcat(buf, "}", len);
+	}
+	for (i = 0; i < N_ELEMENTS(glyphs); i++) {
+		if (glyphs[i].code == code) {
+			my_strcat(buf, glyphs[i].glyph, len);
+			return;
+		}
+	}
+	if (desc) {
+		strnfmt(tmp, sizeof(tmp), "[%s]", desc);
+	} else if (code < 127) {
+		strnfmt(tmp, sizeof(tmp), "%c", (int) code);
+	} else {
+		my_strcpy(tmp, "?", sizeof(tmp));
+	}
+	my_strcat(buf, tmp, len);
+}
+
+/* What a slot sends, as a face: the command's key now, or the action. */
+static void get_panel_key_keys(const struct panel_key *pk, char *buf,
+		size_t len)
+{
+	buf[0] = '\0';
+	if (pk->cmd) {
+		keycode_t key = panel_command_key(pk->cmd);
+
+		if (key) {
+			struct keypress k = { EVT_KBRD, key, 0 };
+
+			cat_keypress_face(buf, len, k);
+		}
+	} else if (pk->act) {
+		const struct keypress *k;
+
+		for (k = pk->act; k->type == EVT_KBRD; k++) {
+			cat_keypress_face(buf, len, *k);
+		}
+	}
+}
+
 static void fire_panel_key(struct sdlpui_control *c, struct sdlpui_dialog *d,
 		struct sdlpui_window *w)
 {
@@ -6544,31 +6657,15 @@ static void fire_panel_key(struct sdlpui_control *c, struct sdlpui_dialog *d,
 			panel_redraw(ps, w);
 			return;
 
-		case PANEL_KEY_LAYER:
-			ps->cur_layer = pk->value;
-			panel_redraw(ps, w);
-			return;
-
 		case PANEL_KEY_SEND:
 			break;
 	}
 
 	panel_active_mods(ps, &shift, &ctrl);
 	if (pk->cmd) {
-		/*
-		 * A slot names a command, not a key.  Its key is looked up
-		 * here, at the press, for the keyset in force now, so that
-		 * turning the roguelike option on or off never means editing
-		 * or re-seeding panel.txt.
-		 */
-		int mode = (player && OPT(player, rogue_like_commands)) ?
-			KEYMAP_MODE_ROGUE : KEYMAP_MODE_ORIG;
-		keycode_t key = pk->cmd->key[mode];
+		/* A slot names a command, not a key; see panel_command_key(). */
+		keycode_t key = panel_command_key(pk->cmd);
 
-		/* Before cmd_init() the roguelike keys are still unfilled. */
-		if (!key) {
-			key = pk->cmd->key[0];
-		}
 		if (key) {
 			push_term_keypress(key, 0);
 		}
@@ -6602,11 +6699,9 @@ static void fire_panel_key(struct sdlpui_control *c, struct sdlpui_dialog *d,
 			+ (tolower((unsigned char) pk->text[0]) - 'a');
 
 		push_key_event(w, sym, KMOD_LCTRL | (shift ? KMOD_LSHIFT : 0));
-	} else if (panel_key_is_letter(pk) && shift) {
-		char text[2] = { (char) toupper((unsigned char) pk->text[0]),
-			'\0' };
-
-		push_text_event(w, text);
+	} else if (pk->shift_text[0] && shift) {
+		/* A keyboard's Shift: the capital, or the upper symbol. */
+		push_text_event(w, pk->shift_text);
 	} else if (pk->text[0]) {
 		push_text_event(w, pk->text);
 	}
@@ -6684,7 +6779,6 @@ static void render_panel_key(struct sdlpui_control *c,
 	struct panel_key *pk;
 	struct panel_shared *ps;
 	const char *caption;
-	char shifted[2];
 	SDL_Rect dst_r, cap_r;
 
 	SDL_assert(c->type_code == PANEL_KEY_CODE && c->priv);
@@ -6722,21 +6816,55 @@ static void render_panel_key(struct sdlpui_control *c,
 	SDL_SetRenderDrawColor(r, border->r, border->g, border->b, border->a);
 	SDL_RenderDrawRect(r, &dst_r);
 
-	/* Letters show their case while Shift is active. */
-	caption = pk->caption;
-	cap_r = pk->caption_rect;
-	if (panel_key_is_letter(pk)
-			&& ps->mod_state[PANEL_MOD_SHIFT] != PANEL_MOD_OFF) {
-		shifted[0] = (char) toupper((unsigned char) pk->text[0]);
-		shifted[1] = '\0';
-		caption = shifted;
-		place_caption(c, w, caption, &cap_r);
-	}
-	if (cap_r.w > 0 && cap_r.h > 0) {
-		cap_r.x += dst_r.x;
-		cap_r.y += dst_r.y;
-		sdlpui_render_utf8_line(r, sdlpui_get_ttf(w), fg, &cap_r,
-			caption);
+	if (pk->word) {
+		/*
+		 * A slot is two lines: what it sends, as keycaps, in the text
+		 * colour, and its word beneath in a lighter grey.  Too short
+		 * a cell for both shows the word alone.
+		 */
+		const SDL_Color *dim = &w->app->colors[COLOUR_L_WHITE];
+		char keys[32];
+		int kw = 0, kh = 0, ww = 0, wh = 0;
+		SDL_Rect line;
+
+		get_panel_key_keys(pk, keys, sizeof(keys));
+		if (keys[0]) {
+			sdlpui_get_utf8_metrics(sdlpui_get_ttf(w), keys, &kw, &kh);
+		}
+		sdlpui_get_utf8_metrics(sdlpui_get_ttf(w), pk->word, &ww, &wh);
+		if (kh + wh > c->rect.h) {
+			kw = 0;
+			kh = 0;
+		}
+		line.y = dst_r.y + (c->rect.h - kh - wh) / 2;
+		if (kh > 0) {
+			line.w = MIN(kw, c->rect.w);
+			line.h = kh;
+			line.x = dst_r.x + (c->rect.w - line.w) / 2;
+			sdlpui_render_utf8_line(r, sdlpui_get_ttf(w), fg, &line,
+				keys);
+			line.y += kh;
+		}
+		line.w = MIN(ww, c->rect.w);
+		line.h = wh;
+		line.x = dst_r.x + (c->rect.w - line.w) / 2;
+		sdlpui_render_utf8_line(r, sdlpui_get_ttf(w), dim, &line,
+			pk->word);
+	} else {
+		/* A key shows what Shift makes of it while Shift is active. */
+		caption = pk->caption;
+		cap_r = pk->caption_rect;
+		if (pk->shift_text[0]
+				&& ps->mod_state[PANEL_MOD_SHIFT] != PANEL_MOD_OFF) {
+			caption = pk->shift_text;
+			place_caption(c, w, caption, &cap_r);
+		}
+		if (cap_r.w > 0 && cap_r.h > 0) {
+			cap_r.x += dst_r.x;
+			cap_r.y += dst_r.y;
+			sdlpui_render_utf8_line(r, sdlpui_get_ttf(w), fg, &cap_r,
+				caption);
+		}
 	}
 
 	if (pk->disabled) {
@@ -6883,6 +7011,9 @@ static void cleanup_panel_key(struct sdlpui_control *c)
 	SDL_assert(c->type_code == PANEL_KEY_CODE && c->priv);
 	pk = c->priv;
 	string_free(pk->caption);
+	if (pk->word) {
+		string_free(pk->word);
+	}
 	mem_free(pk->act);
 	SDL_free(pk);
 	c->priv = NULL;
@@ -6959,17 +7090,25 @@ static void add_panel_text(struct panel_piece *pp, int group, int cell,
 		SDLK_UNKNOWN, text, 0, false);
 }
 
-/* Fill a layer's cells from a string of single-character text keys. */
-static int add_panel_chars(struct panel_piece *pp, int layer, int cell,
-		const char *chars)
+/*
+ * Fill the Keys tab's cells from parallel strings of what each key sends
+ * plain and with Shift, as a keyboard's rows go: "1" and "!", "a" and "A".
+ */
+static int add_panel_chars(struct panel_piece *pp, int cell,
+		const char *chars, const char *shifted)
 {
-	const char *p;
+	const char *p, *s;
 
-	for (p = chars; *p; p++) {
+	for (p = chars, s = shifted; *p; p++, s++) {
 		char text[2] = { *p, '\0' };
+		struct sdlpui_control *c = add_panel_key(pp, PANEL_KEY_SEND,
+			PANEL_GROUP_KEYS, cell++, text, SDLK_UNKNOWN, text, 0,
+			false);
+		struct panel_key *pk = c->priv;
 
-		add_panel_text(pp, PANEL_GROUP_LAYER0 + layer, cell++, text,
-			NULL);
+		SDL_assert(*s);
+		pk->shift_text[0] = *s;
+		pk->shift_text[1] = '\0';
 	}
 	return cell;
 }
@@ -7451,7 +7590,7 @@ static const struct {
 	/* Information and Utility */
 	{ "Browse a book",			"Browse" },
 	{ "Gain new spells",			"Study" },
-	{ "View abilities",			"Abilities" },
+	{ "View abilities",			"Ability" },
 	{ "Cast a spell",			"Cast" },
 	{ "Full dungeon map",			"Map" },
 	{ "Toggle ignoring of items",		"Ignoring" },
@@ -7539,8 +7678,9 @@ static void add_panel_slot(struct panel_piece *pp, int tab, int cell,
 	switch (slot->kind) {
 		case PANEL_SLOT_COMMAND:
 			c = add_panel_key(pp, PANEL_KEY_SEND, group, cell,
-				face, SDLK_UNKNOWN, NULL, 0, false);
+				"", SDLK_UNKNOWN, NULL, 0, false);
 			pk = c->priv;
+			pk->word = string_make(face);
 			pk->cmd = find_panel_command(slot->desc);
 			if (!pk->cmd) {
 				/*
@@ -7562,8 +7702,9 @@ static void add_panel_slot(struct panel_piece *pp, int tab, int cell,
 				n++;
 			}
 			c = add_panel_key(pp, PANEL_KEY_SEND, group, cell,
-				face, SDLK_UNKNOWN, NULL, 0, false);
+				"", SDLK_UNKNOWN, NULL, 0, false);
 			pk = c->priv;
+			pk->word = string_make(face);
 			pk->act = mem_alloc((n + 1) * sizeof(*pk->act));
 			memcpy(pk->act, slot->act, (n + 1) * sizeof(*pk->act));
 			break;
@@ -7578,19 +7719,22 @@ static void create_panel_keys(struct panel_piece *pp)
 {
 	int i, cell;
 
-	/* Chrome, two rows of five */
-	add_panel_sym(pp, PANEL_GROUP_CHROME, 0, "Esc", SDLK_ESCAPE, false);
-	add_panel_sym(pp, PANEL_GROUP_CHROME, 1, "↑", SDLK_UP, true);
-	add_panel_sym(pp, PANEL_GROUP_CHROME, 2, "Enter", SDLK_RETURN, false);
-	add_panel_sym(pp, PANEL_GROUP_CHROME, 3, "⌫", SDLK_BACKSPACE, true);
-	add_panel_key(pp, PANEL_KEY_MODIFIER, PANEL_GROUP_CHROME, 4, "Shift",
-		SDLK_UNKNOWN, NULL, PANEL_MOD_SHIFT, false);
-	add_panel_sym(pp, PANEL_GROUP_CHROME, 5, "←", SDLK_LEFT, true);
-	add_panel_sym(pp, PANEL_GROUP_CHROME, 6, "↓", SDLK_DOWN, true);
-	add_panel_sym(pp, PANEL_GROUP_CHROME, 7, "→", SDLK_RIGHT, true);
-	add_panel_text(pp, PANEL_GROUP_CHROME, 8, " ", "Space");
-	add_panel_key(pp, PANEL_KEY_MODIFIER, PANEL_GROUP_CHROME, 9, "Ctrl",
+	/*
+	 * Chrome: two columns at the right edge, cell 2 * row + column, the
+	 * most pressed keys in the bottom corner where the thumb rests.
+	 */
+	add_panel_sym(pp, PANEL_GROUP_CHROME, 0, "↑", SDLK_UP, true);
+	add_panel_sym(pp, PANEL_GROUP_CHROME, 1, "↓", SDLK_DOWN, true);
+	add_panel_sym(pp, PANEL_GROUP_CHROME, 2, "←", SDLK_LEFT, true);
+	add_panel_sym(pp, PANEL_GROUP_CHROME, 3, "→", SDLK_RIGHT, true);
+	add_panel_sym(pp, PANEL_GROUP_CHROME, 4, "⌫", SDLK_BACKSPACE, true);
+	add_panel_key(pp, PANEL_KEY_MODIFIER, PANEL_GROUP_CHROME, 5, "Ctrl",
 		SDLK_UNKNOWN, NULL, PANEL_MOD_CTRL, false);
+	add_panel_key(pp, PANEL_KEY_MODIFIER, PANEL_GROUP_CHROME, 6, "Shift",
+		SDLK_UNKNOWN, NULL, PANEL_MOD_SHIFT, false);
+	add_panel_text(pp, PANEL_GROUP_CHROME, 7, " ", "Space");
+	add_panel_sym(pp, PANEL_GROUP_CHROME, 8, "Esc", SDLK_ESCAPE, false);
+	add_panel_sym(pp, PANEL_GROUP_CHROME, 9, "Enter", SDLK_RETURN, false);
 
 	/* Tab strip */
 	for (i = 0; i < PANEL_TABS; i++) {
@@ -7607,31 +7751,24 @@ static void create_panel_keys(struct panel_piece *pp)
 		}
 	}
 
-	/* Keys tab, letters layer: a to z, Tab, then the layer key */
-	cell = add_panel_chars(pp, 0, 0, "abcdefghijklmnopqrstuvwxyz");
-	add_panel_sym(pp, PANEL_GROUP_LAYER0, cell++, "⇥", SDLK_TAB, false);
-	add_panel_key(pp, PANEL_KEY_LAYER, PANEL_GROUP_LAYER0,
-		PANEL_GRID_CELLS - 1, "#+=", SDLK_UNKNOWN, NULL, 1, false);
-
-	/* Symbols layer: the command symbols, then the layer key */
-	cell = add_panel_chars(pp, 1, 0, "!@#$%^&*()-=[];',./\\`~_+{}:");
-	add_panel_key(pp, PANEL_KEY_LAYER, PANEL_GROUP_LAYER0 + 1,
-		PANEL_GRID_CELLS - 1, "123", SDLK_UNKNOWN, NULL, 2, false);
-
-	/* Numbers layer: digits, the remaining symbols, editing keys */
-	cell = add_panel_chars(pp, 2, 0, "1234567890\"<>?|");
-	add_panel_sym(pp, PANEL_GROUP_LAYER0 + 2, cell++, "Del", SDLK_DELETE,
+	/*
+	 * Keys tab: a keyboard's keys, alphabetical, with Shift giving what
+	 * a keyboard's Shift gives, so every character is one or two taps
+	 * and there are no layers.  The strip beside the tabs takes the
+	 * least used; the block under them the letters, the remaining
+	 * symbols, and the digits, Tab at the end of the digits' row.
+	 */
+	cell = add_panel_chars(pp, 0, "`\\[]", "~|{}");
+	add_panel_sym(pp, PANEL_GROUP_KEYS, cell++, "PgUp", SDLK_PAGEUP, true);
+	add_panel_sym(pp, PANEL_GROUP_KEYS, cell++, "PgDn", SDLK_PAGEDOWN,
 		true);
-	add_panel_sym(pp, PANEL_GROUP_LAYER0 + 2, cell++, "Home", SDLK_HOME,
-		false);
-	add_panel_sym(pp, PANEL_GROUP_LAYER0 + 2, cell++, "End", SDLK_END,
-		false);
-	add_panel_sym(pp, PANEL_GROUP_LAYER0 + 2, cell++, "PgUp", SDLK_PAGEUP,
-		true);
-	add_panel_sym(pp, PANEL_GROUP_LAYER0 + 2, cell++, "PgDn",
-		SDLK_PAGEDOWN, true);
-	add_panel_key(pp, PANEL_KEY_LAYER, PANEL_GROUP_LAYER0 + 2,
-		PANEL_GRID_CELLS - 1, "abc", SDLK_UNKNOWN, NULL, 0, false);
+	SDL_assert(cell == PANEL_STRIP_COLS);
+	cell = add_panel_chars(pp, cell, "abcdefghijklmnopqrstuvwxyz",
+		"ABCDEFGHIJKLMNOPQRSTUVWXYZ");
+	cell = add_panel_chars(pp, cell, "-=;',./", "_+:\"<>?");
+	cell = add_panel_chars(pp, cell, "1234567890", "!@#$%^&*()");
+	add_panel_sym(pp, PANEL_GROUP_KEYS, cell++, "⇥", SDLK_TAB, false);
+	SDL_assert(cell == PANEL_KEYS_CELLS);
 }
 
 /* --- the compass rose --- */
@@ -8415,8 +8552,6 @@ static void recreate_panel_textures(struct sdlpui_dialog *d,
 /* Sizes the layout of both pieces uses, in pixels */
 struct panel_metrics {
 	int min_touch, max_cell, gap, lift;
-	/* rows in the key stack */
-	int rows;
 };
 
 static void get_panel_metrics(const struct sdlpui_window *w,
@@ -8426,59 +8561,36 @@ static void get_panel_metrics(const struct sdlpui_window *w,
 	m->max_cell = (int)(PANEL_MAX_KEY_POINTS * w->ui_scale + 0.5f);
 	m->gap = (int)(PANEL_GAP_POINTS * w->ui_scale + 0.5f);
 	m->lift = (int)(PANEL_ROSE_LIFT_POINTS * w->ui_scale + 0.5f);
-	m->rows = PANEL_CHROME_ROWS + 1 + PANEL_GRID_ROWS;
 }
 
 /*
- * The key stack's cell sizes in a piece of the given size (cell sizes
- * include one gap).  Cells are no wider than PANEL_MAX_KEY_POINTS however
- * wide the piece is; rows are one touch target high unless the piece is
- * too short for that, when they shrink rather than being lost.
+ * The key stack's cell pitch (a cell and one gap) in a piece of the given
+ * size.  The stack is PANEL_COLS cells wide with an extra gap before the
+ * chrome, so its width is PANEL_COLS * cell_w + 2 * gap; its height is
+ * PANEL_ROWS * cell_h + gap.  Cells are no wider than PANEL_MAX_KEY_POINTS
+ * however wide the piece is, and one touch target across unless the piece
+ * is too small for that, when they shrink rather than being lost.
  */
 static void get_keys_cell_sizes(const struct panel_metrics *m, int width,
-		int height, int *chrome_w, int *tab_w, int *grid_w, int *cell_h)
-{
-	*cell_h = m->min_touch + m->gap;
-	if (m->rows * *cell_h + m->gap > height && height > 0) {
-		*cell_h = MAX((height - m->gap) / m->rows, 2 * m->gap);
-	}
-	*chrome_w = MIN((width - m->gap) / PANEL_CHROME_COLS, m->max_cell);
-	*tab_w = MIN((width - m->gap) / PANEL_TABS, m->max_cell);
-	*grid_w = MIN((width - m->gap) / PANEL_GRID_COLS, m->max_cell);
-}
-
-/*
- * Does a piece of this size take the key stack's wide form, the chrome
- * beside the tabs and grid (five rows), rather than the stack (seven)?
- * It does when it is wide enough for that and too short for the stack.
- */
-static bool keys_piece_is_wide(const struct panel_metrics *m, int width,
-		int height)
-{
-	int cell = m->min_touch + m->gap;
-
-	return width >= PANEL_WIDE_COLS * cell + 3 * m->gap
-		&& height < m->rows * cell + m->gap;
-}
-
-/* The wide form's cell sizes: one width for every key, rows that shrink. */
-static void get_wide_cell_sizes(const struct panel_metrics *m, int width,
 		int height, int *cell_w, int *cell_h)
 {
-	*cell_w = MAX(MIN((width - 3 * m->gap) / PANEL_WIDE_COLS, m->max_cell),
-		2 * m->gap);
+	*cell_w = m->min_touch + m->gap;
+	if (width > 0) {
+		*cell_w = MAX(MIN((width - 2 * m->gap) / PANEL_COLS,
+			m->max_cell), 2 * m->gap);
+	}
 	*cell_h = m->min_touch + m->gap;
-	if (PANEL_WIDE_ROWS * *cell_h + m->gap > height && height > 0) {
-		*cell_h = MAX((height - m->gap) / PANEL_WIDE_ROWS, 2 * m->gap);
+	if (PANEL_ROWS * *cell_h + m->gap > height && height > 0) {
+		*cell_h = MAX((height - m->gap) / PANEL_ROWS, 2 * m->gap);
 	}
 }
 
 /*
  * The pieces' default places in the panel's home area, in window
  * coordinates.  In a band (a strip along the bottom): the rose at the
- * left and the key stack in its wide form at the right, both centred
- * vertically.  In a column: the rose at the bottom left, its bottom edge
- * lifted, and the stack above it.
+ * left and the key stack at the right, both centred vertically.  In a
+ * column: the rose at the bottom left, its bottom edge lifted, and the
+ * stack above it.
  */
 static void get_panel_default_rects(const struct sdlpui_window *w,
 		SDL_Rect *rects)
@@ -8497,15 +8609,14 @@ static void get_panel_default_rects(const struct sdlpui_window *w,
 		rose->y = p->y + MAX(0, (p->h - rose_side) / 2);
 		rose->w = rose_side;
 		rose->h = rose_side;
-		get_wide_cell_sizes(&m, p->w - rose_side - 3 * m.gap, p->h,
+		get_keys_cell_sizes(&m, p->w - rose_side - 3 * m.gap, p->h,
 			&cell_w, &cell_h);
-		keys->w = PANEL_WIDE_COLS * cell_w + 3 * m.gap;
-		keys->h = PANEL_WIDE_ROWS * cell_h + m.gap;
+		keys->w = PANEL_COLS * cell_w + 2 * m.gap;
+		keys->h = PANEL_ROWS * cell_h + m.gap;
 		keys->x = p->x + p->w - m.gap - keys->w;
 		keys->y = p->y + MAX(0, (p->h - keys->h) / 2);
 	} else {
-		int stack_h = m.rows * (m.min_touch + m.gap) + m.gap;
-		int chrome_w, tab_w, grid_w;
+		int stack_h = PANEL_ROWS * (m.min_touch + m.gap) + m.gap;
 
 		rose_side = MIN(p->w, p->h - m.lift - stack_h - m.gap);
 		rose_side = MIN(rose_side, rose_max);
@@ -8517,59 +8628,62 @@ static void get_panel_default_rects(const struct sdlpui_window *w,
 		rose->w = rose_side;
 		rose->h = rose_side;
 		get_keys_cell_sizes(&m, p->w, rose->y - p->y - m.gap,
-			&chrome_w, &tab_w, &grid_w, &cell_h);
+			&cell_w, &cell_h);
 		keys->x = p->x;
 		keys->y = p->y;
-		keys->w = m.gap + MAX(PANEL_CHROME_COLS * chrome_w,
-			MAX(PANEL_TABS * tab_w, PANEL_GRID_COLS * grid_w));
-		keys->h = m.rows * cell_h + m.gap;
+		keys->w = PANEL_COLS * cell_w + 2 * m.gap;
+		keys->h = PANEL_ROWS * cell_h + m.gap;
 	}
 }
 
-/* Lay the key stack out in its piece: rows of cells, one gap in. */
+/*
+ * Lay the key stack out in its piece, one gap in: the frame in the
+ * comment at the top of the panel code.  A slot tab's grid divides the
+ * block's width into PANEL_GRID_COLS cells of its own, wider than the
+ * frame's, so that a word fits on each.
+ */
 static void layout_keys_piece(struct sdlpui_dialog *d, struct sdlpui_window *w)
 {
 	struct panel_piece *pp = d->priv;
 	struct panel_metrics m;
-	bool wide;
-	int chrome_w, tab_w, grid_w, cell_h, right = 0, i;
+	int cell_w, cell_h, block_w, i;
 
 	get_panel_metrics(w, &m);
-	wide = keys_piece_is_wide(&m, d->rect.w, d->rect.h);
-	if (wide) {
-		get_wide_cell_sizes(&m, d->rect.w, d->rect.h, &chrome_w, &cell_h);
-		tab_w = chrome_w;
-		grid_w = chrome_w;
-		/* The tabs and grid start to the right of the chrome block. */
-		right = m.gap + PANEL_CHROME_COLS * chrome_w;
-	} else {
-		get_keys_cell_sizes(&m, d->rect.w, d->rect.h, &chrome_w, &tab_w,
-			&grid_w, &cell_h);
-	}
+	get_keys_cell_sizes(&m, d->rect.w, d->rect.h, &cell_w, &cell_h);
+	block_w = PANEL_BLOCK_COLS * cell_w;
 	for (i = 0; i < pp->nkeys; i++) {
 		struct sdlpui_control *c = &pp->keys[i];
 		struct panel_key *pk = c->priv;
-		int col, row, cell_w, x0 = 0;
+		int x, y, cw = cell_w;
 
 		if (pk->group == PANEL_GROUP_CHROME) {
-			col = pk->cell % PANEL_CHROME_COLS;
-			row = pk->cell / PANEL_CHROME_COLS;
-			cell_w = chrome_w;
+			/* Right of the block, set off by a second gap. */
+			x = block_w + m.gap
+				+ (pk->cell % PANEL_CHROME_COLS) * cell_w;
+			y = (pk->cell / PANEL_CHROME_COLS) * cell_h;
 		} else if (pk->group == PANEL_GROUP_TABS) {
-			col = pk->cell;
-			row = (wide) ? 0 : PANEL_CHROME_ROWS;
-			cell_w = tab_w;
-			x0 = right;
+			x = pk->cell * cell_w;
+			y = 0;
+		} else if (pk->group == PANEL_GROUP_KEYS) {
+			if (pk->cell < PANEL_STRIP_COLS) {
+				x = (PANEL_TABS + pk->cell) * cell_w;
+				y = 0;
+			} else {
+				int n = pk->cell - PANEL_STRIP_COLS;
+
+				x = (n % PANEL_BLOCK_COLS) * cell_w;
+				y = (1 + n / PANEL_BLOCK_COLS) * cell_h;
+			}
 		} else {
-			col = pk->cell % PANEL_GRID_COLS;
-			row = ((wide) ? 1 : PANEL_CHROME_ROWS + 1)
-				+ pk->cell / PANEL_GRID_COLS;
-			cell_w = grid_w;
-			x0 = right;
+			int col = pk->cell % PANEL_GRID_COLS;
+
+			x = (col * block_w) / PANEL_GRID_COLS;
+			cw = ((col + 1) * block_w) / PANEL_GRID_COLS - x;
+			y = (1 + pk->cell / PANEL_GRID_COLS) * cell_h;
 		}
-		c->rect.x = x0 + m.gap + col * cell_w;
-		c->rect.y = m.gap + row * cell_h;
-		(*c->ftb->resize)(c, d, w, cell_w - m.gap, cell_h - m.gap);
+		c->rect.x = m.gap + x;
+		c->rect.y = m.gap + y;
+		(*c->ftb->resize)(c, d, w, cw - m.gap, cell_h - m.gap);
 	}
 }
 
@@ -8753,7 +8867,6 @@ static void load_panel(struct sdlpui_window *window)
 		if (!window->panel) {
 			window->panel = SDL_calloc(1, sizeof(*window->panel));
 			window->panel->cur_tab = 0;
-			window->panel->cur_layer = 0;
 			load_panel_slots(window->panel);
 		}
 		create_panel_piece(window, kind, &rect);
@@ -8785,19 +8898,54 @@ static void unload_panel(struct sdlpui_window *window)
  * Menu's "Reset Panel Slots" does.  The old file is kept, because the
  * player may have spent time on it.
  */
+/* Copy the shipped panel.txt, line by line, over the player's. */
+static bool copy_panel_file(const char *from, const char *to)
+{
+	char line[1024];
+	ang_file *in = file_open(from, MODE_READ, FTYPE_TEXT);
+	ang_file *out;
+
+	if (!in) {
+		return false;
+	}
+	out = file_open(to, MODE_WRITE, FTYPE_TEXT);
+	if (!out) {
+		file_close(in);
+		SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION, "could not write %s",
+			to);
+		return false;
+	}
+	while (file_getl(in, line, sizeof(line))) {
+		file_putf(out, "%s\n", line);
+	}
+	file_close(out);
+	file_close(in);
+	SDL_Log("copied panel slots from %s to %s", from, to);
+
+	return true;
+}
+
+/*
+ * The Menu's "Reset Panel Slots": the player's panel.txt goes back to the
+ * shipped one, whose order is chosen by hand (TOUCH_PANEL_PLAN.md, step
+ * 4), or to one seeded from the command tables where nothing is shipped.
+ */
 static void reset_panel_slots(struct sdlpui_window *window)
 {
-	char path[1024], old[1024];
+	char path[1024], old[1024], shipped[1024];
 
 	path_build(path, sizeof(path), ANGBAND_DIR_USER, PANEL_SLOT_FILE);
 	path_build(old, sizeof(old), ANGBAND_DIR_USER, PANEL_OLD_SLOT_FILE);
+	path_build(shipped, sizeof(shipped), ANGBAND_DIR_CUSTOMIZE,
+		PANEL_SLOT_FILE);
 	if (file_exists(path)) {
 		file_delete(old);
 		if (file_move(path, old)) {
 			SDL_Log("kept the old panel slots as %s", old);
 		}
 	}
-	if (!seed_panel_file(path)) {
+	if (file_exists(shipped) ? !copy_panel_file(shipped, path)
+			: !seed_panel_file(path)) {
 		return;
 	}
 	unload_panel(window);

@@ -268,6 +268,12 @@ them.
 3. Panel = fixed chrome + five tabs, four by four.
 4. Chrome: compass rose, Escape, Enter, Backspace, Space, sticky Shift,
    sticky Ctrl, tab strip, fast-keys strip.
+   2026-09-11: plus the four arrows, kept because text prompts
+   (`askfor_aux`) and the recall viewers (`textui_textblock_show`) take
+   real arrow keys and not the rose's keypad digits. The chrome is a
+   two-column block at the key stack's right edge, Escape and Enter in
+   the bottom corner where the right thumb rests, the arrows at the top
+   (section 4.2).
 5. Rose: Brogue-style petals, cardinals larger, bottom-left, lifted 140
    points, fixed position for now. 2026-09-09: after seeing it, half the
    size (120 points across), petals drawn as 10 point outlines rather
@@ -275,10 +281,22 @@ them.
    to a semicircular cap); position by two-finger drag (step 2d).
 6. Tabs: Act, Items, Info (seeded from `cmds_all`), Mine (user macros),
    Keys (full keyboard).
+   2026-09-11: Keys has no layers. It is a keyboard's fifty keys,
+   alphabetical, and sticky Shift gives what a keyboard's Shift gives
+   (`1` to `!`, `/` to `?`, the backquote to `~`), so every character is
+   one or two taps. Spells (Cast, Browse, Study) sit on Act, not Info:
+   the command table files them under Information, but casting is an
+   action taken every few turns.
 7. Slots reference commands by description, resolved to a key at press time
    for the active keyset. Literal text and special-key slots also exist.
 8. Faces: words on the four themed tabs, characters on the Keys tab and in
    the fast-keys strip.
+   2026-09-11: a slot's face is two lines. The top line is what the
+   slot sends, as keycaps in the text colour: the command's key for the
+   keyset in force (`R`, `^P`, `⇥` for Tab in the roguelike set), or the
+   whole action for a macro (`R&⏎`), with glyphs for the named keys the
+   font has and `[Name]` for the rest. The word sits beneath in light
+   grey. A cell too short for both shows the word alone.
 9. Modifier rule from pocketzot: tap once, double tap locks, tap from lock
    clears.
 10. Repeat: 350 ms then every 85 ms, for the rose, arrows and Backspace.
@@ -358,6 +376,34 @@ a slice of the map region if wanted.
 - Tabs: Act, Items, Info, Mine are four by four grids of word-faced buttons.
   Keys is a denser character grid: letters layer and symbols layer toggled by
   a button, plus arrows and F1 to F12.
+  2026-09-11: replaced by one frame, thirteen cells by five, the same on
+  every tab (the comment above `PANEL_COLS` in `main-sdl2.c` draws it):
+
+  ```
+  Act  Items Info  Mine  Keys  .  .  .  .  .  .   ^   v
+  .    .     .     .     .     .  .  .  .  .  .   <   >
+  .    .     .     .     .     .  .  .  .  .  .   BS  Ctrl
+  .    .     .     .     .     .  .  .  .  .  .   Sh  Space
+  .    .     .     .     .     .  .  .  .  .  .   Esc Enter
+  ```
+
+  The chrome is the two right-hand columns. The tab strip is the top
+  left. The six cells beside the tabs are the strip, and the eleven by
+  four block under them is the current tab's: a slot tab lays its seven
+  by four grid over the block, so each word cell is 11/7 of a character
+  cell wide (about 79 points in portrait, 100 in landscape: eight
+  characters fit in portrait), and leaves the strip empty for the fast
+  keys; the Keys tab fills strip and block with characters. Thirteen
+  columns is what portrait allows at 44 point targets beside the rose
+  (cells are 50.5 points there, 64 in landscape). The stack's height is
+  five rows in both orientations, which is what the strip allows. The
+  old column form (chrome above tabs above grid) is gone; a narrow piece
+  region now shrinks the cells instead.
+
+  Order within a slot tab, which is what `panel.txt` now encodes: the
+  bottom row is the easiest to reach and its right end, beside Escape
+  and Enter, the easiest cell of all; the top row is the hardest and is
+  left empty on every shipped tab for the fast keys.
 - Landscape: the panel is a column. Rose at the bottom, tabs above it.
   Portrait: the panel is a band. Rose at the left, tabs to its right.
 - A new control type `panel_key` (label, action, repeat flag, pressed state,
@@ -562,6 +608,23 @@ simulator, where touches arrive as mouse events exactly as on the device.
     catches ("Exiting on signal 11"), no report is written; attach
     `lldb -p <pid> --batch -o "process continue" -o "bt 30"` before
     reproducing to get a backtrace.
+  - Learned 2026-09-11, after an Xcode update to 27.0: `build-sim`
+    failed with "SDK lookup failed for canonical name: iphonesimulator
+    26.5" until its `CMakeCache.txt` and `CMakeFiles` were deleted and
+    the configure re-run. `gregsim.sh` and `gregcmake2.sh` now do that
+    themselves when the cached SDK is not under the selected Xcode; a
+    mere existence test is not enough, because the old Xcode stays
+    installed and the device cache pointed into it, while `xcodebuild`
+    from the new one could not find "iphoneos26.5". Keep `build/_deps`
+    through the wipe. And `idb ui tap` stopped working:
+    its companion needs Apple's private `SimulatorKit.framework`, which
+    Xcode 27 no longer ships, while the older `/Applications/Xcode.app`
+    (26.6) still has it. Running the companion against that Xcode works
+    with the 26.5 simulator: `./gregsim.sh idb` starts it (it is
+    `DEVELOPER_DIR=/Applications/Xcode.app idb_companion --udid ...`
+    then `idb connect localhost 10882`). The symptom of the stale
+    companion was "Mach port invalid, device disconnected" and taps
+    that silently did nothing.
   - Learned during step 2a (2026-09-09):
     - A few `SDL_Log` lines in `get_event`, printing each event's type,
       coordinates and device for the first minute, show exactly what the
@@ -618,6 +681,11 @@ portrait. You then tested on the device: the look is right, blanking a
 term by turning every purpose off is the behaviour you want, and the
 menus were crashy. That crash is fixed (toolkit bug, see the step 2d
 box). What is left before step 3 is your re-test on the device.
+2026-09-11: step 4's order decision is made and built: the key stack is
+one frame with the chrome at the right edge, the Keys tab has no layers,
+the shipped `panel.txt` is ordered by reach, and the Android thread is
+mined. Tested on the simulator; your device test of the frame is the
+open box under step 4, with the Mine question.
 
 ### Step 0. Prerequisites
 
@@ -933,6 +1001,10 @@ box). What is left before step 3 is your re-test on the device.
       ↓ 98, → 162, Space 226, Ctrl 290); tabs row 951 (34 to 290 in
       steps of 64); grid rows 999, 1047, 1095, 1143 at columns 34 to
       418 in steps of 64; the layer key is at 418,1143.
+      2026-09-11: superseded by the frame in section 4.2. The three
+      layers and their toggle key are gone; the arrows moved to the top
+      of the chrome at the right edge; Shift now acts on every character
+      key (`shift_text` on `struct panel_key`), not only letters.
 - [x] code: sticky Shift and Ctrl per decision 9, with a visible state
       (off, one-shot, locked). Shift affects letters and shifted symbols;
       Ctrl produces KTRL codes. 2026-09-09: done. Taps cycle off,
@@ -1344,9 +1416,68 @@ theirs. Nothing in those steps waits on it; see section 4.6.
       are longer than six: Closest, Inscribe, Uninscr, TakeOff, Examine,
       Activate, Abilities, Ignoring, Monsters, Feeling, Options,
       Objects.
-- [ ] you decide: review the generated Angband `panel.txt`. Which sixteen
+- [x] you decide: review the generated Angband `panel.txt`. Which sixteen
       go on each tab, in what order, and which face words read badly?
       Whether to mine the Android thread (section 8) before settling this.
+      2026-09-11: decided, after a look at what the Android port thinks.
+      Its ribbon's command mode is, in its author's words, "the most
+      used commands in the game", in this order (Angband keys):
+      `.iUmhfvngdR+ewb,azul[]C~LM=?`, i.e. run, inventory, use, cast,
+      fire at nearest, shoot, throw, repeat, pick up, drop, rest, alter,
+      equipment, wield, browse, stay, aim, zap, staff, look, monster
+      list, object list, character, knowledge, locate, map, options,
+      help. The order is deliberate: the ribbon scrolls, so the first
+      keys are the visible ones; the git history shows alter promoted
+      on day one and later additions (wield 2020, equipment and the
+      three device commands 2024) inserted mid-list, not appended. The
+      author's stated philosophy is to funnel through inventory, use
+      and alter rather than add buttons; stairs are absent because a
+      tap on your own `@` takes them, which `ui-context.c` does here
+      too. Your decisions: chrome to the right edge (decision 4);
+      spells on Act; quaff, read and eat direct on Items' hot row where
+      the Android port funnels them through Use; the Keys tab as in
+      decision 6; all four arrows kept rather than a core patch; the
+      thread mined (section 8). Mine: seeded, you decided later the same
+      day, with the three answers to the rest prompt as one-tap macros
+      (`"R&[Enter]"=Rest&`, `"R*[Enter]"=Rest*`, `"R![Enter]"=Rest!`),
+      on its bottom row. The tab's name is the possessive -- the
+      player's own slots, decision 6's "Mine (user macros)" -- not the
+      verb; you asked. The shipped `lib/customize/panel.txt`
+      is now written by hand in that order, hot row last and its hot
+      end at the right, following the Android ranks adjusted for what
+      the rose covers; the Menu's "Reset Panel Slots" copies the shipped
+      file rather than re-seeding from the tables (`copy_panel_file`),
+      and the seeder is the fallback for a variant that ships none.
+      Faces: with the wider word cells only "Abilities" was clipped in
+      portrait; it is now "Ability". Verified on the simulator with
+      `idb`, in the town with the saved warrior: the Keys tab shows the
+      fifty keys as drawn; Shift then `/` opened help and Shift then the
+      backquote opened the knowledge menu (the shifted face shows while
+      Shift is lit); Ctrl then `f` gave "Looks like a typical town.";
+      the bottom-right slot of Act, Items and Info raised the rest
+      prompt, the inventory and the character sheet. Key centres in
+      portrait, in points, for `idb ui tap`: tabs at y 983, x 193 (Act),
+      243, 294, 344, 395 (Keys); character cells at x 193 + 50.5 * col
+      and y 983 + 48 * row; the chrome at x 752 and 803, rows as above
+      (Esc 752,1175; Enter 803,1175; Shift 752,1127; Ctrl 803,1079);
+      word cells at x 207 + 79.4 * col. Later the same day you asked for
+      the slot faces to show the keystroke over the word (decision 8);
+      done in `render_panel_key` with `get_panel_key_keys`, which
+      resolves a command's key at each redraw as the press does.
+      The Mine grammar was exercised
+      with a user file in the app container carrying
+      `row:"~[Enter]"=Know+  "R&[Enter]"=Rest&`: the first opened the
+      object knowledge screen in one tap, the second rested one turn
+      (the character sheet's Resting count went from 0 to 1), so named
+      keys inside an action work through `feed_keymap`. Landscape was
+      not seen today: the scripted rotation did not take (the Simulator
+      menu click and Cmd-Left both reported success with the Mac
+      unlocked, and the device stayed portrait); the layout code is the
+      same in both orientations with the cells at their 64 point cap in
+      landscape, so check it by hand.
+- [ ] you test (device): the new frame. Are Escape and Enter where your
+      thumb wants them, do the arrows earn their four cells, and do the
+      bottom rows hold what you reach for most? Then the Mine question.
 - [ ] you test (simulator): toggle roguelike keys in the options and
       confirm the same slot now sends the roguelike key without editing the
       file.
@@ -1508,6 +1639,16 @@ theirs. Nothing in those steps waits on it; see section 4.6.
   may accept a touch panel, and FAangband and NarSil both track that file.
 - Mining the angband.live "Angband for Android" thread (18 pages) for the
   most requested buttons before finalising tab defaults.
+  2026-09-11: done, from the Wayback Machine (angband.live was down);
+  full notes in `ANDROID_THREAD_NOTES.md`. In short: the buttons users
+  kept asking for were run (placement and a toggle), the direction pad
+  within one thumb's reach, pick up, the monster list and a wait-a-turn
+  key at the pad's centre; the developer's post introducing the ribbon
+  (page 5, March 2020) says wand, rod and staff were left out of the
+  "most used" set on purpose, so their presence in today's default is a
+  later concession. Nothing there argues against the order shipped
+  today; it argues for the rose's centre being Stay and for run-mode
+  on the centre's long press (section 8, first two items).
 - Haptics through a small Objective-C shim if wanted. VoiceOver is out of
   scope for an SDL-drawn panel.
 - Section 5 is now a checklist. Still open: whether to copy this file into

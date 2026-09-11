@@ -1,10 +1,9 @@
-# The touch panel's slot tabs, written from the game's own
-# command tables.  Edit it freely.
+# The touch panel's slot tabs.  Edit it freely; the Menu's "Reset Panel
+# Slots" brings this file back.
 #
 # tab:Name  starts one of the tabs Act, Items, Info and Mine.
-# row:...   fills that tab's next row of cells; a tab holds
-#           4 rows of 7.  Rows past that are commented out
-#           here, ready to be swapped in.
+# row:...   fills that tab's next row of cells, top row first; a tab
+#           holds 4 rows of 7.
 #
 # A cell is one of
 #   [Description]  a command, named as the command menu names
@@ -16,22 +15,44 @@
 #                  the escape key, "{^}f" is control-F.
 #   -              nothing.
 # Any of them may end in =Face to change the word shown on it.
+#
+# Order.  The grid sits by the right thumb, with Escape and Enter in
+# the bottom corner, so the bottom row is the easiest to reach and
+# its right end the easiest of all; the top row is the hardest.  Each
+# tab below puts its most used commands there, following the Android
+# port's ribbon order (its "most used commands", by its author)
+# adjusted for what the compass rose already covers: walking, staying
+# (its centre), running (Shift) and altering (Ctrl).  Spells are on
+# Act rather than Info because casting is an action taken every few
+# turns.  The top row is left empty on every tab; it is where the
+# fast keys will appear when a prompt is asking for something.
+#
+# Mine is yours: macros, as keymap actions.  It starts with the three
+# answers to the rest prompt, so that each is one tap: '&' rests as
+# needed, '*' until HP and SP are full, '!' until either is.
 
 panel-version:1
 
 tab:Act
-row:[Disarm a trap or chest]  [Rest for a while]  [Look around]  [Target monster or location]  [Target closest monster]  [Dig a tunnel]  [Go up staircase]
-row:[Go down staircase]  [Open a door or a chest]  [Close a door]  [Fire at nearest target]  [Throw an item]  [Walk into a trap]
+row:-
+row:-  [Stand still]  [Walk into a trap]  [Go down staircase]  [Go up staircase]  [Gain new spells]  [Target closest monster]
+row:[Target monster or location]  [Close a door]  [Open a door or a chest]  [Disarm a trap or chest]  [Dig a tunnel]  [Browse a book]  [Alter a grid]
+row:[Start running]  [Throw an item]  [Repeat previous command]  [Look around]  [Fire at nearest target]  [Cast a spell]  [Rest for a while]
 
 tab:Items
-row:[Inscribe an object]  [Uninscribe an object]  [Wear/wield an item]  [Take off/unwield an item]  [Examine an item]  [Drop an item]  [Fire your missile weapon]
-row:[Use a staff]  [Aim a wand]  [Zap a rod]  [Activate an object]  [Eat some food]  [Quaff a potion]  [Read a scroll]
-row:[Fuel your light source]  [Use an item]  [Display equipment listing]  [Display inventory listing]  [Display quiver listing]  [Pick up objects]  [Ignore an item]
+row:-
+row:[Uninscribe an object]  [Inscribe an object]  [Ignore an item]  [Display quiver listing]  [Examine an item]  [Take off/unwield an item]  [Fuel your light source]
+row:[Activate an object]  [Use a staff]  [Zap a rod]  [Aim a wand]  [Eat some food]  [Wear/wield an item]  [Display equipment listing]
+row:[Drop an item]  [Pick up objects]  [Fire your missile weapon]  [Read a scroll]  [Quaff a potion]  [Use an item]  [Display inventory listing]
 
 tab:Info
-row:[Browse a book]  [Gain new spells]  [View abilities]  [Cast a spell]  [Full dungeon map]  [Toggle ignoring of items]  [Display visible item list]
-row:[Display visible monster list]  [Locate player on map]  [Help]  [Identify symbol]  [Character description]  [Check knowledge]  [Repeat level feeling]
-row:[Show previous message]  [Show previous messages]  [Interact with options]  [Save and don't quit]  [Save and quit]  [Retire character and quit]  [Redraw the screen]
-row:[Save "screen dump"]
+row:-
+row:-  -  [Save "screen dump"]  [Redraw the screen]  [Retire character and quit]  [Save and quit]  [Save and don't quit]
+row:[Toggle ignoring of items]  [View abilities]  [Identify symbol]  [Repeat level feeling]  [Show previous message]  [Show previous messages]  [Help]
+row:[Interact with options]  [Display visible item list]  [Display visible monster list]  [Locate player on map]  [Full dungeon map]  [Check knowledge]  [Character description]
 
 tab:Mine
+row:-
+row:-
+row:-
+row:"R&[Enter]"=Rest&  "R*[Enter]"=Rest*  "R![Enter]"=Rest!
