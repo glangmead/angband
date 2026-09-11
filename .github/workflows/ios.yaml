@@ -1,0 +1,70 @@
+name: iOS
+
+on:
+  push:
+    branches: [ sdl_touch_panel ]
+  pull_request:
+
+jobs:
+  build:
+    name: iOS
+    # macos-13 was retired; macos-26 is the current default image, and every
+    # Xcode on it is a 26.x, so the step below has something to find.
+    runs-on: macos-26
+    steps:
+      - name: Clone Project
+        uses: actions/checkout@v4
+
+      - name: Select an Xcode whose iOS SDK is below 27
+        # iOS 27 traps apps linked against the iOS 27 SDK that have not
+        # adopted the UIScene lifecycle, and SDL2 has not, so an .ipa built
+        # against it dies at launch on an iOS 27 device.  Choose the newest
+        # Xcode under that line rather than a fixed version, so an image
+        # update cannot quietly move the build onto 27.
+        run: |
+          set -eu
+          chosen=
+          for xc in $(ls -d /Applications/Xcode*.app | sort -rV); do
+            sdk=$("$xc/Contents/Developer/usr/bin/xcodebuild" -showsdks 2>/dev/null |
+                  sed -n 's/.*-sdk iphoneos\([0-9][0-9]*\).*/\1/p' | sort -rn | head -1) || true
+            if [ -n "${sdk:-}" ] && [ "$sdk" -lt 27 ]; then chosen=$xc; break; fi
+          done
+          if [ -z "$chosen" ]; then echo "no Xcode with an iOS SDK below 27"; exit 1; fi
+          sudo xcode-select -s "$chosen"
+          xcodebuild -version
+          xcodebuild -showsdks | grep iphoneos
+
+      - name: Configure
+        run: |
+          cmake \
+            -B build \
+            -G Xcode \
+            -D CMAKE_TOOLCHAIN_FILE=src/cmake/toolchain/ios.toolchain.cmake \
+            -D ENABLE_BITCODE=0 \
+            -D PLATFORM=OS64 \
+            -D CMAKE_SYSTEM_NAME=iOS \
+            -D CMAKE_BUILD_TYPE=RelWithDebInfo \
+            -D CMAKE_XCODE_ATTRIBUTE_CODE_SIGN_IDENTITY='' \
+            -D SUPPORT_SDL2_FRONTEND=ON \
+            -D CMAKE_POLICY_VERSION_MINIMUM=3.5 \
+            # EOL
+
+      - name: Build
+        run: |
+          cmake \
+            --build build \
+            --config RelWithDebInfo \
+            -j $(sysctl -n hw.physicalcpu) \
+            # EOL
+
+      - name: Pack
+        run: |
+          cd build
+          cpack -G ZIP -C RelWithDebInfo
+
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: Angband.ipa
+          path:  build/Angband.ipa
+          retention-days: 7
