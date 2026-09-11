@@ -7627,7 +7627,28 @@ static const struct {
 	{ "Take notes",				"Notes" },
 	{ "Version info",			"Version" },
 	{ "Load a single pref line",		"Pref" },
-	{ "Toggle windows",			"Windows" }
+	{ "Toggle windows",			"Windows" },
+
+	/*
+	 * The variants' own commands, so that this stays the one table the
+	 * three of them share.  "Abilities list" is NarSil's name for what
+	 * Angband calls "View abilities", so it takes that face; no build
+	 * has both.
+	 */
+	{ "Destroy an item",			"Destroy" },
+	{ "Fire from quiver 1",			"Shoot1" },
+	{ "Fire from quiver 2",			"Shoot2" },
+	{ "Blow a horn",			"Horn" },
+	{ "Smith an item",			"Smith" },
+	{ "Bash a door",			"Bash" },
+	{ "Throw automatically",		"Hurl" },
+	{ "Change song",			"Song" },
+	{ "Toggle stealth mode",		"Stealth" },
+	{ "Exchange places",			"Swap" },
+	{ "Abilities list",			"Ability" },
+	{ "Change shape",			"Shape" },
+	{ "Move house",				"House" },
+	{ "Show the time of day",		"Time" }
 };
 
 /*
