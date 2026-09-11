@@ -419,6 +419,15 @@ if(IOS)
     target_sources(OurExecutable PUBLIC ${RESOURCES})
     set_source_files_properties(${RESOURCES} PROPERTIES MACOSX_PACKAGE_LOCATION "Resources")
 
+    # CMake copies the plist into CMakeFiles/OurExecutable.dir/ when it
+    # configures, and every build uses that copy, so editing the original
+    # does nothing until CMake runs again.  Say the configure is out of date
+    # when the original changes; without this a stale copy goes on shipping,
+    # which is how FAangband kept the landscape-only orientations it had
+    # before the plist allowed portrait.
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+            "${CMAKE_SOURCE_DIR}/os/ios/Info.plist")
+
     set_target_properties(OurExecutable PROPERTIES
             MACOSX_BUNDLE_INFO_PLIST "${CMAKE_SOURCE_DIR}/os/ios/Info.plist"
             XCODE_ATTRIBUTE_ASSETCATALOG_COMPILER_APPICON_NAME "AppIcon"
